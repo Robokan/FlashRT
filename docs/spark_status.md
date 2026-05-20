@@ -11,19 +11,20 @@ Durable agent rules: [`../AGENTS.md`](../AGENTS.md).
 ## TL;DR
 
 Code for all 7 phases is in place and committed to `spark-sm121-port`
-on `Robokan/FlashRT`. **Phase 0 is now verified end-to-end on
-hardware** — the SM_121 + aarch64 kernel build compiles cleanly and
-the smoke gate passes all 9 checks, including a real `fa2.fwd_bf16`
-launch on Pi0.5-realistic shapes. Phases 1–7 have code in place but
-are still un-run against real artifacts (Orbax checkpoints, robot,
-calibration data).
+on `Robokan/FlashRT`. **Phases 0 and 1 (smoke) are now verified
+end-to-end on hardware.** JAX-on-aarch64-Blackwell works out of the
+box via `jax[cuda12]` PyPI wheels (no NGC base or source build
+needed). Pi0.5 LIBERO loads + runs in ~57 ms/iter on the GB10 — well
+inside the 200 ms ceiling and right on the plan's 50–150 ms
+prediction. Phases 2–7 still un-run against real artifacts (OpenArm
+LoRA checkpoint, robot, calibration data).
 
 ## Phase status
 
 | Phase | Description | Code | Verified on Spark? |
 |---|---|---|---|
 | 0 | Build FlashRT for SM_121 + aarch64 | done — `docker/Dockerfile.spark`, `docker/compose.spark.yml`, `CMakeLists.txt` patches, `scripts/spark_build_smoke.py` | **configure: yes; full build: yes (native venv, -j8, ~8.4 min); smoke gate: PASS (9/9) — see "Phase 0 hardware-verified results" below** |
-| 1 | `pi05_libero` Orbax load via `Pi05JaxFrontendRtx` | done — `scripts/spark_phase1_libero_smoke.py`, `scripts/spark_phase1_libero_run.sh` | no |
+| 1 | `pi05_libero` Orbax load via `Pi05JaxFrontendRtx` | done — `scripts/spark_phase1_libero_smoke.py`, `scripts/spark_phase1_libero_run.sh` | **smoke gate: PASS (5/5) — 57.2 ms mean steady-state, see "Phase 1 hardware-verified results" below; full LIBERO simulator eval: still pending** |
 | 2 | LoRA Orbax load + fp32 merge (`pi05_openarm_ngc_lora_v4`) | done — `_maybe_merge_lora` in `flash_rt/frontends/jax/pi05_rtx.py`, `tests/test_lora_merge_jax_loader.py`, `scripts/spark_phase2_lora_load.py` | unit tests: not run on Spark |
 | 3 | FP8 calibration on stratified OpenArm samples | done — `scripts/spark_phase3_prepare_calib.py`, `scripts/spark_phase3_run_calib.py` | no |
 | 4 | Parity vs the openpi JAX server | done — `scripts/spark_phase4_parity.py` and `robot_action_dim` patches in `pi05_rtx.py` (torch + jax frontends and `flash_rt/api.py`) | no |
@@ -87,18 +88,81 @@ uv pip install --index-url https://download.pytorch.org/whl/cu128 torch
 # → torch 2.11.0+cu128, bundles CUDA 12.8 runtime, talks to driver 580 OK
 ```
 
+## Phase 1 hardware-verified results
+
+`python scripts/spark_phase1_libero_smoke.py --checkpoint \
+~/.cache/openpi/openpi-assets/checkpoints/pi05_libero` exits 0 with
+all 5 checks PASS:
+
+```
+PASS  checkpoint dir
+PASS  flash_rt.load_model(framework='jax')          12.4s
+PASS  first infer (calibration + graph capture)     1.11s
+PASS  steady-state latency                          mean=57.2ms p50=57.2ms p99=60.5ms (ceiling=200ms)
+PASS  output shape                                  (10, 7)
+PASS  finite outputs                                1400 values, 0 NaN/Inf
+```
+
+Reaching this PASS required three fixes on top of the previously
+committed Spark port:
+
+1. **`flash_rt/hardware/__init__.py`**: `detect_arch()` had no entry
+   for `(major, minor) == (12, 1)` and refused to load on Spark.
+   Added `"rtx_sm121"` arch string + `_PIPELINE_MAP` entries that
+   mirror the `"rtx_sm120"` ones for pi05/pi0/groot/motus/pi0fast
+   (the compiled `.so` is gencode `sm_121a` and the frontends are
+   arch-agnostic, so it's a trivial dispatch alias today; keeping
+   the string distinct preserves the option of Spark-specific
+   dispatch later).
+
+2. **`flash_rt/core/weights/loader.py` — openpi-path discovery**: the
+   hardcoded list `["/workspace/src"]` was stale (compose.spark.yml
+   mounts at `/openpi/src`, native dev has `~/sparkpack/openpi/src`).
+   Extended to try `$OPENPI_SRC`, `/openpi/src`, `/workspace/src`,
+   and `~/sparkpack/openpi/src` in order, so the loader picks up
+   openpi's `restore_params` regardless of layout.
+
+3. **`flash_rt/core/weights/loader.py` — orbax 0.11 metadata**: the
+   direct-orbax fallback used `metadata["params"]`, which broke
+   because `ckptr.metadata()` now returns a `StepMetadata` wrapper
+   (not subscriptable). Tree metadata moved to
+   `.item_metadata` (a `_TreeMetadataImpl` which IS subscriptable).
+   Wrapped with `getattr(metadata, "item_metadata", metadata)` so
+   both old and new orbax APIs work.
+
+JAX install path that worked: `uv pip install "jax[cuda12]"
+orbax-checkpoint flax ml_dtypes` against PyPI gave jax 0.10.1 +
+jax-cuda12-{pjrt,plugin} which sees the GB10 immediately
+(`jax.devices()==[CudaDevice(id=0)]`, `default_backend=='gpu'`). No
+NGC base image or source build needed. Driver 580.142 + bundled CUDA
+12.8 runtime works on SM_121. Same story for sentencepiece +
+safetensors (`uv pip install sentencepiece safetensors`).
+
+## Calibration warning (followup, not a blocker)
+
+The first FP8 calibration on pi05_libero with 1 random synthetic
+observation flagged 5 scales >20× median, the worst being
+`encoder_ffn_down_w_16` at 20.571×. Calibration completed and
+inference outputs are all finite, but FP8 dynamic-range headroom on
+those layers is compressed. The smoke uses 1 random obs which is the
+worst-possible-case for calibration; in Phase 3 we calibrate on
+50–100 stratified real observations, which should pull these scales
+in. If Phase 2's parity numbers come in low for similar-named layers,
+revisit calibration percentile / sample count.
+
 ## What's not yet verified
 
-- Every Python-side **phase 1–7** script. None have been run against
-  real Orbax checkpoints or robot data yet.
-- JAX-CUDA on aarch64 in this venv — the standard NGC route is
-  documented in the plan as the preferred Phase 1 environment because
-  upstream JAX wheels for aarch64+Blackwell are not guaranteed pip-
-  installable. Need to decide between (a) extending the venv with
-  jax-cuda12 from PyPI and hoping it picks up CUDA 12.8 from the
-  torch bundle, vs (b) using the NGC container per the original plan.
 - The flashrt_spark Docker image build (`docker compose -f
   docker/compose.spark.yml build flashrt_spark`).
+- The full LIBERO simulator eval (`scripts/spark_phase1_libero_run.sh`)
+  — needs `libero + robosuite + mujoco` installed which is a separate
+  install adventure on aarch64+Blackwell. The smoke gate validates
+  the FlashRT stack itself with zero new code, so this is purely a
+  policy-quality regression check. Worth skipping unless we suspect
+  numerical drift.
+- Phases 2–7 (`pi05_openarm_ngc_lora_v4` load, calibration on real
+  OpenArm data, parity vs JAX server, server wrapping, robot test,
+  latency breakdown). Code is in place; not yet run on hardware.
 
 ## Lessons learned the hard way
 

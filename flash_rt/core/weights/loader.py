@@ -107,13 +107,23 @@ def _load_orbax(path: str) -> Dict[str, np.ndarray]:
     # fallback below — verified byte-identical on tested checkpoints, so
     # both paths produce the same engine-weights dict.
     try:
-        # Try importing openpi's loader
-        import importlib.util
+        # Try importing openpi's loader from a few well-known locations:
+        #   - $OPENPI_SRC                       (explicit override)
+        #   - /openpi/src                        (compose.spark.yml mount)
+        #   - /workspace/src                     (legacy docker layout)
+        #   - ~/sparkpack/openpi/src             (native sibling checkout
+        #                                         used by FlashRT spark dev)
+        # If none of these has an importable openpi package, the
+        # ``from openpi.models.model import restore_params`` below raises
+        # ImportError and we fall through to the direct-orbax path.
         openpi_paths = [
+            os.environ.get("OPENPI_SRC", ""),
+            "/openpi/src",
             "/workspace/src",
+            os.path.expanduser("~/sparkpack/openpi/src"),
         ]
         for op in openpi_paths:
-            if os.path.exists(op) and op not in sys.path:
+            if op and os.path.isdir(op) and op not in sys.path:
                 sys.path.insert(0, op)
 
         from openpi.models.model import restore_params
@@ -136,7 +146,12 @@ def _load_orbax(path: str) -> Dict[str, np.ndarray]:
 
         with ocp.PyTreeCheckpointer() as ckptr:
             metadata = ckptr.metadata(str(params_path))
-            item = {"params": metadata["params"]}
+            # orbax-checkpoint >= 0.10 returns a StepMetadata wrapper; the
+            # actual tree-metadata lives on .item_metadata (a
+            # _TreeMetadataImpl which IS subscriptable). Older orbax
+            # exposed the dict directly. Handle both.
+            tree_md = getattr(metadata, "item_metadata", metadata)
+            item = {"params": tree_md["params"]}
             params = ckptr.restore(
                 str(params_path),
                 ocp.args.PyTreeRestore(

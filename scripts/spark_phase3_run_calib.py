@@ -4,7 +4,7 @@
 Inputs:
   - --checkpoint: pi05_openarm_ngc_lora_v4 Orbax dir (LoRA-fused inside
     convert_pi05_orbax thanks to the Phase 2 patch).
-  - --calib-data: npz produced by openpi/scripts/spark_phase3_prepare_calib.py
+  - --calib-data: npz produced by scripts/spark_phase3_prepare_calib.py
   - --percentile: 99.9 (default) — matches FlashRT's
     accumulate_amax(percentile=99.9) recipe. 100.0 == naive max.
 

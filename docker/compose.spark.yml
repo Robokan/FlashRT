@@ -1,0 +1,93 @@
+# FlashRT — DGX Spark build + run, via docker compose.
+#
+# Run with:
+#   cd ~/sparkpack/FlashRT
+#   docker compose -f docker/compose.spark.yml build flashrt_spark
+#   docker compose -f docker/compose.spark.yml run --rm flashrt_spark \
+#       python3 scripts/spark_build_smoke.py
+#
+# The flashrt_spark service builds the SM_121 + aarch64 image and mounts
+# the host FlashRT checkout for live edits to scripts/ and flash_rt/
+# without having to rebuild the image. Adjacent openpi and dataset
+# checkouts are also mounted so Phase 3-7 scripts can find them.
+#
+# Layout assumption (override via env vars if different):
+#   ~/sparkpack/
+#     FlashRT/                 ← context for this compose file
+#     openpi/                  ← optional sibling; needed for Phase 4 parity
+#                                (the existing JAX server) and for the
+#                                WebsocketPolicyServer that scripts/serve_policy_flashrt.py
+#                                imports from. Mount as /openpi.
+#     openpi/.cache/openpi/    ← Orbax checkpoints (mounted to /openpi_assets)
+#
+# Memory caveat for the build step:
+#   nvcc instantiation of the CUTLASS-3.x FA2 sweep + SM120 NVFP4 W4A16
+#   GEMM peaks at ~5 GB host RAM per parallel TU. On a Spark with the
+#   desktop / Cursor running (~30 GB already pinned), BUILD_J > 4 risks
+#   OOM-killing the desktop session. The default is BUILD_J=4. On a
+#   headless Spark, bump to 16-20.
+#       BUILD_J=16 docker compose -f docker/compose.spark.yml build flashrt_spark
+#   See docker/Dockerfile.spark for the full rule of thumb.
+
+services:
+  flashrt_spark:
+    image: flashrt:spark
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.spark
+      args:
+        GPU_ARCH: "121"
+        # Default 4 is safe on a Spark with a desktop + Cursor + JAX
+        # already loaded (~90 GB free). On a headless Spark, raise to
+        # 16-20 — see Dockerfile.spark for the BUILD_J formula.
+        BUILD_J: ${BUILD_J:-4}
+    # Cap the build container's total memory so a runaway parallel
+    # compile cannot starve the host. 60 GB leaves headroom for the
+    # Grace CPU and any other processes. Applies only during the
+    # build phase under BuildKit, which is exactly what we want.
+    mem_limit: 60g
+    memswap_limit: 60g
+
+    init: true
+    tty: true
+    stdin_open: true
+    network_mode: host
+
+    volumes:
+      # Mount FlashRT for live source edits during the port.
+      - ${FLASHRT_DIR:-..}:/workspace/FlashRT
+      # Optional: mount openpi for the Phase 4 parity script and for
+      # the openpi.serving.WebsocketPolicyServer imported by
+      # scripts/serve_policy_flashrt.py.
+      - ${OPENPI_DIR:-../../openpi}:/openpi
+      # Mount checkpoint cache (Orbax checkpoints, FlashRT calibration scales).
+      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+      # HuggingFace cache for any tokenizer / dataset access.
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+      # Datasets directory for OpenArm calibration samples.
+      - ${DATASETS_DIR:-~/datasets}:/datasets
+
+    environment:
+      - OPENPI_DATA_HOME=/openpi_assets
+      - HF_HOME=/root/.cache/huggingface
+      # Make both packages importable:
+      #   /workspace/FlashRT is the FlashRT source (editable-installed in the image)
+      #   /openpi/src exposes the openpi package for WebsocketPolicyServer
+      #   /openpi/packages/openpi-client/src exposes openpi-client (BasePolicy / client side)
+      - PYTHONPATH=/workspace/FlashRT:/openpi/src:/openpi/packages/openpi-client/src
+      - IS_DOCKER=true
+      # Unified-memory caveat: don't preallocate the whole pool —
+      # FlashRT shares LPDDR with the Grace CPU process running the
+      # robot client. 0.6 leaves ~50 GB headroom on a 128 GB Spark.
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+      - XLA_PYTHON_CLIENT_PREALLOCATE=false
+      - JAX_COMPILATION_CACHE_DIR=/workspace/FlashRT/.jax_cache
+      - NVIDIA_TF32_OVERRIDE=1
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

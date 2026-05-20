@@ -19,6 +19,19 @@ torch = ["torch", "safetensors", "sentencepiece"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]
+# `openpi` extra: required to use flash_rt.serving.openpi_adapter and the
+# scripts/serve_policy_flashrt.py + scripts/spark_phase{4,5,7}_*.py wrappers.
+# These depend on the lightweight `openpi-client` package, which lives at
+#   https://github.com/Physical-Intelligence/openpi/tree/main/packages/openpi-client
+# and provides BasePolicy / WebsocketClientPolicy / msgpack-numpy.
+# Install via:
+#   pip install -e ".[openpi]"  with an openpi-client source on PYTHONPATH, or
+#   pip install "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client"
+# The flashrt_spark Docker image (docker/Dockerfile.spark) does not pre-install
+# openpi-client because the typical Spark deployment mounts the openpi
+# checkout at /openpi and adds /openpi/packages/openpi-client/src to
+# PYTHONPATH instead — see docker/compose.spark.yml.
+openpi = []
 # Optional. Required only for the legacy upstream attention path
 # (FVK_RTX_FA2=0 / FVK_RTX_FA2_SITES=...) and the GROOT N1.6/N1.7
 # backend. Default RTX Pi0 / Pi0.5 inference uses the vendored

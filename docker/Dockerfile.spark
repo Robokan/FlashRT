@@ -42,9 +42,40 @@ FROM ${BASE_IMAGE}
 #   CUTLASS_REF pin in case upstream tags get yanked.
 #   FA2_HDIMS   forwarded to CMake to slim FA2 codegen for shipped models.
 #               Pi0.5 only needs hdim=256; defaults still ship 96/128/256.
+#   BUILD_J     nvcc parallelism. Default 4 is conservative; raise it
+#               based on free RAM at build time.
+#
+#               Why this isn't $(nproc): the Spark build compiles a
+#               heavier TU set than the Thor build — FA2's 15 CUTLASS 3.x
+#               hdim x dtype x split instantiations at sm_80 + sm_120 +
+#               sm_121, plus the SM120 NVFP4 W4A16 GEMM and SM120 block-128
+#               FP8 GEMM. Each of these TUs peaks at ~5 GB of host RAM
+#               during template instantiation (regular hand-written
+#               kernels peak ~1-2 GB).
+#
+#               Total transient memory ≈ BUILD_J * peak_per_TU.
+#               On a *headless* Spark you have ~115 GB free → BUILD_J=20
+#               is fine. On a Spark running a desktop + Cursor + JAX
+#               (~30 GB already pinned), only ~90 GB is free → BUILD_J=16
+#               has been observed to OOM-kill the desktop session and
+#               force a hard reboot (Spark's unified LPDDR is shared
+#               between Grace CPU and Blackwell GPU, so the OOM killer
+#               hits the heaviest CPU process — usually the desktop or
+#               the IDE).
+#
+#               Rough rule of thumb on Spark:
+#                   BUILD_J = max(2, floor((free_GB - 12) / 6))
+#                   - 30 GB free → 3
+#                   - 60 GB free → 8
+#                   - 90 GB free → 13
+#                   - 115 GB free → 17
+#
+#               Default 4 keeps you safe even with a fully-loaded desktop.
+#               Override per-build: --build-arg BUILD_J=N.
 ARG GPU_ARCH=121
 ARG CUTLASS_REF=v4.4.2
 ARG FA2_HDIMS=""
+ARG BUILD_J=4
 
 # ── Tiny base utilities. NGC PyTorch image ships cmake / git / ninja
 #    on aarch64 as well; pin ccache for iterative dev. ──
@@ -80,10 +111,13 @@ RUN mkdir -p third_party && ln -sfn /opt/cutlass third_party/cutlass
 # ── Build the CUDA kernels for SM_121 ──
 # Explicit GPU_ARCH=121 (default arg above) keeps the build deterministic
 # regardless of whether nvidia-smi is reachable inside the build sandbox.
+#
+# Parallelism is BUILD_J (default 4), not $(nproc). See the BUILD_J comment
+# above the ARG declaration for why $(nproc) is unsafe on Spark.
 RUN cmake -B build -S . \
         -DGPU_ARCH=${GPU_ARCH} \
         $( [ -n "${FA2_HDIMS}" ] && echo "-DFA2_HDIMS=${FA2_HDIMS}" ) \
- && cmake --build build -j"$(nproc)" \
+ && cmake --build build -j${BUILD_J} \
  && rm -rf build/CMakeFiles
 
 # Editable install with both torch and jax frontends — Spark plan loads

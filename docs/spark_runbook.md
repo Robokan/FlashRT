@@ -4,7 +4,11 @@ End-to-end checklist for running the existing `pi05_openarm_ngc_lora_v4`
 Orbax checkpoint through FlashRT on DGX Spark, replacing the openpi JAX
 server without touching the robot client.
 
-Plan reference: `~/.cursor/plans/flashrt_jax_on_dgx_spark_f0288dd4.plan.md`
+- **Current status**: [`spark_status.md`](spark_status.md) — what's
+  done vs. pending on Spark hardware right now.
+- **Durable agent rules**: [`../AGENTS.md`](../AGENTS.md) — what every
+  Cursor session in this repo should know up front.
+- **Plan**: `~/.cursor/plans/flashrt_jax_on_dgx_spark_f0288dd4.plan.md`
 
 ---
 

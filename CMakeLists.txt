@@ -47,21 +47,35 @@ else()
   set(ENABLE_SM100_CUTLASS OFF)
 endif()
 
-# SM120+ (Blackwell): NVFP4/W4A8 block-scaled GEMM
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "120a")
-  set(ENABLE_NVFP4 ON)
-  message(STATUS "NVFP4/W4A8 support: ENABLED (sm_120a)")
+# Consumer-Blackwell SM_120 / SM_121 share the same FP8 + NVFP4 ISA
+# (5090 desktop and DGX Spark GB10 respectively). Treat them as a
+# single arch family throughout the build: every `IF(GPU_ARCH STREQUAL "120")`
+# block below also matches "121", and the multi-arch FA2 build emits
+# native SASS for both.
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "120a" OR
+   GPU_ARCH STREQUAL "121" OR GPU_ARCH STREQUAL "121a")
+  set(IS_BLACKWELL_CONSUMER ON)
 else()
-  set(ENABLE_NVFP4 OFF)
-  message(STATUS "NVFP4/W4A8 support: DISABLED (requires sm_120a, current: sm_${GPU_ARCH})")
+  set(IS_BLACKWELL_CONSUMER OFF)
 endif()
 
-# Only sm_90/100/110/120 ship an 'a' (architecture-accelerated) variant.
+# SM120+ (Blackwell): NVFP4/W4A8 block-scaled GEMM
+if(IS_BLACKWELL_CONSUMER)
+  set(ENABLE_NVFP4 ON)
+  message(STATUS "NVFP4/W4A8 support: ENABLED (sm_${GPU_ARCH}a)")
+else()
+  set(ENABLE_NVFP4 OFF)
+  message(STATUS "NVFP4/W4A8 support: DISABLED (requires sm_120a/sm_121a, current: sm_${GPU_ARCH})")
+endif()
+
+# Only sm_90/100/110/120/121 ship an 'a' (architecture-accelerated) variant.
 # Ada (sm_89) and Ampere (sm_80/86) do not, so emitting -gencode
 # arch=compute_89a,code=sm_89a breaks nvcc on 4090. Pick the right
 # gencode flag once here and reuse it for every target below.
+# Requires CUDA toolkit >= 13.0 for sm_121a support (NGC pytorch:25.10+).
 if(GPU_ARCH STREQUAL "90"  OR GPU_ARCH STREQUAL "100" OR
-   GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120")
+   GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR
+   GPU_ARCH STREQUAL "121")
   set(GPU_GENCODE "-gencode=arch=compute_${GPU_ARCH}a,code=sm_${GPU_ARCH}a")
 else()
   set(GPU_GENCODE "-gencode=arch=compute_${GPU_ARCH},code=sm_${GPU_ARCH}")
@@ -78,7 +92,7 @@ message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 # FA2 there would add ~10 MB to the .so and unused compile time.
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
    GPU_ARCH STREQUAL "87"  OR
-   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120")
+   GPU_ARCH STREQUAL "89"  OR IS_BLACKWELL_CONSUMER)
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
 else()
@@ -267,9 +281,9 @@ endif()
 
 # ── CUTLASS SM120a block-128 FP8 GEMM (Path B for Qwen3.6) ──
 # DeepSeek-V3 layout: per-token activation x 128x128 weight block scale.
-# Built from CUTLASS 4.x example 87b, requires sm_120a (SM120 with the
-# 'a' arch-accelerated suffix that enables F8F6F4 MMA + TMA SM120).
-if(GPU_ARCH STREQUAL "120")
+# Built from CUTLASS 4.x example 87b, requires sm_120a / sm_121a (consumer
+# Blackwell with the 'a' arch-accelerated suffix that enables F8F6F4 MMA + TMA).
+if(IS_BLACKWELL_CONSUMER)
   add_library(cutlass_sm120_block_obj OBJECT
     csrc/gemm/cutlass_sm120_block128_fp8_gemm.cu)
   set_target_properties(cutlass_sm120_block_obj PROPERTIES
@@ -290,11 +304,11 @@ if(GPU_ARCH STREQUAL "120")
   message(STATUS "SM120a CUTLASS block-128 FP8: ENABLED")
 endif()
 
-# ── CUTLASS SM120a NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt) ──
+# ── CUTLASS SM120a / SM121a NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt) ──
 # Block-scaled FP4 e2m1 weights × FP4 e2m1 act (post quant) × FP8 ue4m3
 # group scales × BF16 output. Ported from NVIDIA unit test
 # sm120_bs_gemm_nvf4_nvf4_f32_bf16.cu — sm_120a / sm_121a.
-if(GPU_ARCH STREQUAL "120")
+if(IS_BLACKWELL_CONSUMER)
   add_library(cutlass_nvfp4_w4a16_sm120_obj OBJECT
     csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm120.cu)
   set_target_properties(cutlass_nvfp4_w4a16_sm120_obj PROPERTIES
@@ -320,7 +334,7 @@ endif()
 # These are model-specific RTX kernels and must remain additive. They are
 # compiled into flash_rt_kernels so Motus does not depend on separate
 # runtime kernel libraries.
-if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
+if(FLASHRT_ENABLE_MOTUS AND IS_BLACKWELL_CONSUMER)
   add_library(motus_aux_sm120_obj OBJECT
     csrc/attention/sage2/sage2_attn_raw.cu
     csrc/conv/fp8_conv2d_3x3_sm120_v1.cu
@@ -449,7 +463,9 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   message(STATUS "Motus beta SM120 kernels: building into flash_rt_kernels")
 endif()
 
-# ── CUTLASS block-scaled kernels (sm_120a only) ──
+# ── CUTLASS block-scaled kernels (sm_120a / sm_121a) ──
+# Uses GPU_GENCODE (computed above), so SM_121 builds emit sm_121a SASS
+# rather than sm_120a SASS. Both share the same source.
 if(ENABLE_NVFP4)
   add_library(gemm_kernels_obj OBJECT csrc/gemm/gemm_kernels.cu)
   set_target_properties(gemm_kernels_obj PROPERTIES
@@ -464,7 +480,7 @@ if(ENABLE_NVFP4)
   target_compile_options(gemm_kernels_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
-      -gencode arch=compute_120a,code=sm_120a
+      ${GPU_GENCODE}
     >
   )
 endif()
@@ -588,13 +604,15 @@ if(ENABLE_FA2)
         >
       )
       message(STATUS "FA2 vendor arch: sm_${GPU_ARCH} AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
-    elseif(GPU_ARCH STREQUAL "120")
+    elseif(IS_BLACKWELL_CONSUMER)
+      # SM_120 (5090) and SM_121 (DGX Spark GB10) share the consumer Blackwell
+      # ISA; emit native SASS for the detected arch only.
       target_compile_options(fa2_vendor_obj PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:
-          "SHELL:-gencode arch=compute_120,code=sm_120"
+          "SHELL:-gencode arch=compute_${GPU_ARCH},code=sm_${GPU_ARCH}"
         >
       )
-      message(STATUS "FA2 vendor arch: sm_120 AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
+      message(STATUS "FA2 vendor arch: sm_${GPU_ARCH} AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
     endif()
   else()
     # Default multi-arch AOT (original behaviour; distributable across
@@ -602,14 +620,30 @@ if(ENABLE_FA2)
     # build). See commit history for the reason each gencode matters —
     # routing 5090 through compute_80 PTX produced a subtle sm_120 SASS
     # drift that accumulated to cos 0.98 under Pi0 FP8.
-    target_compile_options(fa2_vendor_obj PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        "SHELL:-gencode arch=compute_80,code=sm_80"
-        "SHELL:-gencode arch=compute_120,code=sm_120"
-        "SHELL:-gencode arch=compute_120,code=compute_120"
-      >
-    )
-    message(STATUS "FA2 vendor arch: sm_80 + sm_120 AOT + compute_120 PTX fallback (default)")
+    #
+    # On Spark (SM121), we also emit sm_121 native SASS so cuBLASLt
+    # heuristics don't have to JIT — the compute_120 PTX fallback still
+    # provides forward-compat for any other consumer-Blackwell SKU.
+    if(GPU_ARCH STREQUAL "121")
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          "SHELL:-gencode arch=compute_80,code=sm_80"
+          "SHELL:-gencode arch=compute_120,code=sm_120"
+          "SHELL:-gencode arch=compute_121,code=sm_121"
+          "SHELL:-gencode arch=compute_120,code=compute_120"
+        >
+      )
+      message(STATUS "FA2 vendor arch: sm_80 + sm_120 + sm_121 AOT + compute_120 PTX fallback (Spark default)")
+    else()
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          "SHELL:-gencode arch=compute_80,code=sm_80"
+          "SHELL:-gencode arch=compute_120,code=sm_120"
+          "SHELL:-gencode arch=compute_120,code=compute_120"
+        >
+      )
+      message(STATUS "FA2 vendor arch: sm_80 + sm_120 AOT + compute_120 PTX fallback (default)")
+    endif()
   endif()
 
   # Macros the wrapper reads to #ifdef-guard optional hdim/dtype
@@ -708,16 +742,16 @@ if(ENABLE_SM80_INT8_CUTLASS)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM80_INT8_CUTLASS=1)
 endif()
 
-# SM120a CUTLASS block-128 FP8 GEMM (Path B for Qwen3.6).
-if(GPU_ARCH STREQUAL "120")
+# SM120a / SM121a CUTLASS block-128 FP8 GEMM (Path B for Qwen3.6).
+if(IS_BLACKWELL_CONSUMER)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_sm120_block_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
 endif()
 
-# SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
-if(GPU_ARCH STREQUAL "120")
+# SM120a / SM121a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
+if(IS_BLACKWELL_CONSUMER)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
@@ -725,7 +759,7 @@ if(GPU_ARCH STREQUAL "120")
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
 endif()
 
-if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
+if(FLASHRT_ENABLE_MOTUS AND IS_BLACKWELL_CONSUMER)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:motus_aux_sm120_obj>
     $<TARGET_OBJECTS:motus_fp8_smallm_sm120_obj>

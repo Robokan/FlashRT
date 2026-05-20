@@ -1,0 +1,105 @@
+# FlashRT — DGX Spark image (Grace + Blackwell GB10, SM_121, aarch64).
+#
+# Base: NVIDIA NGC PyTorch 25.10 — ships CUDA 13.0 (which is required
+# for sm_121a gencode), PyTorch 2.9, cuBLASLt, nvcc 13.0.88, Python 3.12.
+# Docker auto-selects the linux/arm64 manifest on a Spark host.
+#
+# Build (on a DGX Spark host):
+#   docker build -t flashrt:spark -f docker/Dockerfile.spark .
+#
+# Build (cross-arch from x86_64 with buildx):
+#   docker buildx build --platform linux/arm64 \
+#       -t flashrt:spark -f docker/Dockerfile.spark --load .
+#
+# Run:
+#   docker run --rm --gpus all -it --runtime=nvidia flashrt:spark
+#
+# Notes on Spark vs RTX 5090 (both consumer Blackwell):
+#   - Same compute_cap family: SM_120 (5090) and SM_121 (GB10). CMakeLists
+#     gates these together via IS_BLACKWELL_CONSUMER, so all NVFP4, FP8
+#     CUTLASS, and Motus megakernels are enabled.
+#   - Same FA2 vendored attention (SM80/SM120/SM121 native SASS + PTX fallback).
+#   - Different host ISA: aarch64 Grace vs x86_64. This matters for the
+#     base-image manifest, not for any FlashRT C++/CUDA source.
+#   - Unified memory: DGX Spark sees one LPDDR pool shared between Grace
+#     CPU and Blackwell GPU. cudaMallocAsync / cudaMemcpy are still the
+#     right APIs — pointers remain device pointers from the GPU's view.
+#     Performance-tuned: no zero-copy mapping required for FlashRT's
+#     persistent-kernel paths.
+#
+# Layer order is tuned for cache reuse: anything that changes per
+# commit (the source tree) is copied last so flipping a one-line
+# patch does NOT invalidate the CUTLASS clone or pip layer.
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3
+FROM ${BASE_IMAGE}
+
+# Build-arg knobs:
+#   GPU_ARCH    pin the SASS arch. For DGX Spark this is 121. Default
+#               attempts auto-detect via nvidia-smi, but cross-arch builds
+#               on a non-Spark host won't see a Spark GPU — explicit
+#               GPU_ARCH=121 is required for buildx / CI scenarios.
+#   CUTLASS_REF pin in case upstream tags get yanked.
+#   FA2_HDIMS   forwarded to CMake to slim FA2 codegen for shipped models.
+#               Pi0.5 only needs hdim=256; defaults still ship 96/128/256.
+ARG GPU_ARCH=121
+ARG CUTLASS_REF=v4.4.2
+ARG FA2_HDIMS=""
+
+# ── Tiny base utilities. NGC PyTorch image ships cmake / git / ninja
+#    on aarch64 as well; pin ccache for iterative dev. ──
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── CUTLASS 4.4.2 — vendor in the image so per-commit rebuilds skip
+#    the ~80 MB git clone every time. CUTLASS 4.4.x has the sm_121
+#    instantiations needed by gemm_kernels.cu and the NVFP4 W4A16 path. ──
+RUN git clone --depth 1 --branch ${CUTLASS_REF} \
+        https://github.com/NVIDIA/cutlass.git /opt/cutlass \
+    && rm -rf /opt/cutlass/.git
+
+RUN python3 -m pip install --no-cache-dir \
+        --upgrade pybind11 ninja
+
+WORKDIR /workspace/FlashRT
+
+COPY CMakeLists.txt pyproject.toml setup.py README.md USAGE.md ./
+COPY csrc/         csrc/
+COPY flash_rt/     flash_rt/
+COPY flash_wm/     flash_wm/
+COPY tools/        tools/
+COPY docs/         docs/
+COPY examples/     examples/
+COPY training/     training/
+COPY tests/        tests/
+COPY scripts/      scripts/
+
+RUN mkdir -p third_party && ln -sfn /opt/cutlass third_party/cutlass
+
+# ── Build the CUDA kernels for SM_121 ──
+# Explicit GPU_ARCH=121 (default arg above) keeps the build deterministic
+# regardless of whether nvidia-smi is reachable inside the build sandbox.
+RUN cmake -B build -S . \
+        -DGPU_ARCH=${GPU_ARCH} \
+        $( [ -n "${FA2_HDIMS}" ] && echo "-DFA2_HDIMS=${FA2_HDIMS}" ) \
+ && cmake --build build -j"$(nproc)" \
+ && rm -rf build/CMakeFiles
+
+# Editable install with both torch and jax frontends — Spark plan loads
+# Orbax checkpoints via Pi05JaxFrontendRtx which is a thin shim over the
+# torch frontend, so both extras are required.
+RUN python3 -m pip install --no-cache-dir --no-build-isolation -e ".[torch,jax]"
+
+# ── Smoke check at image-build time. Spark gets:
+#      flash_rt_kernels.cpython-312-aarch64-linux-gnu.so
+#      flash_rt_fa2.cpython-312-aarch64-linux-gnu.so      (FA2 enabled on SM_121)
+#      flash_rt_jax_ffi.so
+#    Spark does NOT get libfmha_fp16_strided.so (Thor-only path). ──
+RUN python3 -c "import flash_rt; \
+print('flash_rt', flash_rt.__version__); \
+from flash_rt import flash_rt_kernels, flash_rt_fa2; \
+assert callable(flash_rt_fa2.fwd_bf16); \
+print('Spark build OK — kernels + fa2 present (SM_121)')"
+
+CMD ["python3", "-c", "import flash_rt; print('flash_rt', flash_rt.__version__, '— DGX Spark (SM_121) build ready'); import code; code.interact(local={'flash_rt': flash_rt})"]

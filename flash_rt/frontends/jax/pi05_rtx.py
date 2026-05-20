@@ -97,6 +97,136 @@ def _to_bf16_cuda(arr: np.ndarray) -> torch.Tensor:
     ).contiguous()
 
 
+def _resolve_lora_pair(
+    la_key: str, raw: dict
+) -> Optional[tuple[str, str]]:
+    """Resolve a LoRA-A key to its (base_key, lora_b_key) pair.
+
+    openpi's LoRA module flattens (sep='.') into one of two patterns:
+
+      1. **Einsum** (attention q/kv/o, action-expert q/kv/o):
+         base = ``X.w``,   la = ``X.lora_a``,   lb = ``X.lora_b``
+         → dot-separated. ``la_key.endswith('.lora_a')``.
+
+      2. **FeedForward** (mlp gating / linear projections):
+         base = ``X.gating_einsum``,
+         la   = ``X.gating_einsum_lora_a``,
+         lb   = ``X.gating_einsum_lora_b``
+         → underscore-suffixed. ``la_key.endswith('_lora_a')`` and the
+         segment before the underscore matches the base parameter name.
+
+    Returns ``(base_key, lb_key)`` if both endpoints exist in ``raw``,
+    or ``None`` if the LoRA-A is orphaned. Caller is expected to warn
+    on ``None`` returns rather than crash, so a partially-broken
+    checkpoint surfaces in logs (and downstream key-mismatch errors)
+    rather than silently producing wrong weights.
+    """
+    # Pattern 1: dot-separated Einsum.
+    if la_key.endswith(".lora_a"):
+        prefix = la_key[: -len(".lora_a")]
+        base_key = prefix + ".w"
+        lb_key = prefix + ".lora_b"
+        if base_key in raw and lb_key in raw:
+            return base_key, lb_key
+
+    # Pattern 2: underscore-suffixed FeedForward.
+    if la_key.endswith("_lora_a") and "." in la_key:
+        head, tail = la_key.rsplit(".", 1)
+        if tail.endswith("_lora_a") and tail != "lora_a":
+            base_name = tail[: -len("_lora_a")]
+            base_key = f"{head}.{base_name}"
+            lb_key = f"{head}.{base_name}_lora_b"
+            if base_key in raw and lb_key in raw:
+                return base_key, lb_key
+
+    return None
+
+
+def _maybe_merge_lora(
+    raw: dict,
+    *,
+    scaling: float = 1.0,
+    log_layers: bool = False,
+) -> dict:
+    """Merge LoRA params into base weights in fp32, in place on ``raw``.
+
+    Why fp32: openpi's PyTorch parity work
+    (`openpi/PYTORCH_PARITY_DEBUG.md`) showed that pre-merging LoRA in
+    bf16 causes ~8% magnitude bias in the final action because the
+    rank-r intermediate gets quantized. Doing the same merge in fp32 —
+    BEFORE the subsequent fp32→bf16 truncation that downstream cares
+    about — costs zero precision relative to the JAX bf16 inference
+    path because the bf16 rounding now happens on the *full* merged
+    weight, not on the narrow rank-r intermediate.
+
+    Why a loader-level merge (vs. runtime LoRA): the FlashRT FP8 GEMM
+    operates on the merged weight. Keeping ``lora_a`` / ``lora_b``
+    separate at inference would require either (a) a separate FP8
+    calibration / quantize pass for the LoRA neck (way more invasive),
+    or (b) running the LoRA adds in bf16/fp32 alongside the FP8 base
+    (sacrifices the FlashRT speed advantage). Offline fp32-merge
+    sidesteps both.
+
+    Args:
+        raw: flat dict from ``_load_orbax``. Modified in place: lora_a /
+            lora_b entries are removed; their corresponding base entries
+            are replaced with the merged fp32 weight.
+        scaling: LoRA scaling factor (alpha / rank, or alpha / sqrt(rank)
+            for rslora). Default 1.0 matches openpi pi05's r=16/α=16 and
+            r=32/α=32 LoRA configs. Override via the
+            ``FLASHRT_LORA_SCALING`` env var at the call site.
+        log_layers: emit a debug-level log line per merged tensor; useful
+            for verifying every expected LoRA slot was picked up.
+
+    Returns:
+        ``raw`` (the same dict instance), with LoRA fused away.
+    """
+    # Catches both Einsum (.lora_a) and FeedForward (_lora_a) patterns.
+    lora_a_keys = sorted(k for k in raw if k.endswith("lora_a"))
+    if not lora_a_keys:
+        logger.info("LoRA merge: no lora_a keys found, treating as base checkpoint")
+        return raw
+
+    merged = 0
+    skipped: list[str] = []
+    for la_key in lora_a_keys:
+        pair = _resolve_lora_pair(la_key, raw)
+        if pair is None:
+            logger.warning(
+                "LoRA merge: %s has no matching base weight + lora_b — skipping",
+                la_key,
+            )
+            skipped.append(la_key)
+            continue
+        base_key, lb_key = pair
+
+        w = raw[base_key].astype(np.float32, copy=False)
+        la = raw[la_key].astype(np.float32, copy=False)
+        lb = raw[lb_key].astype(np.float32, copy=False)
+        # np.matmul broadcasts over leading dims, so multi-layer stacks
+        # (la (L, ..., r), lb (L, ..., r, out)) merge in one call.
+        delta = np.matmul(la, lb)
+        if delta.shape != w.shape:
+            logger.warning(
+                "LoRA merge: shape mismatch at %s: base=%s, delta=%s — skipping",
+                base_key, w.shape, delta.shape,
+            )
+            skipped.append(la_key)
+            continue
+
+        raw[base_key] = w + scaling * delta
+        del raw[la_key]
+        del raw[lb_key]
+        merged += 1
+        if log_layers:
+            logger.debug("LoRA merge: %s ← + %.4f * (%s @ %s)", base_key, scaling, la_key, lb_key)
+
+    if skipped:
+        logger.warning("LoRA merge: skipped %d entries: %s", len(skipped), skipped[:5])
+    logger.info("LoRA merge: fused %d tensor(s) at scaling=%.4f", merged, scaling)
+    return raw
+
+
 def convert_pi05_orbax(
     checkpoint_dir: Union[str, pathlib.Path]
 ) -> dict:
@@ -114,6 +244,14 @@ def convert_pi05_orbax(
     checkpoint_dir = pathlib.Path(checkpoint_dir)
     logger.info("Loading Pi0.5 Orbax checkpoint: %s", checkpoint_dir)
     raw = _load_orbax(str(checkpoint_dir))
+
+    # LoRA merge (no-op if the checkpoint has no .lora_a entries). Done
+    # BEFORE the fp32→bf16 truncation below so the rank-r LoRA neck
+    # never sees bf16 — matches the JAX server's effective accuracy
+    # without the runtime LoRA cost. Override scaling via env if your
+    # training used non-default alpha/rank.
+    lora_scaling = float(os.environ.get("FLASHRT_LORA_SCALING", "1.0"))
+    raw = _maybe_merge_lora(raw, scaling=lora_scaling)
 
     # Bit-truncate fp32 → bf16 → fp32. Production loads everything as
     # bf16; truncating now guarantees byte-identical FP8 scales vs the
@@ -450,12 +588,25 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         use_fp8: bool = True,
         hardware: Optional[str] = None,
         fp8_layout: Optional[str] = None,
+        robot_action_dim: Optional[int] = None,
     ):
         # Don't chain to Pi05TorchFrontendRtx.__init__ — it expects a safetensors
         # file. We replicate the body and swap the loader.
+        from flash_rt.core.utils.actions import LIBERO_ACTION_DIM
+        from flash_rt.models.pi05.pipeline_rtx import ACTION_DIM as _ACTION_DIM
+
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
+        # See Pi05TorchFrontendRtx.__init__ for rationale: defaults to 7
+        # (LIBERO); pass robot_action_dim=16 for OpenArm bimanual.
+        if robot_action_dim is None:
+            robot_action_dim = int(
+                os.environ.get("FLASHRT_ROBOT_ACTION_DIM", LIBERO_ACTION_DIM))
+        if not 1 <= robot_action_dim <= _ACTION_DIM:
+            raise ValueError(
+                f"robot_action_dim must be in [1, {_ACTION_DIM}], got {robot_action_dim}")
+        self.robot_action_dim = int(robot_action_dim)
         self.max_prompt_len = int(max_prompt_len)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)

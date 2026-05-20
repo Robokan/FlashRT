@@ -475,10 +475,22 @@ class Pi05TorchFrontendRtx:
                  cache_frames: int = 1,
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
-                 fp8_layout: Optional[str] = None):
+                 fp8_layout: Optional[str] = None,
+                 robot_action_dim: Optional[int] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
+        # The model outputs ACTION_DIM=32 raw values; the frontend slices
+        # the first ``robot_action_dim`` to match the robot's DOF.
+        # Default 7 = LIBERO (xyz + rot + gripper). OpenArm bimanual is 16.
+        # Override via constructor (preferred) or env var FLASHRT_ROBOT_ACTION_DIM.
+        if robot_action_dim is None:
+            robot_action_dim = int(
+                os.environ.get("FLASHRT_ROBOT_ACTION_DIM", LIBERO_ACTION_DIM))
+        if not 1 <= robot_action_dim <= ACTION_DIM:
+            raise ValueError(
+                f"robot_action_dim must be in [1, {ACTION_DIM}], got {robot_action_dim}")
+        self.robot_action_dim = int(robot_action_dim)
         self.max_prompt_len = int(max_prompt_len)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
@@ -1447,7 +1459,7 @@ class Pi05TorchFrontendRtx:
 
         raw_actions = self._noise_out.float().cpu().numpy()  # (chunk, 32)
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        robot_actions = unnorm[:, :self.robot_action_dim]
 
         if debug:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
@@ -1498,7 +1510,7 @@ class Pi05TorchFrontendRtx:
 
         raw_actions = self._noise_out.float().cpu().numpy()
         unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
+        robot_actions = unnorm[:, :self.robot_action_dim]
 
         if debug:
             logger.info(
@@ -1706,7 +1718,7 @@ class Pi05TorchFrontendRtx:
         for b in range(PI05_BATCH_SIZE):
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            results.append({"actions": unnorm[:, :self.robot_action_dim]})
         return results
 
     def get_latency_stats(self) -> dict:

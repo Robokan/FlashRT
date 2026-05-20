@@ -16,8 +16,12 @@ end-to-end on hardware.** JAX-on-aarch64-Blackwell works out of the
 box via `jax[cuda12]` PyPI wheels (no NGC base or source build
 needed). Pi0.5 LIBERO loads + runs in ~57 ms/iter on the GB10 — well
 inside the 200 ms ceiling and right on the plan's 50–150 ms
-prediction. Phases 2–7 still un-run against real artifacts (OpenArm
-LoRA checkpoint, robot, calibration data).
+prediction. A live MuJoCo playground
+(`examples/libero_playground.py`) drives the full LIBERO sim from
+Pi0.5 + FlashRT and lets you hot-swap chunk-execution / blending
+modes; on first run it solved `libero_object` task 0 in 44 s of sim
+time with zero deadline misses. Phases 2–7 still un-run against real
+artifacts (OpenArm LoRA checkpoint, robot, calibration data).
 
 ## Phase status
 
@@ -138,6 +142,80 @@ NGC base image or source build needed. Driver 580.142 + bundled CUDA
 12.8 runtime works on SM_121. Same story for sentencepiece +
 safetensors (`uv pip install sentencepiece safetensors`).
 
+## Playground — interactive LIBERO sim with hot-swappable blending
+
+`examples/libero_playground.py` opens a live MuJoCo viewer window, takes
+free-form prompts on stdin, and lets you switch chunk execution mode at
+runtime to compare smoothness. Mode 2 (async pipelined via
+`flash_rt.runtime.rtc.AsyncChunkRunner`) solved `libero_object` task 0
+("pick up the alphabet soup and place it in the basket") in 44 s of sim
+time on first attempt — 877 actions / 110 chunks / 0 deadline misses /
+last-infer 101.9 ms / reward 1.00 at step 859. The async runner cleanly
+absorbed Pi0.5's 50–100 ms inference under the 20 Hz control budget.
+
+Modes available (toggle with `1`/`2`/`3`/`4`):
+
+1. **sync truncate-replan, k=5** — the canonical LIBERO eval pattern.
+   Robot visibly hitches every 5 steps while inference runs.
+2. **async pipelined, no blend** — `AsyncChunkRunner` with
+   `blend_steps=0`, `miss_policy="hold_last"`. Hard swap at chunk
+   seams, but never stalls. **Default.**
+3. **async + tail blend = 3** — same as 2 but linearly blends the last
+   3 actions of an exhausted chunk with the previous served action.
+   Only fires on deadline miss; on the Spark we're fast enough that
+   misses are rare.
+4. **async + tail blend = 5** — same with a 5-step blend window.
+
+Tail-blend (`blend_steps>0` in `AsyncChunkRunner`) is end-of-chunk
+smoothing for the deadline-miss case, not cross-chunk seam smoothing.
+A future mode 5 (cross-chunk seam blend on the new-chunk side) would
+get us closer to what `openpi/AsyncActionChunkBroker` does without
+needing the server-side RTC inpainting plumbing.
+
+LIBERO sim install (incremental on top of the Phase 1 venv):
+
+```bash
+cd ~/sparkpack/FlashRT && source .venv/bin/activate
+uv pip install "robosuite==1.4.1" mujoco bddl easydict gym \
+    robomimic hydra-core cloudpickle einops future \
+    opencv-python-headless
+uv pip install -e ~/sparkpack/openpi/third_party/libero
+# libero outer dir has no __init__.py so the editable install leaves
+# MAPPING empty; export PYTHONPATH for import-time:
+export PYTHONPATH=$HOME/sparkpack/openpi/third_party/libero
+# Seed ~/.libero/config.yaml to skip the interactive first-run prompt
+# (the playground does it for you; if you import libero manually first,
+# answer "N" to the "custom path?" question).
+```
+
+Three small drifts to watch:
+
+- **robosuite must be pinned to 1.4.1.** 1.5+ removed
+  `robosuite.environments.manipulation.single_arm_env.SingleArmEnv`
+  which libero 0.1.0 imports directly. openpi's
+  `examples/libero/requirements.in` pins 1.4.1 for the same reason.
+- **`torch.load(weights_only=True)` (default since 2.6)** rejects
+  libero's numpy-pickle init-state files. The playground monkey-patches
+  `torch.load` to default `weights_only=False` for its own process. The
+  libero init states ship with the libero source and are trusted.
+- **Spark = unified memory** (like Jetson). The playground applies the
+  same EGL cleanup patches (`robosuite.renderers.context.egl_context`
+  + `robosuite.utils.binding_utils.MjRenderContext.__del__` no-ops)
+  that `examples/thor/eval_libero.py` already uses, to avoid EGL
+  release races into CUDA-mapped memory.
+
+Run:
+
+```bash
+PYTHONPATH=$HOME/sparkpack/openpi/third_party/libero \
+python examples/libero_playground.py \
+    --checkpoint ~/.cache/openpi/openpi-assets/checkpoints/pi05_libero \
+    --suite libero_object --task 0 --mode 2
+```
+
+Cold start ~25 s (kernel autotune, same as the Phase 1 smoke); viewer
+opens and you control via stdin (`h` for help, `q` to quit).
+
 ## Calibration warning (followup, not a blocker)
 
 The first FP8 calibration on pi05_libero with 1 random synthetic
@@ -155,11 +233,11 @@ revisit calibration percentile / sample count.
 - The flashrt_spark Docker image build (`docker compose -f
   docker/compose.spark.yml build flashrt_spark`).
 - The full LIBERO simulator eval (`scripts/spark_phase1_libero_run.sh`)
-  — needs `libero + robosuite + mujoco` installed which is a separate
-  install adventure on aarch64+Blackwell. The smoke gate validates
-  the FlashRT stack itself with zero new code, so this is purely a
-  policy-quality regression check. Worth skipping unless we suspect
-  numerical drift.
+  on the headless EGL path is still un-run, but the **interactive
+  playground above is the same stack** (libero + robosuite 1.4.1 +
+  mujoco + Pi0.5 via FlashRT JAX) and it solves task 0 of
+  `libero_object` first try. The `_run.sh` adds a benchmark sweep on
+  top; not a separate risk.
 - Phases 2–7 (`pi05_openarm_ngc_lora_v4` load, calibration on real
   OpenArm data, parity vs JAX server, server wrapping, robot test,
   latency breakdown). Code is in place; not yet run on hardware.

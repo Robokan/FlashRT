@@ -11,16 +11,18 @@ Durable agent rules: [`../AGENTS.md`](../AGENTS.md).
 ## TL;DR
 
 Code for all 7 phases is in place and committed to `spark-sm121-port`
-on `Robokan/FlashRT`. The CMake configure step has been verified on
-Spark — SM_121 / NVFP4 / FA2 flags all light up correctly. The actual
-CUDA kernel compile has **not** been run yet. Phase 0–7 gates have
-all been written but not executed against the hardware.
+on `Robokan/FlashRT`. **Phase 0 is now verified end-to-end on
+hardware** — the SM_121 + aarch64 kernel build compiles cleanly and
+the smoke gate passes all 9 checks, including a real `fa2.fwd_bf16`
+launch on Pi0.5-realistic shapes. Phases 1–7 have code in place but
+are still un-run against real artifacts (Orbax checkpoints, robot,
+calibration data).
 
 ## Phase status
 
 | Phase | Description | Code | Verified on Spark? |
 |---|---|---|---|
-| 0 | Build FlashRT for SM_121 + aarch64 | done — `docker/Dockerfile.spark`, `docker/compose.spark.yml`, `CMakeLists.txt` patches, `scripts/spark_build_smoke.py` | configure: yes; full build: **no** |
+| 0 | Build FlashRT for SM_121 + aarch64 | done — `docker/Dockerfile.spark`, `docker/compose.spark.yml`, `CMakeLists.txt` patches, `scripts/spark_build_smoke.py` | **configure: yes; full build: yes (native venv, -j8, ~8.4 min); smoke gate: PASS (9/9) — see "Phase 0 hardware-verified results" below** |
 | 1 | `pi05_libero` Orbax load via `Pi05JaxFrontendRtx` | done — `scripts/spark_phase1_libero_smoke.py`, `scripts/spark_phase1_libero_run.sh` | no |
 | 2 | LoRA Orbax load + fp32 merge (`pi05_openarm_ngc_lora_v4`) | done — `_maybe_merge_lora` in `flash_rt/frontends/jax/pi05_rtx.py`, `tests/test_lora_merge_jax_loader.py`, `scripts/spark_phase2_lora_load.py` | unit tests: not run on Spark |
 | 3 | FP8 calibration on stratified OpenArm samples | done — `scripts/spark_phase3_prepare_calib.py`, `scripts/spark_phase3_run_calib.py` | no |
@@ -42,15 +44,61 @@ all been written but not executed against the hardware.
   -- SM120a CUTLASS NVFP4 W4A16 GEMM: ENABLED
   -- FA2 vendor arch: sm_80 + sm_120 + sm_121 AOT + compute_120 PTX fallback (Spark default)
   ```
+- **`cmake --build build -j8` finishes in ~8.4 min wall-time** on a
+  workstation Spark (with the desktop + Cursor running). All 58
+  ninja steps green; only two harmless "unused variable / function"
+  warnings, zero errors. Both `.so` artifacts produced:
+  - `flash_rt/flash_rt_kernels.cpython-312-aarch64-linux-gnu.so`
+  - `flash_rt/flash_rt_fa2.cpython-312-aarch64-linux-gnu.so`
+- Memory at `-j8`: peaked at ~40 GB free during the CUTLASS-template
+  instantiation phase (8 nvcc concurrent), recovered to >100 GB once
+  template TUs finished. No swap touched, no OOM-killer activity.
+  This validates the AGENTS.md `BUILD_J=8` budget for the 110 GB-free
+  case; the documented `BUILD_J=4` workstation default remains correct
+  for tighter memory situations.
+
+## Phase 0 hardware-verified results
+
+`python scripts/spark_build_smoke.py` exits 0 with all 9 checks PASS:
+
+```
+PASS  import flash_rt                  version=0.1.0
+PASS  locate flash_rt_kernels.so       flash_rt_kernels.cpython-312-aarch64-linux-gnu.so
+PASS  locate flash_rt_fa2.so           flash_rt_fa2.cpython-312-aarch64-linux-gnu.so
+PASS  host arch                        aarch64 (Grace)
+PASS  get_gpu_sm_version               121 (DGX Spark GB10)
+PASS  supports_fp8()                   True
+PASS  supports_nvfp4()                 True
+PASS  get_gpu_name                     'NVIDIA GB10'
+PASS  fa2.fwd_bf16 launch              shape=(1, 1024, 8, 256) dtype=torch.bfloat16 |O|.mean()=0.041
+```
+
+The fa2.fwd_bf16 step was originally written assuming a high-level
+`(q, k, v) -> Tensor` wrapper that doesn't exist — `flash_rt_fa2` is
+a low-level pybind ABI taking raw device pointers + a pre-allocated
+O and softmax_lse in BSHD layout (matches
+`flash_rt/hardware/rtx/attn_backend.py::_call_fvk_fa2`). The smoke
+script was fixed to mirror that calling convention exactly with
+B=1, S=1024, H=8, D=256 — the same code path Pi0.5 will hit at
+inference time. PyTorch was installed via the aarch64 CUDA wheel
+channel:
+```bash
+uv pip install --index-url https://download.pytorch.org/whl/cu128 torch
+# → torch 2.11.0+cu128, bundles CUDA 12.8 runtime, talks to driver 580 OK
+```
 
 ## What's not yet verified
 
-- The actual `cmake --build build` step. Compilation of the FA2 sweep,
-  CUTLASS GEMMs, Motus kernels, and FA2 pybind module for SM_121. This
-  is the biggest unknown — there *could* still be a code path that
-  references `sm_120` in a way that doesn't generalize to `sm_121`.
-- Every Python-side phase script (1–7).
-- The flashrt_spark Docker image.
+- Every Python-side **phase 1–7** script. None have been run against
+  real Orbax checkpoints or robot data yet.
+- JAX-CUDA on aarch64 in this venv — the standard NGC route is
+  documented in the plan as the preferred Phase 1 environment because
+  upstream JAX wheels for aarch64+Blackwell are not guaranteed pip-
+  installable. Need to decide between (a) extending the venv with
+  jax-cuda12 from PyPI and hoping it picks up CUDA 12.8 from the
+  torch bundle, vs (b) using the NGC container per the original plan.
+- The flashrt_spark Docker image build (`docker compose -f
+  docker/compose.spark.yml build flashrt_spark`).
 
 ## Lessons learned the hard way
 

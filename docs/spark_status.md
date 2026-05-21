@@ -11,17 +11,21 @@ Durable agent rules: [`../AGENTS.md`](../AGENTS.md).
 ## TL;DR
 
 Code for all 7 phases is in place and committed to `spark-sm121-port`
-on `Robokan/FlashRT`. **Phases 0 and 1 (smoke) are now verified
+on `Robokan/FlashRT`. **Phases 0, 1, and 2 (smoke) are now verified
 end-to-end on hardware.** JAX-on-aarch64-Blackwell works out of the
 box via `jax[cuda12]` PyPI wheels (no NGC base or source build
 needed). Pi0.5 LIBERO loads + runs in ~57 ms/iter on the GB10 — well
 inside the 200 ms ceiling and right on the plan's 50–150 ms
-prediction. A live MuJoCo playground
-(`examples/libero_playground.py`) drives the full LIBERO sim from
-Pi0.5 + FlashRT and lets you hot-swap chunk-execution / blending
-modes; on first run it solved `libero_object` task 0 in 44 s of sim
-time with zero deadline misses. Phases 2–7 still un-run against real
-artifacts (OpenArm LoRA checkpoint, robot, calibration data).
+prediction. The OpenArm v4 LoRA Orbax checkpoint
+(`pi05_openarm_ngc_lora_v4`) loads through the fp32-merge path,
+fans 10 stacked LoRA tensors into 180 per-layer merges, and produces
+finite (10, 16) actions through the FlashRT JAX SM_121 pipeline.
+A live MuJoCo playground (`examples/libero_playground.py`) drives
+the full LIBERO sim from Pi0.5 + FlashRT and lets you hot-swap
+chunk-execution / blending modes; on first run it solved
+`libero_object` task 0 in 44 s of sim time with zero deadline misses.
+Phases 3–7 still un-run against real artifacts (stratified OpenArm
+calibration set, JAX-server parity reference, robot).
 
 ## Phase status
 
@@ -29,7 +33,7 @@ artifacts (OpenArm LoRA checkpoint, robot, calibration data).
 |---|---|---|---|
 | 0 | Build FlashRT for SM_121 + aarch64 | done — `docker/Dockerfile.spark`, `docker/compose.spark.yml`, `CMakeLists.txt` patches, `scripts/spark_build_smoke.py` | **configure: yes; full build: yes (native venv, -j8, ~8.4 min); smoke gate: PASS (9/9) — see "Phase 0 hardware-verified results" below** |
 | 1 | `pi05_libero` Orbax load via `Pi05JaxFrontendRtx` | done — `scripts/spark_phase1_libero_smoke.py`, `scripts/spark_phase1_libero_run.sh` | **smoke gate: PASS (5/5) — 57.2 ms mean steady-state, see "Phase 1 hardware-verified results" below; full LIBERO simulator eval: still pending** |
-| 2 | LoRA Orbax load + fp32 merge (`pi05_openarm_ngc_lora_v4`) | done — `_maybe_merge_lora` in `flash_rt/frontends/jax/pi05_rtx.py`, `tests/test_lora_merge_jax_loader.py`, `scripts/spark_phase2_lora_load.py` | unit tests: not run on Spark |
+| 2 | LoRA Orbax load + fp32 merge (`pi05_openarm_ngc_lora_v4`) | done — `_maybe_merge_lora` in `flash_rt/frontends/jax/pi05_rtx.py`, `tests/test_lora_merge_jax_loader.py`, `scripts/spark_phase2_lora_load.py` | **smoke gate: PASS (5/5) — 10 LoRA tensors (180 per-layer merges) consumed, finite (10, 16) actions, see "Phase 2 hardware-verified results" below** |
 | 3 | FP8 calibration on stratified OpenArm samples | done — `scripts/spark_phase3_prepare_calib.py`, `scripts/spark_phase3_run_calib.py` | no |
 | 4 | Parity vs the openpi JAX server | done — `scripts/spark_phase4_parity.py` and `robot_action_dim` patches in `pi05_rtx.py` (torch + jax frontends and `flash_rt/api.py`) | no |
 | 5 | Serve FlashRT via openpi WebsocketPolicyServer | done — `flash_rt/serving/openpi_adapter.py` (`FlashRTPolicyAdapter`), `scripts/serve_policy_flashrt.py`, `scripts/spark_phase5_adapter_smoke.py` | no |
@@ -142,6 +146,58 @@ NGC base image or source build needed. Driver 580.142 + bundled CUDA
 12.8 runtime works on SM_121. Same story for sentencepiece +
 safetensors (`uv pip install sentencepiece safetensors`).
 
+## Phase 2 hardware-verified results
+
+`FLASHRT_ROBOT_ACTION_DIM=16 python scripts/spark_phase2_lora_load.py
+--checkpoint ~/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05/29999`
+exits 0:
+
+```
+PASS  checkpoint dir
+PASS  detect LoRA params                10 lora_a/lora_b tensor pairs (~180 per-layer merges) in 8.0s (71 tensors total)
+PASS  LoRA merge consumes all pairs     merged 10 tensors
+PASS  per-layer merge count plausible   180 (expected 80..240)
+PASS  load_model(framework='jax')       18.3s incl. LoRA merge
+PASS  merged-ckpt inference             shape=(10, 16) dtype=float32 1110.8ms first call
+Phase 2 PASSED — LoRA merge wired in. Advance to Phase 3.
+```
+
+The v4 LoRA recipe targets every PaLI-Gemma encoder + action-expert
+attention/MLP site at rank 16 (encoder) or rank 32 (action expert),
+producing 10 stacked LoRA tensors that fan out into 180 per-layer
+merges. Both openpi key schemes are present in the checkpoint —
+dot-separated for the einsum sites (`...attn.q_einsum.lora_a`) and
+underscore-suffixed for the FFN sites
+(`...mlp.gating_einsum_lora_a`); `_maybe_merge_lora` consumes both,
+and the smoke script's detector was fixed to match (was previously
+counting only the dot-separated form and under-reporting 6 pairs
+instead of 10).
+
+The inference smoke confirmed three Spark-specific things at once:
+
+- `FLASHRT_ROBOT_ACTION_DIM=16` is honored end-to-end; the
+  Pi05JaxFrontendRtx returns `(10, 16)` actions for OpenArm bimanual
+  rather than the LIBERO default `(10, 7)`. The
+  `LIBERO_ACTION_DIM=7 -> 16` patch that landed in `pi05_rtx.py` is
+  active.
+- The Orbax loader transparently handles the v4 nested layout
+  (`<root>/chocolate_bars_pi05/29999/params/...`) without needing a
+  `--params-subdir` flag — the `_load_orbax` autodiscovery added in
+  Phase 1 covers it.
+- The FP8 calibration warning that fired on Phase 1's synthetic-obs
+  smoke fires again here with similar top offenders
+  (`encoder_ffn_down_w_16`), now at 3.857x median instead of 20.571x —
+  i.e. on the OpenArm v4 weights the same FFN-down channels are still
+  the worst calibration outliers but the gap is ~5x smaller. Phase 3
+  (calibration on real OpenArm observations) is the right place to
+  pull these in; the warning is not a Phase 2 blocker.
+
+First-call latency (1.1 s) is dominated by FP8 calibration + CUDA
+graph capture; steady-state should match the ~57 ms pi05_libero
+number once the graph is hot. Steady-state measurement is folded
+into Phase 4 (parity), since that script runs many inferences in a
+row anyway.
+
 ## Playground — interactive LIBERO sim with hot-swappable blending
 
 `examples/libero_playground.py` opens a live MuJoCo viewer window, takes
@@ -218,15 +274,23 @@ opens and you control via stdin (`h` for help, `q` to quit).
 
 ## Calibration warning (followup, not a blocker)
 
-The first FP8 calibration on pi05_libero with 1 random synthetic
-observation flagged 5 scales >20× median, the worst being
-`encoder_ffn_down_w_16` at 20.571×. Calibration completed and
-inference outputs are all finite, but FP8 dynamic-range headroom on
-those layers is compressed. The smoke uses 1 random obs which is the
-worst-possible-case for calibration; in Phase 3 we calibrate on
-50–100 stratified real observations, which should pull these scales
-in. If Phase 2's parity numbers come in low for similar-named layers,
-revisit calibration percentile / sample count.
+The synthetic-obs FP8 calibration flags a recurring set of FFN-down
+channels as outliers across BOTH checkpoints tested so far:
+
+| Checkpoint        | Worst layer            | x median | # flagged |
+|-------------------|------------------------|----------|-----------|
+| pi05_libero       | encoder_ffn_down_w_16  | 20.571   | 5         |
+| pi05_openarm v4   | encoder_ffn_down_w_16  | 3.857    | 4         |
+
+The fact that the SAME layer is the worst offender on two unrelated
+fine-tunes points at a base-model property (PaLI-Gemma encoder
+mid-stack FFN-down channels have heavy-tailed activations), not a
+checkpoint-specific bug. The smoke uses 1 random obs which is the
+worst-possible case; in Phase 3 we calibrate on 50–100 stratified
+real OpenArm observations, which should pull all of these in. If
+Phase 4 parity numbers come in low for these layers specifically,
+revisit calibration percentile / sample count, or keep
+`encoder_ffn_down_w_16` in FP16.
 
 ## What's not yet verified
 
@@ -238,9 +302,10 @@ revisit calibration percentile / sample count.
   mujoco + Pi0.5 via FlashRT JAX) and it solves task 0 of
   `libero_object` first try. The `_run.sh` adds a benchmark sweep on
   top; not a separate risk.
-- Phases 2–7 (`pi05_openarm_ngc_lora_v4` load, calibration on real
-  OpenArm data, parity vs JAX server, server wrapping, robot test,
-  latency breakdown). Code is in place; not yet run on hardware.
+- Phases 3–7 (calibration on real OpenArm data, parity vs JAX
+  server, server wrapping, robot test, latency breakdown). Code is
+  in place; not yet run on hardware. Phase 2 (LoRA load) is now
+  verified — see "Phase 2 hardware-verified results" above.
 
 ## Lessons learned the hard way
 

@@ -88,8 +88,14 @@ def main() -> int:
         raw = _load_orbax(str(ckpt))
         load_time = time.perf_counter() - t0
 
-        n_la = sum(1 for k in raw if k.endswith(".lora_a"))
-        n_lb = sum(1 for k in raw if k.endswith(".lora_b"))
+        # NB: endswith("lora_a"), NOT endswith(".lora_a"). openpi LoRA
+        # uses two key schemes — dot-separated for einsum sites
+        # ("...attn.q_einsum.lora_a") and underscore-suffixed for FFN
+        # sites ("...mlp.gating_einsum_lora_a"). _maybe_merge_lora
+        # already accepts both via its endswith("lora_a") filter; the
+        # detector here was stricter and under-counted.
+        n_la = sum(1 for k in raw if k.endswith("lora_a"))
+        n_lb = sum(1 for k in raw if k.endswith("lora_b"))
         if n_la == 0 and n_lb == 0:
             _fail("detect lora_a / lora_b keys",
                   f"no LoRA params found in {ckpt}; this looks like a "
@@ -100,8 +106,21 @@ def main() -> int:
             _fail("count lora_a / lora_b",
                   f"asymmetric: lora_a={n_la}, lora_b={n_lb} (expected equal)")
             failures.append("lora_count_asymmetric")
+
+        # Most pi05 LoRA tensors stack across layers in their leading
+        # dim (e.g. (18, 2048, r)). Report per-layer LoRA count too so
+        # the "merge count plausible" band makes sense across single-
+        # tensor-per-layer and stacked-tensor recipes.
+        per_layer = 0
+        for k in raw:
+            if not k.endswith("lora_a"):
+                continue
+            shape = raw[k].shape
+            per_layer += shape[0] if len(shape) >= 3 else 1
         _pass("detect LoRA params",
-              f"{n_la} pairs of lora_a/lora_b in {load_time:.1f}s ({len(raw)} tensors total)")
+              f"{n_la} lora_a/lora_b tensor pairs (~{per_layer} per-layer "
+              f"merges after unstacking) in {load_time:.1f}s "
+              f"({len(raw)} tensors total)")
     except Exception as e:  # pragma: no cover
         _fail("load + detect LoRA", f"{type(e).__name__}: {e}")
         traceback.print_exc()
@@ -110,8 +129,8 @@ def main() -> int:
     # 2. Merge.
     try:
         merged_raw = _maybe_merge_lora(raw, scaling=1.0)
-        n_la_after = sum(1 for k in merged_raw if k.endswith(".lora_a"))
-        n_lb_after = sum(1 for k in merged_raw if k.endswith(".lora_b"))
+        n_la_after = sum(1 for k in merged_raw if k.endswith("lora_a"))
+        n_lb_after = sum(1 for k in merged_raw if k.endswith("lora_b"))
         if n_la_after == 0 and n_lb_after == 0:
             _pass("LoRA merge consumes all pairs", f"merged {n_la} tensors")
         else:
@@ -123,14 +142,19 @@ def main() -> int:
         traceback.print_exc()
         return 1
 
-    # 3. Sanity check on merge count.
-    EXPECTED_MIN = 80   # at minimum: paligemma q/kv/o + ff over 18 layers
-    EXPECTED_MAX = 180  # paligemma + action expert + every layer ≤ 180
-    if EXPECTED_MIN <= n_la <= EXPECTED_MAX:
-        _pass("merge count plausible", f"{n_la} (expected {EXPECTED_MIN}..{EXPECTED_MAX})")
+    # 3. Sanity check on per-layer merge count.
+    # 18 paligemma layers x 4 attn sites (q,kv,o,attn_vec) + 18 layers x
+    # 2 ffn sites (gating, linear) = 108 per-layer merges for the
+    # encoder. With an action-expert (suffix "_1") that mirrors the
+    # encoder, the full LoRA-everywhere recipe is 216.
+    EXPECTED_MIN = 80
+    EXPECTED_MAX = 240
+    if EXPECTED_MIN <= per_layer <= EXPECTED_MAX:
+        _pass("per-layer merge count plausible",
+              f"{per_layer} (expected {EXPECTED_MIN}..{EXPECTED_MAX})")
     else:
-        _warn("merge count outside expected band",
-              f"{n_la} (expected {EXPECTED_MIN}..{EXPECTED_MAX}). "
+        _warn("per-layer merge count outside expected band",
+              f"{per_layer} (expected {EXPECTED_MIN}..{EXPECTED_MAX}). "
               "Not necessarily wrong — a different LoRA target set produces "
               "different counts. Verify against your training recipe.")
 

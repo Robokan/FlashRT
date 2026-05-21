@@ -1316,8 +1316,43 @@ The cache replaces the old "rebuild on every length change" path
 that landed in G3. The frontend's three-tier log keeps per-frame
 operation at 25–30 Hz quiet: ``was_built`` → INFO with
 ``NEW pipeline cached, cache size=N``; cache-hit-with-swap →
-DEBUG; same-pipeline re-upload → DEBUG. Real-server validation
-(Phase 4 n=30) is the next step.
+DEBUG; same-pipeline re-upload → DEBUG.
+
+**Phase 4 hardware validation (n=30) — passed:**
+
+```
+cos: min=0.9478  median=0.9920  mean=0.9886
+ratio: min=0.999 median=1.090 max=1.608  (chunk_size=10 vs 50 — known)
+cos >= 0.99 : 19/30 (63%)
+cos >= 0.95 : 29/30 (97%)
+
+Latency (round-trip client → ws → server → graph → back):
+  Frames 0-21 (cache-fill window): 7 build spikes at frames
+    0, 3, 5, 8, 12, 13, 21 (one per distinct prompt_len in calib
+    npz: 74, 75, 76, 78, 79, 80, 81)
+  Frames 22-29 (post-fill, steady): p50 = 210 ms
+
+Vs baseline (pre-cache, state-in-prompt, no padding) measured G3:
+  600-800 ms every single frame
+Vs baseline (pre-cache, pad-state degraded-quality mode):
+  68 ms every frame BUT cos = 0.96 (attention pollution)
+```
+
+Cache filled to 8 entries (one extra at server-startup priming),
+hit the warn threshold — because the calibration npz has more
+prompt-text diversity (Put/put, with/without trailing `.`, with/
+without ` (mirrored)` augmentation suffix) than a real production
+deployment with a fixed operator prompt. Real OpenArm chocolate_bars
+should see 3–5 distinct token counts driven only by state-vector
+variation. ``prewarm_prompt_buckets`` not yet wired into
+``serve_policy_flashrt.py`` startup; doing so eliminates ALL build
+spikes during inference and is the obvious production follow-up.
+
+Report: ``/tmp/phase4_postcache.json``. Validated against commit
+``67631d4`` (which also includes a small init-fix:
+``Pi05JaxFrontendRtx.__init__`` was missing the cache fields
+because its body replicates rather than chains to super; same
+pattern G3 already established for ``_fp8_scales_snapshot``).
 
 **Shipped — native FA2 varlen wrapper (csrc).** Bit-exact
 verified against the dense path on real Pi0.5 encoder shapes

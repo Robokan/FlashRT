@@ -41,11 +41,18 @@ class VLAModel:
         # rtx Pi0.5 (RtxTorchPi05) requires an explicit
         # ``calibrate_with_real_data([obs])`` call before the first
         # ``infer()``; Thor / rtx GROOT lazy-calibrate inside ``infer()``.
-        # Track whether we still need to bootstrap calibration so that
-        # first predict() can call it exactly once.
-        self._needs_real_data_calibration = hasattr(
+        # We also need to re-fire calibration any time the frontend
+        # rebuilds its pipeline (which happens whenever set_prompt sees
+        # a prompt whose token count differs from the current one):
+        # the new pipeline has uncalibrated FP8 scales + no captured
+        # graph, and would otherwise silently produce stale/garbage
+        # actions. The frontend signals this by flipping its
+        # ``calibrated`` attribute to False in set_prompt. We check
+        # that flag inside predict() so re-calibration fires as needed.
+        self._has_real_data_calibration = hasattr(
             pipe, "calibrate_with_real_data"
         )
+        self._needs_real_data_calibration = self._has_real_data_calibration
 
     def predict(self, images, prompt=None, state=None):
         """Run inference.
@@ -93,7 +100,17 @@ class VLAModel:
 
         # rtx Pi0.5 expects an explicit calibration bootstrap before the
         # first infer(); fire it lazily here so user code stays "3 lines".
-        if self._needs_real_data_calibration:
+        # Also re-fire if the frontend reports it's no longer calibrated
+        # (e.g. set_prompt rebuilt the pipeline for a different-length
+        # prompt — the new pipeline has uncalibrated FP8 scales and an
+        # empty captured graph). Without this re-fire, the model would
+        # silently produce stale-looking outputs after a prompt change
+        # whose token count differs from the previous prompt's.
+        needs_cal = self._needs_real_data_calibration or (
+            self._has_real_data_calibration
+            and not getattr(self._pipe, "calibrated", True)
+        )
+        if needs_cal:
             self._pipe.calibrate_with_real_data([obs])
             self._needs_real_data_calibration = False
 

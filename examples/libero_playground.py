@@ -371,15 +371,34 @@ def main() -> int:
 
     # ── build env ─────────────────────────────────────────────────────
     print(f"\nBuilding LIBERO env ...")
-    env = OffScreenRenderEnv(
-        bddl_file_name=str(task_bddl),
-        camera_heights=LIBERO_RES, camera_widths=LIBERO_RES,
-    )
-    obs = env.reset()
-    obs = env.set_init_state(init_states[0])
-    # Spin idle for a few sim frames to let physics settle
-    for _ in range(10):
-        obs, _, _, _ = env.step(DUMMY_ACTION)
+
+    def _build_env(bddl: pathlib.Path, init_state: np.ndarray):
+        """Construct a fresh LIBERO env + drain to a settled initial state.
+
+        We always go through a fresh OffScreenRenderEnv() here rather than
+        env.reset() on an existing env. Reason: in robosuite 1.4.1, when
+        an episode has hit done=True (task success OR horizon timeout),
+        env.reset() doesn't reliably re-seed the OSC_POSE controller's
+        internal setpoints. The visible scene snaps back via
+        set_init_state (which calls sim.set_state_from_flattened) but the
+        controller's residual error against the OLD goal-state pose
+        leaks into the next chunk of actions, and the arm spends the
+        first ~30 frames untangling itself before honouring the policy.
+        Rebuilding the env from BDDL costs ~2 s and gives a guaranteed
+        clean controller, sim, observable, and physics-settle path that
+        mirrors the original startup sequence below.
+        """
+        new_env = OffScreenRenderEnv(
+            bddl_file_name=str(bddl),
+            camera_heights=LIBERO_RES, camera_widths=LIBERO_RES,
+        )
+        new_env.reset()
+        new_obs = new_env.set_init_state(init_state)
+        for _ in range(10):
+            new_obs, _, _, _ = new_env.step(DUMMY_ACTION)
+        return new_env, new_obs
+
+    env, obs = _build_env(task_bddl, init_states[0])
 
     # ── pull MuJoCo handles for the viewer ────────────────────────────
     mj_sim = env.env.sim
@@ -437,10 +456,13 @@ def main() -> int:
                         print(f"        env_task={task.language!r}")
                         print(f"        prompt  ={current_prompt!r}  [{ptag}]")
                     elif cmd == "r":
-                        env.reset()
-                        env.set_init_state(init_states[0])
-                        for _ in range(10):
-                            obs, _, _, _ = env.step(DUMMY_ACTION)
+                        env.close()
+                        env, obs = _build_env(task_bddl, init_states[0])
+                        mj_sim = env.env.sim
+                        mj_model = mj_sim.model._model
+                        mj_data = mj_sim.data._data
+                        viewer.close()
+                        viewer = mv.launch_passive(mj_model, mj_data)
                         mode.reset()
                         mode.set_prompt(current_prompt)
                         step_counter = 0
@@ -455,20 +477,12 @@ def main() -> int:
                         if not 0 <= new_tid < n_tasks:
                             print(f"[err] task {new_tid} out of range [0, {n_tasks})")
                             continue
-                        # Rebuild env for the new task (different BDDL = different scene)
                         env.close()
                         args.task = new_tid
                         task = suite.get_task(new_tid)
                         task_bddl = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
                         init_states = suite.get_task_init_states(new_tid)
-                        env = OffScreenRenderEnv(
-                            bddl_file_name=str(task_bddl),
-                            camera_heights=LIBERO_RES, camera_widths=LIBERO_RES,
-                        )
-                        env.reset()
-                        obs = env.set_init_state(init_states[0])
-                        for _ in range(10):
-                            obs, _, _, _ = env.step(DUMMY_ACTION)
+                        env, obs = _build_env(task_bddl, init_states[0])
                         mj_sim = env.env.sim
                         mj_model = mj_sim.model._model
                         mj_data = mj_sim.data._data
@@ -498,18 +512,38 @@ def main() -> int:
                         # scene prior says "nothing to do, hold gripper".
                         # Auto-reset to give the new prompt a fair chance.
                         if prev_done:
-                            env.reset()
-                            env.set_init_state(init_states[0])
-                            for _ in range(10):
-                                obs, _, _, _ = env.step(DUMMY_ACTION)
+                            env.close()
+                            env, obs = _build_env(task_bddl, init_states[0])
+                            mj_sim = env.env.sim
+                            mj_model = mj_sim.model._model
+                            mj_data = mj_sim.data._data
+                            viewer.close()
+                            viewer = mv.launch_passive(mj_model, mj_data)
                             mode.reset()
                             mode.set_prompt(current_prompt)
                             step_counter = 0
                             prev_done = False
-                            print(f"[prompt+reset] {current_prompt!r}  "
-                                  f"(env was done; auto-reset to initial state "
-                                  f"so the new prompt actually gets a chance to "
-                                  f"steer the policy)")
+                            # Show robot+gripper state so it's obvious the
+                            # auto-reset actually put the arm back at home,
+                            # not in some half-reset goal-state pose.
+                            try:
+                                eef = np.asarray(obs["robot0_eef_pos"])
+                                gq = np.asarray(obs["robot0_gripper_qpos"])
+                                pose_tag = (f"eef=({eef[0]:+.2f},{eef[1]:+.2f},"
+                                            f"{eef[2]:+.2f}) gripper={gq.tolist()}")
+                            except Exception:
+                                pose_tag = "(eef pose unavailable)"
+                            print(f"[prompt+reset] {current_prompt!r}")
+                            print(f"               env was done; full env "
+                                  f"rebuild from BDDL + fresh OSC_POSE "
+                                  f"controller. {pose_tag}")
+                            if current_prompt != task.language:
+                                print(f"               note: prompt differs "
+                                      f"from env task {task.language!r}; "
+                                      f"if your prompt references objects "
+                                      f"not in this scene, the model can't "
+                                      f"comply. use 't N' to load a "
+                                      f"different scene.")
                         elif current_prompt == task.language:
                             print(f"[prompt] {current_prompt!r}  "
                                   f"(matches env's task)")

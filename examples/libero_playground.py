@@ -287,12 +287,12 @@ MODE_FACTORIES = {
 HELP = """
 Commands:
   <any prompt>     send a new natural-language prompt to the policy.
-                   If the env is currently in its done/goal state, this
-                   also auto-resets the env to the initial state, so
-                   the new prompt actually gets a chance to steer the
-                   policy (pi05_libero outputs near-zero actions for
-                   any prompt when it sees a "task complete" scene --
-                   that case is far OOD from training).
+                   The robot continues from its current pose -- the env
+                   and arm are NOT reset. If the env is in done-state
+                   when you do this, the arm will likely just hold pose
+                   because pi05_libero outputs near-zero actions on
+                   completed-scene observations (that case is far OOD
+                   from training). Press 'r' if you want a clean reset.
   1 / 2 / 3 / 4    switch chunk execution mode (see header for descriptions)
   r                reset env to the current task's initial state
   t <n>            change task within the current suite (0-indexed)
@@ -503,59 +503,33 @@ def main() -> int:
                     else:
                         current_prompt = cmd
                         mode.set_prompt(current_prompt)
-                        # If the env is currently in its done/goal state
-                        # (task object already in its target zone, robot
-                        # in a "task complete" pose), the policy will
-                        # mostly produce near-zero actions for ANY new
-                        # prompt -- pi05_libero never saw "completed
-                        # scene + new task" during training, so the
-                        # scene prior says "nothing to do, hold gripper".
-                        # Auto-reset to give the new prompt a fair chance.
-                        if prev_done:
-                            env.close()
-                            env, obs = _build_env(task_bddl, init_states[0])
-                            mj_sim = env.env.sim
-                            mj_model = mj_sim.model._model
-                            mj_data = mj_sim.data._data
-                            viewer.close()
-                            viewer = mv.launch_passive(mj_model, mj_data)
-                            mode.reset()
-                            mode.set_prompt(current_prompt)
-                            step_counter = 0
-                            prev_done = False
-                            # Show robot+gripper state so it's obvious the
-                            # auto-reset actually put the arm back at home,
-                            # not in some half-reset goal-state pose.
-                            try:
-                                eef = np.asarray(obs["robot0_eef_pos"])
-                                gq = np.asarray(obs["robot0_gripper_qpos"])
-                                pose_tag = (f"eef=({eef[0]:+.2f},{eef[1]:+.2f},"
-                                            f"{eef[2]:+.2f}) gripper={gq.tolist()}")
-                            except Exception:
-                                pose_tag = "(eef pose unavailable)"
-                            print(f"[prompt+reset] {current_prompt!r}")
-                            print(f"               env was done; full env "
-                                  f"rebuild from BDDL + fresh OSC_POSE "
-                                  f"controller. {pose_tag}")
-                            if current_prompt != task.language:
-                                print(f"               note: prompt differs "
-                                      f"from env task {task.language!r}; "
-                                      f"if your prompt references objects "
-                                      f"not in this scene, the model can't "
-                                      f"comply. use 't N' to load a "
-                                      f"different scene.")
-                        elif current_prompt == task.language:
-                            print(f"[prompt] {current_prompt!r}  "
-                                  f"(matches env's task)")
+                        # No env reset, no arm teleport. The new prompt
+                        # just becomes the conditioning for subsequent
+                        # inferences; the robot continues from wherever
+                        # it currently is. If you DO want a fresh start,
+                        # press 'r' or 't N'.
+                        if current_prompt == task.language:
+                            tag = "matches env's task"
                         else:
-                            print(f"[prompt] {current_prompt!r}")
-                            print(f"         note: env's reward is hardcoded "
-                                  f"to {task.language!r}")
-                            print(f"         (so [goal reached!] below would "
-                                  f"mean the env's task object hit the basket,")
-                            print(f"         not necessarily what you asked "
-                                  f"for. use 't N' to switch the env to a "
-                                  f"matching scene.)")
+                            tag = (f"differs from env task "
+                                   f"{task.language!r}; env reward stays "
+                                   f"tied to the env's task")
+                        # In the done-state, pi05_libero tends to output
+                        # near-zero actions for ANY prompt because the
+                        # "task complete" scene is far OOD from training
+                        # (it never saw "completed scene + new task").
+                        # Print this as a heads-up rather than acting on it.
+                        if prev_done:
+                            print(f"[prompt] {current_prompt!r}  ({tag})")
+                            print(f"         env is in done-state; the arm "
+                                  f"will likely stay near its current "
+                                  f"position because pi05_libero produces "
+                                  f"near-zero actions on completed-scene "
+                                  f"observations. press 'r' to reset to "
+                                  f"the initial pose if you want a fair "
+                                  f"trial of the new prompt.")
+                        else:
+                            print(f"[prompt] {current_prompt!r}  ({tag})")
             except queue.Empty:
                 pass
 

@@ -1127,6 +1127,15 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         # don't cover diffusion noise variance, tanking cos from ~0.96
         # (80-sample multi-frame) to ~0.6 (1-sample).
         self._fp8_scales_snapshot: dict[str, np.ndarray] = {}
+        # Pipeline cache (keyed by exact prompt_len) — see
+        # Pi05TorchFrontendRtx.__init__ for the full rationale and the
+        # deferred-varlen note. Must be declared here too because this
+        # __init__ does NOT chain to super; the torch path is replicated
+        # body-style (see comment near the top of this method).
+        from flash_rt.models.pi05.pipeline_rtx import Pi05Pipeline
+        self._pipeline_cache: dict[int, Pi05Pipeline] = {}
+        self._pipeline_cache_warn_threshold = int(
+            os.environ.get("FLASHRT_PIPELINE_CACHE_WARN", "8"))
         self.current_prompt_len = 0
         self.pipeline = None
 

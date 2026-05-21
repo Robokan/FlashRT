@@ -68,7 +68,15 @@ def main() -> int:
     parser.add_argument("--calib-data", default=None,
                         help="Optional path to an npz of stratified observations "
                              "(see scripts/spark_phase3_prepare_calib.py). "
-                             "Triggers eager calibration before the server starts.")
+                             "Triggers eager calibration before the server starts. "
+                             "Ignored when --no-fp8 is set.")
+    parser.add_argument("--no-fp8", action="store_true",
+                        help="Disable FP8 execution; run the full FlashRT "
+                             "Pi0.5 pipeline in BF16. Skips FP8 calibration "
+                             "(unnecessary). Useful for isolating whether a "
+                             "numerical regression is FP8-induced or lives "
+                             "elsewhere in the serving path. Substantially "
+                             "slower than FP8 mode.")
     parser.add_argument("--port", type=int, default=8002,
                         help="Websocket port. Default 8002 leaves 8001 free "
                              "for the openpi JAX reference server when "
@@ -95,15 +103,22 @@ def main() -> int:
                      "Run inside the flashrt:spark container.", e)
         return 1
 
-    logger.info("Loading FlashRT model from %s (framework=%s, robot_action_dim=%s)",
-                args.checkpoint, args.framework, args.robot_action_dim)
+    use_fp8 = not args.no_fp8
+    logger.info("Loading FlashRT model from %s (framework=%s, robot_action_dim=%s, use_fp8=%s)",
+                args.checkpoint, args.framework, args.robot_action_dim, use_fp8)
     model = flash_rt.load_model(
         checkpoint=args.checkpoint,
         framework=args.framework,
         num_views=args.num_views,
         autotune=args.autotune,
         robot_action_dim=args.robot_action_dim,
+        use_fp8=use_fp8,
     )
+
+    if args.calib_data and not use_fp8:
+        logger.info("Ignoring --calib-data because --no-fp8 was set "
+                    "(BF16 path has no FP8 amax to compute).")
+        args.calib_data = None
 
     # 2. Eager calibrate if asked. Two npz schemas are supported:
     #    - new OpenArm 3-cam (from spark_phase3_prepare_calib.py):
@@ -162,6 +177,7 @@ def main() -> int:
         "framework": args.framework,
         "chunk_size": model._pipe.chunk_size,
         "robot_action_dim": model._pipe.robot_action_dim,
+        "use_fp8": use_fp8,
     }
     if args.metadata_config:
         import json

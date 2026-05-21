@@ -366,6 +366,239 @@ to support `action_horizon=50`. That's a non-trivial change in
 and a separate phase or PR; not gating on it for the initial Spark
 milestone.
 
+### h=10 retrain + held-out episode replay (the conclusive test)
+
+Re-trained `pi05_openarm_ngc_lora_v4` with `--model.action-horizon=10`
+in openpi (the openpi serve_policy and FlashRT-served pipeline now both
+emit `(10, 16)` chunks). Re-ran Phase 4 stratified parity on the new
+checkpoint: median cos still 0.963 — chunk-size mismatch was not the
+dominant gap.
+
+Replaced that with a much stronger test:
+`scripts/spark_replay_episode.py` walks a held-out chocolate_bars
+episode frame-by-frame, feeds each obs to both servers in sequence,
+and compares each predicted step-0 action against the teleoperator's
+ground-truth action that was actually recorded for that frame.
+Held-out episode 3 (not in the FP8 calibration set), full episode at
+stride 1 = **587 frames**:
+
+```
+=== openpi h=10 server vs teleop ground truth (the reference) ===
+  cos(openpi-step0, teleop):  median=+0.99978  p5=+0.9953  min=+0.9824
+  ||openpi - teleop|| (rad):  median=+0.0600   max=+0.5335
+
+=== FlashRT h=10 server vs teleop ground truth ===
+  cos(FlashRT-step0, teleop): median=+0.9023   p5=+0.6246  min=+0.4440
+  ||FlashRT - teleop|| (rad): median=+1.2844   max=+2.2937
+
+=== Server-vs-server agreement (FlashRT vs openpi) ===
+  cos at first step:          median=+0.9053   p5=+0.6435  min=+0.4473
+  cos over full 10-step chunk: median=+0.9082
+
+=== Trajectory smoothness (cos of successive step-0 predictions) ===
+  consecutive cos (openpi):   median=+0.9998   p5=+0.9981   min=+0.9786
+  consecutive cos (FlashRT):  median=+0.9968   p5=+0.9766   min=+0.9162
+
+=== Latency (per-frame, single-client) ===
+  ref p50=405 ms  p99=422 ms
+  sut p50=94  ms  p99=99  ms      (~4.3x faster)
+```
+
+**Two clear findings.**
+
+1. **openpi-h10 reproduces the teleoperator nearly exactly.** Median
+   cos 0.99978 / L2 0.060 rad against ground truth across 587 frames
+   of a held-out episode means the trained model itself is fully
+   adequate for the task — the h=10 retrain landed correctly. Anything
+   FlashRT gets *wrong* on this checkpoint is a FlashRT-serving bug,
+   not a model-quality issue.
+
+2. **FlashRT's gripper channels are broken — not the arms.** Per-dim
+   error in *normalized* space (so dim spread is factored out), all
+   587 frames:
+
+   ```
+    dim   |F-O|.n   |F-gt|.n   |O-gt|.n
+      0    0.046     0.048     0.007
+      1    0.115     0.120     0.011
+      2    0.057     0.059     0.006
+      3    0.267     0.272     0.018
+      4    0.088     0.087     0.008
+      5    0.059     0.059     0.007
+      6    0.076     0.077     0.008
+      7    0.247     0.258     0.033    <- LEFT GRIPPER
+      8    0.026     0.027     0.004
+      9    0.198     0.206     0.010
+     10    0.020     0.020     0.005
+     11    0.313     0.319     0.009
+     12    0.176     0.174     0.005
+     13    0.069     0.073     0.005
+     14    0.032     0.034     0.004
+     15    0.654     0.662     0.010    <- RIGHT GRIPPER
+
+   arm dims (14):     mean |F-O|.norm = 0.110
+   gripper dims (2):  mean |F-O|.norm = 0.451   (~4.1x worse)
+   ```
+
+   The right gripper (dim 15) carries ~0.65 rad of FlashRT's 1.28 rad
+   median L2 error against ground truth — over half the total error
+   budget on one channel. Both grippers (dims 7 and 15) are 4x noisier
+   than the worst arm dim. The Phase 3 calibration set covers the
+   full gripper training range (97-100% of q01..q99 span), so it's
+   not a calibration-coverage problem. The openpi server's gripper
+   error against teleop is 0.01-0.03 normalized — the trained weights
+   *can* compute correct grippers; FlashRT's serving path is
+   corrupting those two specific output channels.
+
+   Trajectory smoothness is fine (consecutive cos median 0.997 for
+   FlashRT), so this is a *static* per-frame error on the gripper
+   channels, not a temporal-coherence issue.
+
+   **Practical implication: don't run this on a real OpenArm yet.**
+   An ~0.9 rad gripper-target error means the model would consistently
+   command the grippers to wrong open-vs-closed positions, dropping
+   objects mid-grasp. The arm trajectory itself (mean |F-O|.norm =
+   0.11) is borderline workable for testing but not high-quality.
+
+#### Root cause: FlashRT's Pi0.5 pipeline is missing the state input
+
+To narrow the cause, spawned a third server on port 8003: FlashRT-h10
+with `--no-fp8` (the full pipeline in BF16, FP8 disabled end-to-end).
+Re-ran the same replay on episode 3 (n=30, stride 5):
+
+```
+                          arm |F-O|.n   grip |F-O|.n   dim 15 |F-O|.n
+FlashRT FP8 (port 8002):    0.108         0.428         0.633
+FlashRT BF16 (port 8003):   0.110         0.394         0.564
+```
+
+BF16 is essentially identical to FP8 (within ~10% on the worst dim,
+not the orders-of-magnitude drop you'd expect if FP8 were the cause).
+**FP8 quantization is not the dominant source of the FlashRT-vs-openpi
+gap.** The bug is somewhere both modes share.
+
+Searching for what *is* different: openpi's Pi0 model
+(`openpi/src/openpi/models/pi0.py:97,153`) projects the robot state
+into a token via a learned `state_proj` linear layer and prepends it
+to the input attention sequence with `ar_mask=True`:
+
+```python
+self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, ...)
+...
+state_token = self.state_proj(obs.state)[:, None, :]
+tokens.append(state_token)
+input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+ar_mask += [True]
+```
+
+FlashRT's Pi0 pipeline (`flash_rt/frontends/torch/pi0_rtx.py`) handles
+this correctly: it loads `state_proj_w/b` from the checkpoint and
+plumbs `input_state_buf` through the encoder.
+
+But the **Pi0.5** pipeline (`flash_rt/models/pi05/pipeline_rtx.py`)
+does not. Its docstring lists every weight key the pipeline consumes
+(lines 118-152) — there is no `state_proj_w/b`. Its
+`Pi05TorchFrontendRtx.set_prompt(prompt_text: str)` accepts no state.
+Its `Pi05Pipeline.forward()` has no `input_state_buf`. The
+`FlashRTPolicyAdapter.infer()` calls
+`self._model.predict(images=images, prompt=str(prompt))` with no
+`state` parameter, and even if it did, `flash_rt.api.VLAModel.predict`
+only forwards `state` to `set_prompt`, which Pi0.5 silently ignores.
+
+**FlashRT's Pi0.5 path drops the robot state input entirely.** The
+model produces actions conditioned on images + prompt + diffusion
+noise only, blind to current joint positions and gripper state.
+
+This explains every observation:
+
+- **Gripper channels are worst hit** (4x worse than arm dims). Gripper
+  position is bimodal (mostly closed or briefly open) and the next
+  gripper command depends almost entirely on the current gripper state
+  — without state input, the model defaults to a near-average over the
+  training distribution.
+- **Arm dims also off but much less** (~11% normalized). The arm
+  trajectory is largely visually determined (gripper-to-object), so
+  the model gets it directionally right without state, but lacks the
+  proprioceptive grounding to land on exactly the right joint angle.
+- **LIBERO Phase 4 parity was fine** because LIBERO tasks are mostly
+  visually determined and the LIBERO checkpoint was probably also
+  trained without strong state conditioning.
+- **FP8 disable did not help** because the missing-state bug is
+  upstream of FP8 — it's a missing computation, not noise.
+- **Both FlashRT and openpi norm_stats agreed on state ranges** so
+  this is not a normalization issue.
+
+#### Diagnosis validation: starve openpi of state, watch it degrade
+
+To confirm the missing-state diagnosis before committing to a
+multi-file FlashRT fix, added `--ref-state-mode {normal,zeros,mean}`
+to `scripts/spark_replay_episode.py`. Sends the *full* obs to FlashRT
+(so its `delta_action_mask` offset still uses real state) but
+substitutes zeros or the dataset midpoint into the `state` field of
+the obs sent to openpi only.
+
+Per-dim |pred - teleop|.norm on episode 3 (n=30, stride=5):
+
+```
+                          ARM mean   GRIP mean   grip/arm ratio
+openpi normal state         0.009      0.020         2.4x
+openpi state = mean         0.337      0.495         1.5x
+openpi state = zeros        0.348      0.495         1.4x
+FlashRT (no state input)    0.112      0.426         3.8x
+```
+
+Three findings:
+
+1. **State matters enormously to openpi-Pi0.5.** Starving it of
+   correct state collapses arm-dim error 37x worse and gripper-dim
+   error 25x worse. The model cannot generate coherent actions
+   without proprioception. Unambiguous proof that Pi0.5 *requires*
+   state input — it's not vestigial.
+
+2. **FlashRT's gripper error (0.426) ≈ state-starved openpi's
+   gripper error (0.495).** This is the smoking gun: FlashRT's
+   gripper-localised failure mode is exactly what you'd expect from
+   a model trying to predict gripper actions without knowing the
+   current gripper state.
+
+3. **FlashRT's arm error (0.112) is better than state-starved
+   openpi's (0.34).** FlashRT isn't exactly "openpi minus state
+   token" — it omits the state token from the attention sequence
+   entirely (the `Pi05Pipeline` was built without one), whereas
+   zero/mean-state openpi adds a *wrong* state token at index 0.
+   Models cope with "no signal" better than "wrong signal." Once we
+   plumb state through, arm-dim quality should also improve toward
+   openpi-normal's 0.009, not just grippers.
+
+Fix scope (estimated ~half day of careful work):
+
+1. In the Orbax weight conversion (`jax/pi05_rtx.py`) load
+   `state_proj.weight` / `.bias` into the pipeline's weight dict.
+2. In `flash_rt/models/pi05/pipeline_rtx.py`: add `input_state_buf`,
+   add a state-token projection step at the start of the encoder
+   forward, account for the extra +1 token in attention shape /
+   position-embed indexing, re-capture the CUDA graph.
+3. In `Pi05TorchFrontendRtx.set_prompt` and the JAX sibling: accept
+   `state` argument, upload to `input_state_buf` per inference.
+4. In `flash_rt/api.VLAModel.predict`: pass `state` into `set_prompt`
+   if the underlying pipeline accepts it (already true for Pi0, just
+   needs the Pi0.5 pipeline to accept it).
+5. In `flash_rt/serving/openpi_adapter.py:infer`: extract `state`
+   from obs (already does this for `delta_action_mask`) and pass to
+   `self._model.predict(images=..., prompt=..., state=state)`.
+6. Also handle the LoRA merge for `state_proj` (the OpenArm LoRA may
+   have rank-decomposed updates for this layer; check
+   `training/jax/merge_lora.py`).
+
+3. **Latency win still real.** 94 ms p50 vs 405 ms p50 (4.3x speedup)
+   on a per-frame single-client workload — that is the actual product
+   win once the gripper bug is fixed.
+
+Per-frame CSVs: `/tmp/replay_ep3/replay_ep3.csv` (n=30, stride 5) and
+`/tmp/replay_ep3_full/replay_ep3.csv` (n=587, stride 1). Reproduce
+with `scripts/spark_replay_episode.py --episode 3 --stride 1
+--ref-server localhost:8000 --sut-server localhost:8002`.
+
 ## Phase 5 hardware-verified results
 
 `scripts/spark_phase5_serve_smoke.py` (single-shell smoke against

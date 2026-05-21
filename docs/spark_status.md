@@ -1444,6 +1444,113 @@ Confirms the openpi server pipeline (websocket transport +
 msgpack-numpy obs marshalling + adapter chunk conversion) lights up
 end-to-end on Spark with the FlashRT backend.
 
+### G5 — client-side blending wrapper (Phase 6 prep)
+
+The websocket policy server (port 8002, `serve_policy_flashrt.py`)
+returns full action chunks of shape `(H, action_dim)` with no
+seam-handling logic of its own. The robot client owns chunk
+consumption: when to swap to the next chunk, what to do if the next
+chunk is late, whether to smooth the boundary. Without a standard
+client-side wrapper, each consumer (SparkJAX's `OpenPIRunnerNode`,
+`examples/libero_playground.py`, the bare websocket smoke tests)
+re-implements that loop with subtly different defaults — and that
+makes Phase 6 backend comparisons (FlashRT vs openpi-JAX) confounded
+by which broker each side wraps the policy in.
+
+**Shipped — `flash_rt.serving.ChunkedWebsocketClient`.** Wraps any
+`BasePolicy` (typically `openpi_client.WebsocketClientPolicy`) with
+`flash_rt.runtime.AsyncChunkRunner`. Selects the chunk-consumption
+strategy via a single `blending_mode` int (1..4) that matches the
+convention used by `examples/libero_playground.py` keys 1..4:
+
+| mode | RTCConfig | semantics |
+|---|---|---|
+| 1 | `action_horizon=5, start_next_at=5, miss_policy="block", blend_steps=0` | sync truncate-replan k=5 — robot blocks per chunk; chunks of 5 |
+| 2 (default) | `action_horizon=H, blend_steps=0` | async pipelined, hard chunk swap |
+| 3 | `action_horizon=H, blend_steps=3` | async + 3-step tail damping |
+| 4 | `action_horizon=H, blend_steps=5` | async + 5-step tail damping |
+
+`H` is auto-resolved from the server's metadata (`chunk_size` field
+that both the FlashRT and the chunk_size-patched openpi-JAX servers
+publish). Vanilla openpi-JAX < 2026-05 ships empty metadata; the
+fallback is 50 (the Pi0.5 default). Override with
+`chunk_len_override`.
+
+`set_blending_mode(int)` switches modes at runtime. Tears down the
+old `AsyncChunkRunner`, waits for any in-flight background inference
+to release the shared websocket, builds a fresh runner with the new
+config. Caller pays one chunk of latency for the next `next_action`
+(fresh inference on the new runner). Designed for ROS-service-style
+hot-swaps from SparkJAX (`/jax/set_chunk_blending` is the planned
+service in a follow-up commit).
+
+`flash_rt.runtime.AsyncChunkRunner.close()` gained a `wait: bool`
+kwarg (default False, backward-compatible). The wrapper passes
+`wait=True` so the websocket is fully quiesced before the next
+runner takes it; without this, switching modes against a shared
+websocket raised `websockets.exceptions.ConcurrencyError: cannot
+call recv while another thread is already running recv` from the
+old runner's background `recv` still being in flight.
+
+**CLI — `scripts/robot_client_chunked.py`.** Standalone launcher
+for the wrapper. Exercises any backend without a robot in the loop.
+Useful for: connection smoke tests, per-mode latency sweeps, and
+ad-hoc characterisation of new server builds.
+
+```
+# Hit the FlashRT server in mode 2 with real teleop frames:
+python scripts/robot_client_chunked.py \
+    --server-url ws://localhost:8002 \
+    --calib-data /tmp/calib_openarm_v4_80.npz \
+    --num-steps 30 --blending-mode 2
+
+# Sweep all four modes back-to-back:
+python scripts/robot_client_chunked.py \
+    --server-url ws://localhost:8002 \
+    --calib-data /tmp/calib_openarm_v4_80.npz \
+    --num-steps 30 --sweep-modes
+
+# Bare-minimum connection smoke test (synthetic zeros, no calib npz):
+python scripts/robot_client_chunked.py \
+    --server-url ws://localhost:8002 --obs-source synthetic-zeros \
+    --prompt 'put the chocolate bars in the container' --num-steps 12
+```
+
+**Validated — same client, two backends.** Phase 6 dry run with
+n=30 at 25 Hz controller rate, calib_openarm_v4 obs:
+
+| backend | mode | first ms | served | swaps | misses |
+|---|---|---|---|---|---|
+| FlashRT (8002) | 1 | 217 | 30 | 5 | 5 (sync blocks count as misses) |
+| FlashRT (8002) | 2 | 180 | 30 | 2 | 1 |
+| FlashRT (8002) | 3 | 208 | 30 | 2 | 0 |
+| FlashRT (8002) | 4 | 201 | 30 | 2 | 1 |
+| openpi-JAX (8000) | 2 | 419 | 15 | 0 | 5 |
+
+The openpi-JAX row is the structural Phase 6 finding: at 25 Hz the
+inference budget for async pipelining is `H/2 * period = 5*40 = 200
+ms`, but JAX takes 419 ms first call and ~175 ms steady — so mode 2
+at 25 Hz doesn't pipeline cleanly against JAX (5 deadline misses,
+0 background swaps; the runner hold-lasts every time). FlashRT at
+180 ms first / ~165 ms steady DOES pipeline at 25 Hz (2 clean swaps,
+≤1 borderline miss). This is the latency win we ship — independent
+of the blending mode.
+
+**Runtime mode switch smoke** — verified mid-loop: start in mode 2,
+drive 12 steps, call `set_blending_mode(3)`, drive 12 more. The
+transition costs one fresh-inference latency at the swap point
+(~150 ms) then resumes 0-ms cache reads. No websocket
+ConcurrencyError, no crash.
+
+**Deferred — SparkJAX integration.** `OpenPIRunnerNode` currently
+inlines a `openpi_client.AsyncActionChunkBroker` wrapper with hard
+defaults (`enable_rtc=False`, `inference_delay=9`, mode-2-only). The
+follow-up commit replaces that wrapper with
+`flash_rt.serving.ChunkedWebsocketClient`, exposes a
+`/jax/set_chunk_blending` service that wraps `set_blending_mode`,
+and threads a `--blending-mode` parameter through `/jax/start_policy`.
+That belongs in the SparkJAX repo, not here.
+
 ## Playground — interactive LIBERO sim with hot-swappable blending
 
 `examples/libero_playground.py` opens a live MuJoCo viewer window, takes

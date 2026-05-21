@@ -123,10 +123,20 @@ class AsyncChunkRunner:
         self._last_action: np.ndarray | None = None
         self._closed = False
 
-    def close(self) -> None:
+    def close(self, *, wait: bool = False) -> None:
+        """Shut down the background executor.
+
+        Args:
+            wait: If True, block until any in-flight inference completes.
+                Useful when the underlying policy holds shared resources
+                (e.g. a single websocket) that the next consumer needs
+                in a quiesced state. Default False keeps the historical
+                fire-and-forget behaviour for in-process consumers that
+                hold no shared state.
+        """
         with self._lock:
             self._closed = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=wait, cancel_futures=not wait)
 
     def __enter__(self) -> "AsyncChunkRunner":
         return self

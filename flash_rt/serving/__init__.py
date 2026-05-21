@@ -11,3 +11,15 @@ Install with::
 """
 
 from __future__ import annotations
+
+from .chunked_websocket_client import (
+    ChunkedWebsocketClient,
+    MODE_DESCRIPTIONS,
+    VALID_MODES,
+)
+
+__all__ = [
+    "ChunkedWebsocketClient",
+    "MODE_DESCRIPTIONS",
+    "VALID_MODES",
+]

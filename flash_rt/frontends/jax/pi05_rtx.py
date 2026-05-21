@@ -241,6 +241,54 @@ def _build_padded_attn_lora_b(
     return lb_full
 
 
+def _build_padded_gateup_lora(
+    la_gate: np.ndarray,   # (D, r)
+    la_up:   np.ndarray,   # (D, r)
+    lb_gate: np.ndarray,   # (r, H)
+    lb_up:   np.ndarray,   # (r, H)
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fuse the gate + up LoRA matrices into a single padded pair.
+
+    The FP8 (and INT8) encoder FFN path uses a single fused weight
+    ``encoder_ffn_gate_up_w_{i}`` of shape ``(D, 2H)`` where the
+    column layout is ``[gate_proj | up_proj]``. The single FP8 GEMM
+    writes the (seq, 2H) output into ``encoder_gate_merged``. To add
+    a LoRA delta in the same buffer with a single fused
+    ``_apply_enc_lora`` call, we mirror the QKV-padded pattern:
+
+      la_padded = [la_gate | la_up]   in (D, 2r)  — column-stack
+      lb_padded[:r,  :H] = lb_gate    block-diagonal in (2r, 2H)
+      lb_padded[ r:, H:] = lb_up
+      (other blocks = 0)
+
+    The runtime then runs
+        neck = x @ la_padded                          # (seq, 2r)
+        encoder_gate_merged += neck @ lb_padded       # (seq, 2H)
+    which expands to
+        encoder_gate_merged[:, :H] += (x @ la_gate) @ lb_gate
+        encoder_gate_merged[:, H:] += (x @ la_up)   @ lb_up
+    exactly (the cross-blocks in lb_padded are zero so they
+    contribute nothing). One bf16_nn + one bf16_nn_res covers both
+    LoRA contributions and matches the fused FP8 base GEMM's output
+    layout — no per-half pointer offset / leading-dim trick needed.
+
+    All inputs are fp32; the caller is responsible for the final
+    bf16 cast (same convention as the rest of this file).
+    """
+    D, r = la_gate.shape
+    r_check, H = lb_gate.shape
+    assert la_up.shape == (D, r), f"la_up {la_up.shape} != ({D}, {r})"
+    assert lb_up.shape == (r, H), f"lb_up {lb_up.shape} != ({r}, {H})"
+    assert r == r_check, f"rank mismatch la r={r} vs lb r={r_check}"
+
+    la_padded = np.concatenate(
+        [la_gate.astype(np.float32), la_up.astype(np.float32)], axis=1)
+    lb_padded = np.zeros((2 * r, 2 * H), dtype=np.float32)
+    lb_padded[:r, :H] = lb_gate.astype(np.float32)
+    lb_padded[r:, H:] = lb_up.astype(np.float32)
+    return la_padded, lb_padded
+
+
 def _build_o_lora(
     la_o: np.ndarray,    # (NH, HD, r)
     lb_o: np.ndarray,    # (NH, r, D)
@@ -636,6 +684,11 @@ def convert_pi05_orbax(
     enc_gate_la_list, enc_gate_lb_list = [], []
     enc_up_la_list, enc_up_lb_list = [], []
     enc_down_la_list, enc_down_lb_list = [], []
+    # FP8 path needs the fused (D, 2r) / (2r, 2H) form (matches
+    # ``encoder_ffn_gate_up_w_{i}`` layout). Built in the same loop so
+    # both BF16 (separate gate/up) and FP8 (fused gateup) paths have
+    # the right per-layer slices ready. See _build_padded_gateup_lora.
+    enc_gateup_la_list, enc_gateup_lb_list = [], []
     # Encoder attention LoRA (added in the "encoder" mode). Q, K, V are
     # combined into one padded la/lb per layer so the runtime path runs
     # a single bf16_nn + bf16_nn_res for all three projections at once
@@ -765,6 +818,13 @@ def convert_pi05_orbax(
             enc_up_la_list.append(la_up)
             enc_up_lb_list.append(lb_up)
 
+            # Fused (D, 2r) / (2r, 2H) padded LoRA for the FP8 path
+            # whose base GEMM uses encoder_ffn_gate_up_w_{i} (D, 2H).
+            gu_la, gu_lb = _build_padded_gateup_lora(
+                la_gate, la_up, lb_gate, lb_up)
+            enc_gateup_la_list.append(gu_la)
+            enc_gateup_lb_list.append(gu_lb)
+
         # Down: JAX (16384, 2048) — already (in, out), no fold
         enc_down_list.append(
             raw["PaliGemma.llm.layers.mlp.linear"][i].astype(np.float32))
@@ -799,11 +859,15 @@ def convert_pi05_orbax(
         ckpt["encoder_ffn_gate_lora_b"] = _to_bf16_cuda(np.stack(enc_gate_lb_list))
         ckpt["encoder_ffn_up_lora_a"]   = _to_bf16_cuda(np.stack(enc_up_la_list))
         ckpt["encoder_ffn_up_lora_b"]   = _to_bf16_cuda(np.stack(enc_up_lb_list))
+        ckpt["encoder_ffn_gateup_lora_a"] = _to_bf16_cuda(np.stack(enc_gateup_la_list))
+        ckpt["encoder_ffn_gateup_lora_b"] = _to_bf16_cuda(np.stack(enc_gateup_lb_list))
         logger.info(
             "Runtime LoRA: stashed encoder gate/up lora_a/lora_b (shape %s, %s) "
-            "across %d layers",
+            "+ fused gateup (shape %s, %s) across %d layers",
             tuple(ckpt["encoder_ffn_gate_lora_a"].shape),
             tuple(ckpt["encoder_ffn_gate_lora_b"].shape),
+            tuple(ckpt["encoder_ffn_gateup_lora_a"].shape),
+            tuple(ckpt["encoder_ffn_gateup_lora_b"].shape),
             ENC_L,
         )
     if enc_down_la_list:

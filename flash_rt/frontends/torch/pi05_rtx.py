@@ -1000,11 +1000,13 @@ class Pi05TorchFrontendRtx:
         for _k in (
             "encoder_ffn_gate_lora_a", "encoder_ffn_gate_lora_b",
             "encoder_ffn_up_lora_a",   "encoder_ffn_up_lora_b",
+            "encoder_ffn_gateup_lora_a", "encoder_ffn_gateup_lora_b",
             "encoder_ffn_down_lora_a", "encoder_ffn_down_lora_b",
             "encoder_attn_qkv_lora_a", "encoder_attn_qkv_lora_b",
             "encoder_attn_o_lora_a",   "encoder_attn_o_lora_b",
             "decoder_ffn_gate_lora_a", "decoder_ffn_gate_lora_b",
             "decoder_ffn_up_lora_a",   "decoder_ffn_up_lora_b",
+            "decoder_ffn_gateup_lora_a", "decoder_ffn_gateup_lora_b",
             "decoder_ffn_down_lora_a", "decoder_ffn_down_lora_b",
             "decoder_attn_qkv_lora_a", "decoder_attn_qkv_lora_b",
             "decoder_attn_o_lora_a",   "decoder_attn_o_lora_b",

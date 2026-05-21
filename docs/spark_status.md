@@ -1089,6 +1089,95 @@ Script: `scripts/spark_runtime_lora_g1.py` (committed). Runs ~85 s
 end-to-end with `--encoder` flag (four model loads × ~20 s each on
 Spark native venv).
 
+#### Runtime-LoRA G2 result — FP8 base + BF16 LoRA encoder (2026-05-21)
+
+Goal: see whether the runtime-LoRA wiring rescues FP8 quality on
+this checkpoint (the previously-observed "cos 0.617 catastrophe" in
+the 587-frame OpenArm v4 replay against openpi h=10).
+
+Wiring delivered in this commit:
+
+* JAX converter (`_build_padded_gateup_lora`) emits the fused
+  `(D, 2r)` / `(2r, 2H)` block-diagonal gateup LoRA that matches
+  the FP8 `encoder_ffn_gate_up_w_{i}` (D, 2H) base weight layout —
+  same trick as the QKV padded LoRA, so a single
+  `bf16_nn` + `bf16_nn_res` adds both gate and up deltas into
+  `encoder_gate_merged` without per-half pointer offset / leading-
+  dim tricks.
+* Pi05Pipeline detects encoder LoRA at init and forces the
+  encoder `fused` FP8 path off (so the BF16 intermediates of
+  `encoder_x_norm` / `encoder_hidden` that the LoRA matmuls need
+  are present); each FP8 base GEMM is followed by the matching
+  BF16 LoRA add through the same `_apply_enc_lora` helper as G1.
+* Cost of disabling encoder FP8 fusion is small — FP8 GEMMs still
+  run; only the `residual_add + rms_norm + fp8_quantize` and
+  `gate_geglu + fp8_quantize` epilogue fusions are dropped.
+
+G2 measurement (`scripts/spark_runtime_lora_g2.py`, three subprocess
+runs; FP8 with dynamic activation calibration during warm-up):
+
+| Mode                | norm   | ratio | cos vs bf16_merge |  infer |
+|---------------------|-------:|------:|------------------:|-------:|
+| `bf16_merge` (truth)| 4.6348 | 1.000 |          1.000000 | 278 ms |
+| `fp8_merge`         | 4.6232 | 0.998 |          0.999811 | 225 ms |
+| `fp8_runtime_enc`   | 4.2475 | 0.916 |          0.998442 | 213 ms |
+
+Both FP8 modes hold cos > 0.998 vs bf16_merge on the
+single-frame synthetic test — the "cos 0.617 catastrophe" does
+**not** reproduce here. That is informative: single-call FP8 with
+calibrated static scales is essentially fine on this checkpoint,
+so the historical 0.617 number must come from one of the
+multi-frame failure modes already enumerated above (PAD-token
+calibration pollution, cross-layer error compounding across the
+587 trajectory frames, or the chunk-size mismatch). The "layer-16
+amax 27.4" outlier that motivated the original LoRA-merge
+hypothesis is also still present here at amax 21.6 in the
+runtime-LoRA mode (LoRA contributes ~22 % of that magnitude, but
+the base weight itself is the bulk of the outlier — falsifies the
+"LoRA-merge is the *sole* cause of the layer-16 outlier" claim;
+LoRA is at most a 22 % contributor).
+
+What G2 actually verified, then:
+
+* Runtime-LoRA arithmetic is correctly wired through every FP8
+  encoder GEMM site (QKV / O / fused gateup / down). cos > 0.998 vs
+  BF16 truth on a single frame proves no obvious bug.
+* The fused gateup padded LoRA correctly cancels out into the
+  separate gate / up base updates (the block-diagonal lb ensures
+  cross-talk between the two halves stays at zero).
+* The forced `fused = False` downgrade keeps overall infer time
+  *lower* than the merged FP8 path here (213 ms vs 225 ms) — the
+  autotuner picks better algos for the smaller separate GEMMs once
+  the EVT fusion is off.
+
+What G2 did *not* validate (still open):
+
+* Multi-frame trajectory parity. The 587-frame OpenArm v4 replay
+  against openpi h=10 (which produced the original cos 0.617
+  median) has not been re-run with runtime LoRA on. That is the
+  real test of whether the merge-then-quantize hypothesis was
+  correct.
+* Decoder runtime LoRA — decoder pairs are still fp32-merged.
+  In the single-frame test this is harmless (cos 0.998), but a
+  multi-frame trajectory could amplify it.
+
+Next, in order of cost:
+
+1. Re-run `scripts/spark_phase4_parity.py` (or
+   `scripts/spark_replay_episode.py`) with
+   `FLASHRT_RUNTIME_LORA=encoder` and compare cos / ratio
+   distributions vs the historical 0.617 number. This is the
+   real G2 validator and the cheap one (existing infra).
+2. If (1) closes the gap: extend runtime LoRA to decoder, re-run.
+3. If (1) does not close the gap: the catastrophe isn't from
+   LoRA-merge-then-quantize at all; pivot to the PAD-token
+   calibration pollution hypothesis (root cause #1 in the
+   "block-128 smoke test" section above) — fix attention masking
+   in the calibration sampler, re-calibrate, re-run.
+
+Script: `scripts/spark_runtime_lora_g2.py` (committed). Runs ~65 s
+end-to-end (three model loads × ~22 s each on Spark native venv).
+
 ## Phase 5 hardware-verified results
 
 `scripts/spark_phase5_serve_smoke.py` (single-shell smoke against

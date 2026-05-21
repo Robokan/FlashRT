@@ -253,6 +253,14 @@ class Pi05Pipeline:
             and "encoder_ffn_up_lora_a" in weights
             and "encoder_ffn_up_lora_b" in weights
         )
+        # Fused (D, 2r) / (2r, 2H) padded gateup form, used by the
+        # FP8 path whose base GEMM writes encoder_gate_merged in one
+        # shot. Built next to the separate gate/up tensors at conversion
+        # time (see _build_padded_gateup_lora in the JAX converter).
+        self._has_enc_ffn_gateup_lora_fused = (
+            "encoder_ffn_gateup_lora_a" in weights
+            and "encoder_ffn_gateup_lora_b" in weights
+        )
         self._has_enc_ffn_down_lora = (
             "encoder_ffn_down_lora_a" in weights
             and "encoder_ffn_down_lora_b" in weights
@@ -296,13 +304,23 @@ class Pi05Pipeline:
                 max_neck = max(
                     max_neck,
                     int(weights["encoder_attn_qkv_lora_a"].shape[-1]))
+            if self._has_enc_ffn_gateup_lora_fused:
+                # 2r for the fused gateup form (typical 2*16 = 32).
+                max_neck = max(
+                    max_neck,
+                    int(weights["encoder_ffn_gateup_lora_a"].shape[-1]))
             self._enc_lora_neck_max = max_neck
             self._enc_lora_neck = CudaBuffer.device_empty(es * max_neck, BF16)
             logger.info(
-                "Pi05Pipeline: runtime LoRA enabled for encoder FFN "
-                "(gate/up=%s, down=%s, rank=%d, scaling=%.4f)",
-                self._has_enc_ffn_gateup_lora, self._has_enc_ffn_down_lora,
+                "Pi05Pipeline: runtime LoRA enabled for encoder "
+                "(ffn_gateup=%s, ffn_gateup_fused=%s, ffn_down=%s, attn=%s, "
+                "rank=%d, scaling=%.4f, max_neck=%d)",
+                self._has_enc_ffn_gateup_lora,
+                self._has_enc_ffn_gateup_lora_fused,
+                self._has_enc_ffn_down_lora,
+                self._has_enc_attn_lora,
                 self._lora_rank, self._lora_scaling,
+                self._enc_lora_neck_max,
             )
             if self._lora_scaling != 1.0:
                 # TODO: non-unit scaling needs either a scaled residual_add
@@ -1249,8 +1267,19 @@ class Pi05Pipeline:
 
         # Language embeds have been written by frontend into encoder_x[vs_enc:vs_enc+lang_len]
 
-        # B1-B5: 18 encoder layers. Fuse previous B5 residual into this B1's RMS→FP8
-        fused = use_fp8 and self.fp8_calibrated
+        # B1-B5: 18 encoder layers. Fuse previous B5 residual into this B1's RMS→FP8.
+        # When runtime LoRA is on we need BF16 intermediates of
+        # encoder_x_norm (LoRA QKV/gateup input) and encoder_hidden
+        # (LoRA down input). The fused FP8 path produces FP8 directly
+        # and overwrites those buffers — so disable the fusion when
+        # any encoder LoRA add is active. Correctness > 5 % FP8 speed,
+        # and the non-fused FP8 path keeps every base matmul in FP8.
+        _enc_lora_on = (
+            self._has_enc_ffn_gateup_lora
+            or self._has_enc_ffn_gateup_lora_fused
+            or self._has_enc_ffn_down_lora
+            or self._has_enc_attn_lora)
+        fused = use_fp8 and self.fp8_calibrated and not _enc_lora_on
         for i in range(ENC_L):
             self._encoder_layer(i, seq, fuse_b1=(i > 0 and fused), stream=stream)
 
@@ -1261,7 +1290,12 @@ class Pi05Pipeline:
         W = self.weights
         B = self.bufs
         attn_ptrs = self._attn_ptrs
-        fused = self.use_fp8 and self.fp8_calibrated
+        _enc_lora_on = (
+            self._has_enc_ffn_gateup_lora
+            or self._has_enc_ffn_gateup_lora_fused
+            or self._has_enc_ffn_down_lora
+            or self._has_enc_attn_lora)
+        fused = self.use_fp8 and self.fp8_calibrated and not _enc_lora_on
         use_int8_enc = self.use_int8_encoder
 
         # B1: RMSNorm → QKV GEMM
@@ -1310,6 +1344,22 @@ class Pi05Pipeline:
                 f"encoder_attn_qkv_w_{i}",
                 B["encoder_QKV"].ptr.value,
                 seq, (ENC_NH + 2 * ENC_NKV) * ENC_HD, ENC_D, stream)
+            # Runtime LoRA QKV — base GEMM is FP8 (quantized), LoRA add
+            # is BF16 on top via bf16_nn_res. Same padded form as the
+            # BF16 path (see _build_padded_attn_lora_{a,b}). Must run
+            # BEFORE qkv_split_rope (shared with BF16 path below).
+            if self._has_enc_attn_lora:
+                la_qkv = W["encoder_attn_qkv_lora_a"][i]
+                lb_qkv = W["encoder_attn_qkv_lora_b"][i]
+                self._apply_enc_lora(
+                    B["encoder_x_norm"].ptr.value,
+                    la_qkv.data_ptr(), lb_qkv.data_ptr(),
+                    B["encoder_QKV"].ptr.value,
+                    seq,
+                    ENC_D,
+                    (ENC_NH + 2 * ENC_NKV) * ENC_HD,
+                    int(la_qkv.shape[-1]),
+                    stream)
         else:
             fvk.rms_norm(
                 B["encoder_x"].ptr.value, self._rms_ones_enc.ptr.value,
@@ -1389,6 +1439,16 @@ class Pi05Pipeline:
                 f"encoder_attn_o_w_{i}",
                 B["encoder_x_norm"].ptr.value,
                 seq, ENC_D, ENC_D, stream)
+            # Runtime LoRA attn O — base FP8, add BF16 delta into the
+            # same x_norm buffer. enc_o_ptr is the attention output
+            # (BF16 from FMHA), same activation the FP8 base consumed.
+            if self._has_enc_attn_lora:
+                self._apply_enc_lora(
+                    enc_o_ptr,
+                    W["encoder_attn_o_lora_a"][i].data_ptr(),
+                    W["encoder_attn_o_lora_b"][i].data_ptr(),
+                    B["encoder_x_norm"].ptr.value,
+                    seq, ENC_D, ENC_D, self._lora_rank, stream)
         else:
             gemm.bf16_nn(
                 enc_o_ptr, W["encoder_attn_o_w"][i],
@@ -1463,6 +1523,21 @@ class Pi05Pipeline:
                 f"encoder_ffn_gate_up_w_{i}",
                 B["encoder_gate_merged"].ptr.value,
                 seq, 2 * ENC_H, ENC_D, stream)
+            # Runtime LoRA fused gateup — base FP8 writes (seq, 2H) into
+            # encoder_gate_merged in the [gate | up] layout; the padded
+            # gateup LoRA (D, 2r) × (2r, 2H) block-diagonal mirrors that
+            # layout exactly so a single bf16_nn + bf16_nn_res covers
+            # gate's [:,:H] and up's [:,H:] in one pass.
+            if self._has_enc_ffn_gateup_lora_fused:
+                la_gu = W["encoder_ffn_gateup_lora_a"][i]
+                lb_gu = W["encoder_ffn_gateup_lora_b"][i]
+                self._apply_enc_lora(
+                    B["encoder_x_norm"].ptr.value,
+                    la_gu.data_ptr(), lb_gu.data_ptr(),
+                    B["encoder_gate_merged"].ptr.value,
+                    seq, ENC_D, 2 * ENC_H,
+                    int(la_gu.shape[-1]),  # 2r (= 32 for r=16)
+                    stream)
         else:
             fvk.residual_add(
                 B["encoder_x"].ptr.value, B["encoder_x_norm"].ptr.value,
@@ -1527,6 +1602,16 @@ class Pi05Pipeline:
                 f"encoder_ffn_down_w_{i}",
                 B["encoder_x_norm"].ptr.value,
                 seq, ENC_D, ENC_H, stream)
+            # Runtime LoRA down — input is post-geglu encoder_hidden in
+            # BF16 (gate_geglu_merged writes BF16). Same shape contract
+            # as the BF16 path.
+            if self._has_enc_ffn_down_lora:
+                self._apply_enc_lora(
+                    B["encoder_hidden"].ptr.value,
+                    W["encoder_ffn_down_lora_a"][i].data_ptr(),
+                    W["encoder_ffn_down_lora_b"][i].data_ptr(),
+                    B["encoder_x_norm"].ptr.value,
+                    seq, ENC_H, ENC_D, self._lora_rank, stream)
         else:
             fvk.gate_geglu(
                 B["encoder_gate_merged"].ptr.value,

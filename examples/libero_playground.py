@@ -195,7 +195,6 @@ class TruncateReplanMode:
     def set_prompt(self, prompt: str) -> None:
         self._prompt = prompt
         self._queue.clear()
-        print(f"[set_prompt:sync] {prompt!r}", flush=True)
 
     def reset(self) -> None:
         self._queue.clear()
@@ -205,7 +204,6 @@ class TruncateReplanMode:
     def next_action(self, obs: dict) -> np.ndarray:
         if not self._queue:
             agent, wrist = _policy_inputs_from_obs(obs)
-            print(f"[infer:sync] prompt={self._prompt!r}", flush=True)
             t0 = time.perf_counter()
             actions = self._model.predict(images=[agent, wrist], prompt=self._prompt)
             self._last_latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -235,10 +233,8 @@ class AsyncBlendMode:
 
         def _infer(observation: dict) -> np.ndarray:
             agent, wrist = _policy_inputs_from_obs(observation)
-            p = self._prompt
-            print(f"[infer:async] prompt={p!r}", flush=True)
             return np.asarray(
-                model.predict(images=[agent, wrist], prompt=p),
+                model.predict(images=[agent, wrist], prompt=self._prompt),
                 dtype=np.float64,
             )
 
@@ -254,11 +250,10 @@ class AsyncBlendMode:
 
     def set_prompt(self, prompt: str) -> None:
         self._prompt = prompt
-        print(f"[set_prompt:async] {prompt!r}", flush=True)
-        # AsyncChunkRunner has no in-flight invalidation hook; let the
-        # current chunk drain. The next chunk will be generated against
-        # the new prompt automatically. (For a hard cut, type the prompt
-        # and then 'r' to reset both env and runner.)
+        # AsyncChunkRunner has no in-flight invalidation hook; the
+        # current chunk drains against the OLD prompt and the next
+        # chunk (started at step 5) uses the new one. For a hard cut,
+        # type the prompt and then 'r' to reset env + runner.
 
     def reset(self) -> None:
         # AsyncChunkRunner.reset takes an observation. We do it lazily
@@ -413,8 +408,16 @@ def main() -> int:
                     elif cmd == "h":
                         print(HELP)
                     elif cmd == "s":
-                        print(f"[stats] mode='{mode.name}' prompt={current_prompt!r} "
+                        match = (current_prompt == task.language)
+                        if match:
+                            ptag = "MATCHES env's task"
+                        else:
+                            ptag = (f"DIFFERS from env's task -- env will "
+                                    f"reward only {task.language!r}")
+                        print(f"[stats] mode='{mode.name}' task={args.task} "
                               f"step={step_counter} {mode.stats()}")
+                        print(f"        env_task={task.language!r}")
+                        print(f"        prompt  ={current_prompt!r}  [{ptag}]")
                     elif cmd == "r":
                         env.reset()
                         env.set_init_state(init_states[0])
@@ -468,7 +471,18 @@ def main() -> int:
                     else:
                         current_prompt = cmd
                         mode.set_prompt(current_prompt)
-                        print(f"[prompt] {current_prompt!r}")
+                        if current_prompt == task.language:
+                            print(f"[prompt] {current_prompt!r}  "
+                                  f"(matches env's task)")
+                        else:
+                            print(f"[prompt] {current_prompt!r}")
+                            print(f"         note: env's reward is hardcoded "
+                                  f"to {task.language!r}")
+                            print(f"         (so [goal reached!] below would "
+                                  f"mean the env's task object hit the basket,")
+                            print(f"         not necessarily what you asked "
+                                  f"for. use 't N' to switch the env to a "
+                                  f"matching scene.)")
             except queue.Empty:
                 pass
 
@@ -479,13 +493,27 @@ def main() -> int:
             viewer.sync()
             step_counter += 1
 
-            # Print goal-reached ONCE per success (on False->True transition)
-            # to avoid spamming the terminal at 20 lines/sec, which makes it
-            # impossible to type the next prompt or command.
+            # Print goal-reached ONCE per success (on False->True transition).
+            # Be explicit that env reward is hardcoded to the loaded task's
+            # BDDL goal -- it fires when the env's task target ends up where
+            # the BDDL says, REGARDLESS of which prompt you've sent the
+            # policy. If your current prompt matches the env's task language,
+            # this is a real "you asked X, model did X" success. If not, the
+            # model still did the env's task and your prompt was ignored
+            # (which is mostly a Pi0.5-LIBERO scene-prior issue: each LIBERO
+            # scene was trained to one target, so OOD (scene, prompt) pairs
+            # collapse back to the trained behaviour).
             if done and not prev_done:
-                print(f"[goal reached!] step={step_counter} reward={reward:.2f}  "
-                      f"(env keeps running; type a new prompt, 't N' for another "
-                      f"task, or 'r' to retry)")
+                if current_prompt == task.language:
+                    print(f"[goal reached!] step={step_counter} reward={reward:.2f}  "
+                          f"-- you asked {current_prompt!r} and the env's "
+                          f"reward fired. press 'r' to retry or type a new prompt.")
+                else:
+                    print(f"[env task succeeded] step={step_counter} reward={reward:.2f}")
+                    print(f"   env's task: {task.language!r}  (reward fired on this)")
+                    print(f"   your prompt: {current_prompt!r}  (likely ignored by "
+                          f"pi05_libero -- scene prior dominates language prior)")
+                    print(f"   use 't N' to load a scene whose task matches your prompt.")
             prev_done = bool(done)
 
             # Periodic stats every 10s

@@ -1178,6 +1178,96 @@ Next, in order of cost:
 Script: `scripts/spark_runtime_lora_g2.py` (committed). Runs ~65 s
 end-to-end (three model loads × ~22 s each on Spark native venv).
 
+### G3 — Phase 4 multi-frame, autotune-skip + scale-restore + delta-mask
+
+Phase 4 (`scripts/spark_phase4_parity.py`, n=30 OpenArm v4 samples,
+two-live-servers topology, both servers including `state` in the
+prompt + identical observation pipeline) re-run with the two pipeline
+hardening fixes from this session **plus** the previously-mandatory
+`--delta-action-mask '7,-1,7,-1'` CLI flag (the lack of which was the
+cause of the 0.617 ↔ 0.69 "regression" we chased: omitting it makes
+FlashRT serve normalized deltas while openpi serves absolute joints,
+producing the exact ratio 0.1–0.8 / cos 0.6–0.8 footprint we'd been
+attributing to FP8):
+
+| mode | cos median | cos mean | cos min | ratio median | rebuild p50 | cache-hit p50 | crash? |
+|---|---|---|---|---|---|---|---|
+| `fp8_merge` (default; no runtime LoRA)  | **0.9946** | 0.9895 | 0.9455 | 1.080 | 612 ms | 162 ms | none |
+| `fp8_runtime_lora=encoder`              | **0.9954** | 0.9925 | 0.9508 | 1.080 | 705 ms | 178 ms | none |
+
+Both modes back at the documented multi-frame baseline (cos median
+0.957 from commit `9e610d3`; better here because we now have h=10
+checkpoint matching openpi's chunk_size=10). Runtime-LoRA encoder mode
+is **slightly better** than merge mode on cos mean (0.9925 vs 0.9895)
+at a +93 ms per-rebuild latency cost (extra LoRA neck GEMMs per
+encoder layer when the FP8 fused norm→FP8 path is disabled — see
+`Pi05Pipeline._encoder_layer`). cos min ~0.95 floor is the same on
+both paths and tracks variance in openpi's deterministic-noise vs
+FlashRT's random-noise diffusion, not a FlashRT bug.
+
+The two pipeline fixes that made this re-run possible (and stable
+across 30 rebuilds, where the old code crashed at rebuild ≥3):
+
+1. **Autotune-skip on rebuild**
+   (`Pi05TorchFrontendRtx._gemm_autotune_done` flag +
+   `Pi05Pipeline.record_infer_graph(skip_autotune=True)`). cuBLASLt's
+   per-shape tuned algo is cached on the *shared* `GemmRunner`, not
+   on the per-rebuild pipeline. Re-running autotune on rebuild
+   was both wasted work (~150 ms per rebuild) AND a reliable
+   `cudaDeviceSynchronize` illegal-memory-access trigger inside
+   `autotune_fp8_nn_dev` after the 3rd rebuild (csrc/gemm/
+   gemm_runner.cu:178 warmup loop). With the skip, the first
+   pipeline tunes everything once; subsequent rebuilds use the
+   cached algos (vision + decoder shapes hit the cache; new
+   encoder shapes get cuBLASLt's heuristic top-1, which is
+   numerically equivalent — autotune only picks *faster*, not
+   *more accurate*).
+
+2. **FP8 scales snapshot / restore across rebuilds**
+   (`Pi05TorchFrontendRtx._snapshot_fp8_scales` after multi-frame
+   calibration + `_restore_fp8_scales` on every set_prompt rebuild).
+   Before: each rebuild's predict-time `_calibrate_single_frame`
+   would dynamic-quant from a single observation's activations and
+   overwrite `fp8_act_scales` — scales fit one noise realization
+   and didn't cover the diffusion-noise variance, tanking cos
+   relative to the multi-frame baseline. After: the 80-sample
+   snapshot is uploaded into every rebuilt pipeline, `fp8_calibrated`
+   is flipped to True, `calibrate_fp8`'s reuse-from-forward
+   early-return kicks in, and `record_infer_graph` captures a
+   static-FP8 graph using the multi-frame scales. (In the n=30
+   run this turned out *not* to move cos meaningfully — the cos
+   regression we'd been investigating was actually 100% explained
+   by the missing `--delta-action-mask`. The scale-restore fix
+   is still correct and necessary, just not the cause of the
+   numbers we were chasing today.)
+
+Crashes: 0 in 30 frames in both modes. Pre-fix, autotune crashed at
+rebuild #3 (~12 frames in, depending on which prompt_len hit first).
+
+Remaining gap to the strict gate (cos ≥ 0.99 + ratio ∈ [0.95, 1.05]):
+2/30 pass on both paths. The 28 that fall short fail on ratio
+(median 1.08; openpi-h10 actions are systematically ~8% smaller
+in magnitude than FlashRT-h10) more than on cos. That's the
+chunk_size=10 vs 50 architectural mismatch documented in commit
+`9e610d3` — a separate pipeline change, not a calibration or
+quantization issue. The 1.5–1.6 ratio outlier (sample idx=43)
+is the same encoder_ffn_down_w_{15,16} FP8 calibration outlier
+flagged in earlier diagnostics — it survives the runtime-LoRA
+path too, so it's not LoRA-merge-and-quantize but a property of
+the activation distribution at that specific frame.
+
+**Production blocker that remains**: per-rebuild latency.
+state-in-prompt drifts ±2 tokens per frame, each crossing triggers
+a 600–700 ms rebuild (pipeline alloc + FP8 calibration forward +
+graph capture). The cache-hit p50 is 162–178 ms (graph replay
+on a same-prompt-len frame). Both are far above the 50–150 ms
+band that the plan needs for 25 Hz control. The fix is encoder
+attention masking via FA2 varlen so one pipeline at
+`max_prompt_len` covers every length without rebuild — that's
+the next real C++ change once we want to chase production
+latency. (See "What's not yet verified" → "Production-viable
+state-in-prompt latency".)
+
 ## Phase 5 hardware-verified results
 
 `scripts/spark_phase5_serve_smoke.py` (single-shell smoke against

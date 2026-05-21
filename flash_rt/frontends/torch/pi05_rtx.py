@@ -572,6 +572,26 @@ class Pi05TorchFrontendRtx:
         self.latency_records: list[float] = []
         self.calibrated = False
         self.graph_recorded = False
+        # Persistent across pipeline rebuilds: cuBLASLt's per-shape tuned
+        # algo is cached on the shared GemmRunner instance, not on the
+        # pipeline. Re-running autotune across rebuilds (1) is wasted work
+        # since the shared cache already has the best algo for each
+        # (M, N, K) and (2) reliably hits a cuBLASLt illegal-memory-access
+        # crash on the 3rd+ rebuild on Spark/SM121 — re-tuning the same
+        # cached entry from a new pipeline's tensors triggers it (see
+        # csrc/gemm/gemm_runner.cu:178 autotune warmup). The first
+        # successful run sets this flag; subsequent rebuilds use the
+        # cached algos via cuBLASLt's heuristic top-1 (or the
+        # previously-tuned algo on shared shapes — vision and decoder).
+        self._gemm_autotune_done = False
+        # Snapshot of FP8 activation scales calibrated against the full
+        # 80-sample dataset (with diverse states + diverse noise). Restored
+        # into every rebuilt pipeline so per-frame rebuilds (state-in-prompt
+        # mode) reuse the multi-frame scales instead of degenerating to
+        # single-frame scales that don't cover noise variance and tank
+        # cosine to ~0.6 vs the JAX reference. Keyed by FP8 GEMM name
+        # ("encoder_attn_qkv_w_0", etc.), value is the float32 amax/scale.
+        self._fp8_scales_snapshot: dict[str, np.ndarray] = {}
         self.current_prompt_len = 0
         self.pipeline: Optional[Pi05Pipeline] = None
         # Last prompt text passed to set_prompt() — used as a fallback by
@@ -1201,6 +1221,13 @@ class Pi05TorchFrontendRtx:
             if self.pipeline.use_int8_vision_static:
                 self.pipeline.vis_int8_static_calibrated = False
                 self.pipeline.vis_int8_static_scales = {}
+            # Restore the multi-frame FP8 scales (if we have them) so the
+            # rebuilt pipeline uses the same calibration as the initial
+            # 80-sample pass. Without this, the predict-time
+            # _calibrate_single_frame fallback overwrites them with
+            # single-frame scales that don't cover diffusion-noise variance
+            # — cos drops from ~0.96 to ~0.6 (see Phase 4 parity).
+            self._restore_fp8_scales()
 
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
@@ -1440,8 +1467,15 @@ class Pi05TorchFrontendRtx:
                     "from one calibration sample. Expect cosine drop "
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
-            self.pipeline.autotune_gemms()
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            if not self._gemm_autotune_done:
+                self.pipeline.autotune_gemms()
+                self._gemm_autotune_done = True
+            else:
+                logger.info("Skipping autotune_gemms (already tuned in this "
+                            "process; cuBLASLt entries are cached on the "
+                            "shared GemmRunner across pipeline rebuilds).")
+            self.pipeline.record_infer_graph(
+                external_stream_int=stream_int, skip_autotune=True)
 
         self.calibrated = True
         self.graph_recorded = True
@@ -1557,11 +1591,18 @@ class Pi05TorchFrontendRtx:
                     np.array([final_amax[idx]], dtype=np.float32))
 
             self.pipeline.fp8_calibrated = True
-            self.pipeline.autotune_gemms()
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            if not self._gemm_autotune_done:
+                self.pipeline.autotune_gemms()
+                self._gemm_autotune_done = True
+            else:
+                logger.info("Skipping autotune_gemms (already tuned in this "
+                            "process).")
+            self.pipeline.record_infer_graph(
+                external_stream_int=stream_int, skip_autotune=True)
 
         self.calibrated = True
         self.graph_recorded = True
+        self._snapshot_fp8_scales()
         self._precision_spec = self._snapshot_precision_spec(
             method="percentile", n=n, percentile=percentile)
         self._warn_if_scale_ceiling_exceeded(label=f"pi05_rtx_N{n}")
@@ -1574,6 +1615,45 @@ class Pi05TorchFrontendRtx:
             buf.zero_()
         for buf in getattr(self.pipeline, "int8_act_scales", {}).values():
             buf.zero_()
+
+    def _snapshot_fp8_scales(self) -> None:
+        """Capture the calibrated FP8 activation scales into a host-side dict.
+
+        Called after a successful multi-frame calibration. The snapshot is
+        replayed into every subsequently-rebuilt pipeline by
+        :meth:`_restore_fp8_scales`, so per-frame rebuilds in state-in-prompt
+        mode don't fall back to single-frame re-calibration (which gives
+        scales that don't cover diffusion-noise variance and tanks cos to
+        ~0.6 vs the JAX reference).
+        """
+        snap: dict[str, np.ndarray] = {}
+        for name, buf in self.pipeline.fp8_act_scales.items():
+            snap[name] = buf.download_new((1,), np.float32).copy()
+        self._fp8_scales_snapshot = snap
+        if snap:
+            logger.info(
+                "Snapshotted %d FP8 activation scales for rebuild reuse",
+                len(snap))
+
+    def _restore_fp8_scales(self) -> bool:
+        """Push the snapshotted FP8 scales into the current pipeline.
+
+        Returns True if scales were restored (and the pipeline marked
+        ``fp8_calibrated = True``), False if there's nothing to restore.
+        """
+        if not self._fp8_scales_snapshot or self.pipeline is None:
+            return False
+        if not getattr(self.pipeline, "use_fp8", False):
+            return False
+        for name, val in self._fp8_scales_snapshot.items():
+            buf = self.pipeline._fp8_scale_buf(name)
+            buf.upload(val.astype(np.float32))
+        self.pipeline.fp8_calibrated = True
+        logger.info(
+            "Restored %d FP8 activation scales from multi-frame snapshot "
+            "(skipping per-rebuild single-frame re-calibration)",
+            len(self._fp8_scales_snapshot))
+        return True
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "pi05_rtx") -> None:
         """Diagnostic warning if any FP8 scale exceeds the sanity ceiling."""
@@ -1918,8 +1998,14 @@ class Pi05TorchFrontendRtx:
             self._copy_tensor_to_pipeline_buf_stream(
                 noise, self.pipeline.input_noise_buf, stream_int)
             self.pipeline.calibrate_fp8()
-            self.pipeline.autotune_gemms()
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            if not self._gemm_autotune_done:
+                self.pipeline.autotune_gemms()
+                self._gemm_autotune_done = True
+            else:
+                logger.info("Skipping autotune_gemms (already tuned in this "
+                            "process; batched-CFG path).")
+            self.pipeline.record_infer_graph(
+                external_stream_int=stream_int, skip_autotune=True)
         self.calibrated = True
         self.graph_recorded = True
 

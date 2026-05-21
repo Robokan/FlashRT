@@ -2067,7 +2067,8 @@ class Pi05Pipeline:
         self._cudart.cudaDeviceSynchronize()
         logger.info("Autotune complete")
 
-    def record_infer_graph(self, external_stream_int: int | None = None) -> None:
+    def record_infer_graph(self, external_stream_int: int | None = None,
+                           skip_autotune: bool = False) -> None:
         """Capture the full pipeline as a CUDA Graph.
 
         Because the attention backend may run framework-specific kernels
@@ -2092,7 +2093,8 @@ class Pi05Pipeline:
         """
         if self.use_fp8 and not self.fp8_calibrated:
             self.calibrate_fp8()
-        self.autotune_gemms()
+        if not skip_autotune:
+            self.autotune_gemms()
 
         self._graph = CUDAGraph()
         if external_stream_int is None:

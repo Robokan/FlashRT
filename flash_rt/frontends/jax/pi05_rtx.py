@@ -1117,6 +1117,16 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.latency_records: list[float] = []
         self.calibrated = False
         self.graph_recorded = False
+        # See Pi05TorchFrontendRtx.__init__ for the rationale; cuBLASLt's
+        # per-shape tuned algo is cached on the shared GemmRunner across
+        # pipeline rebuilds, so re-running autotune is both wasted work
+        # and a known crash trigger after the 3rd rebuild on Spark/SM121.
+        self._gemm_autotune_done = False
+        # FP8 scales snapshot — see Pi05TorchFrontendRtx for the rationale.
+        # Per-rebuild single-frame re-calibration produces scales that
+        # don't cover diffusion noise variance, tanking cos from ~0.96
+        # (80-sample multi-frame) to ~0.6 (1-sample).
+        self._fp8_scales_snapshot: dict[str, np.ndarray] = {}
         self.current_prompt_len = 0
         self.pipeline = None
 

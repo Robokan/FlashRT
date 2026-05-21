@@ -282,3 +282,81 @@ DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true)
 #else
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
 #endif
+
+// ──────────────────────────────────────────────────────────────
+// Variable-length entry. Same arg list as the dense entry plus
+// cu_seqlens_q_ptr / cu_seqlens_k_ptr — device int32 buffers with
+// (batch+1) cumulative seqlens each. The kernel iterates the full
+// max_seqlen_{q,k} grid (passed as seqlen_q / seqlen_k) but uses
+// BlockInfo::actual_seqlen_q/k = cu_seqlens[bidb+1] - cu_seqlens[bidb]
+// to mask out rows/cols beyond each batch element's real length.
+//
+// Designed for CUDA Graph capture: the cu_seqlens device pointers
+// are baked into the captured kernel arg, but their *contents* can
+// be updated between replays via cudaMemcpyAsync. One graph capture
+// covers every (real_prompt_len ≤ max_prompt_len), eliminating the
+// per-frame pipeline rebuild for state-in-prompt mode.
+//
+// is_seqlens_k_cumulative is forced true (matches the encoder-self-
+// attention layout where K's cumulative seqlens equal Q's). For
+// per-batch K-cache lengths (e.g. paged KV), call sites would set
+// is_seqlens_k_cumulative=false separately — not exposed here.
+// ──────────────────────────────────────────────────────────────
+
+#define DEFINE_FA2_VARLEN_ENTRY(NAME, ELEM_T, IS_BF16)                          \
+extern "C" void NAME(                                                            \
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,                     \
+    void* o_ptr, void* softmax_lse_ptr,                                          \
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,                              \
+    const void* cu_seqlens_q_ptr, const void* cu_seqlens_k_ptr,                  \
+    int batch, int max_seqlen_q, int max_seqlen_k,                               \
+    int num_heads_q, int num_heads_kv, int head_dim,                             \
+    int q_batch_stride, int q_row_stride, int q_head_stride,                     \
+    int k_batch_stride, int k_row_stride, int k_head_stride,                     \
+    int v_batch_stride, int v_row_stride, int v_head_stride,                     \
+    int o_batch_stride, int o_row_stride, int o_head_stride,                     \
+    float softmax_scale, int num_sms, cudaStream_t stream)                       \
+{                                                                                \
+    FLASH_NAMESPACE::Flash_fwd_params params;                                    \
+    fill_params(params, IS_BF16,                                                 \
+                q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,                     \
+                batch, max_seqlen_q, max_seqlen_k,                               \
+                num_heads_q, num_heads_kv, head_dim,                             \
+                q_batch_stride, q_row_stride, q_head_stride,                     \
+                k_batch_stride, k_row_stride, k_head_stride,                     \
+                v_batch_stride, v_row_stride, v_head_stride,                     \
+                o_batch_stride, o_row_stride, o_head_stride,                     \
+                softmax_scale);                                                  \
+    /* Override the cu_seqlens fields fill_params hard-coded to null.            \
+     * BlockInfo<Varlen=true> picks these up via params.cu_seqlens_q/k. */       \
+    params.cu_seqlens_q = const_cast<int*>(                                      \
+        reinterpret_cast<const int*>(cu_seqlens_q_ptr));                         \
+    params.cu_seqlens_k = const_cast<int*>(                                      \
+        reinterpret_cast<const int*>(cu_seqlens_k_ptr));                         \
+    params.is_seqlens_k_cumulative = true;                                       \
+    int num_splits = setup_splitkv(params, softmax_lse_accum_ptr, o_accum_ptr,   \
+                                    num_sms, max_seqlen_q, max_seqlen_k,         \
+                                    head_dim, batch, num_heads_q);               \
+    dispatch_hdim<ELEM_T>(head_dim, num_splits, params, stream);                 \
+}
+
+#define DEFINE_FA2_VARLEN_STUB(NAME, DTYPE_STR)                                  \
+extern "C" void NAME(                                                            \
+    const void*, const void*, const void*, void*, void*,                         \
+    void*, void*, const void*, const void*,                                      \
+    int, int, int, int, int, int,                                                \
+    int, int, int, int, int, int,                                                \
+    int, int, int, int, int, int,                                                \
+    float, int, cudaStream_t)                                                    \
+{                                                                                \
+    fprintf(stderr,                                                              \
+        "fvk_attention_fa2_varlen: " DTYPE_STR " entry was not compiled. "       \
+        "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.\n");              \
+    std::abort();                                                                \
+}
+
+#ifdef FA2_HAS_BF16
+DEFINE_FA2_VARLEN_ENTRY(fvk_attention_fa2_fwd_bf16_varlen, cutlass::bfloat16_t, true)
+#else
+DEFINE_FA2_VARLEN_STUB(fvk_attention_fa2_fwd_bf16_varlen,  "bf16")
+#endif

@@ -1268,6 +1268,130 @@ the next real C++ change once we want to chase production
 latency. (See "What's not yet verified" → "Production-viable
 state-in-prompt latency".)
 
+### G4 — pipeline cache + FA2 varlen building block (G3 follow-up)
+
+Two pieces landed in this session to address the per-rebuild latency
+ceiling, plus one piece deliberately left for a future session:
+
+**Shipped — pipeline cache (Pi05TorchFrontendRtx.\_pipeline\_cache).**
+``set_prompt(prompt, state)`` now caches the full ``Pi05Pipeline``
+keyed by EXACT prompt_len. Second visit to a length we've already
+seen is a pure pointer swap — no autotune, no warmup, no graph
+re-capture, no FP8 scale restore. Three new methods on
+``Pi05TorchFrontendRtx``:
+
+- ``_build_pipeline_for_prompt_len(prompt_len)`` — pure factory.
+- ``_get_or_build_pipeline_for_prompt_len(prompt_len) → (pipeline, was_built)``
+  — cache lookup; builds + caches + restores FP8 scales on miss.
+  Warns at threshold (default 8, override via
+  ``FLASHRT_PIPELINE_CACHE_WARN``).
+- ``prewarm_prompt_buckets(prompt_lens: list[int])`` — opt-in
+  amortisation. If the operator knows the expected token-count set
+  for a task (OpenArm chocolate_bars: 78..82), call this once after
+  ``calibrate_with_real_data`` returns to pay all the rebuild costs
+  up front at startup. Then ZERO rebuild spikes during inference.
+
+Why we key on EXACT prompt_len rather than padding to a bucket
+bound: the earlier zero-pad-to-max experiment dropped
+cos(FlashRT, teleop) from 0.989 → 0.892 (encoder attention attends
+to pad rows). The bucket cache shape-matches the captured graph to
+the prompt, so no padding, no attention pollution. Cost: typically
+3–6 cached pipelines per task; each adds ~200–300 MB scratch on a
+121 GB pool, trivial.
+
+Cache-logic smoke test (mock-driven, no checkpoint load — runs
+in ~1 s):
+
+```
+T1 first call prompt_len=80 ............... BUILD, cache_size=1
+T2 same prompt_len=80 ..................... HIT (same instance, no
+                                            pipeline change)
+T3 new prompt_len=82 ...................... BUILD, cache_size=2
+T4 back to prompt_len=80 .................. HIT (cache swap)
+T5 prewarm [78,79,80,81,82] ............... +3 builds (80,82 cached)
+T6 re-prewarm same list ................... 0 builds (idempotent)
+```
+
+The cache replaces the old "rebuild on every length change" path
+that landed in G3. The frontend's three-tier log keeps per-frame
+operation at 25–30 Hz quiet: ``was_built`` → INFO with
+``NEW pipeline cached, cache size=N``; cache-hit-with-swap →
+DEBUG; same-pipeline re-upload → DEBUG. Real-server validation
+(Phase 4 n=30) is the next step.
+
+**Shipped — native FA2 varlen wrapper (csrc).** Bit-exact
+verified against the dense path on real Pi0.5 encoder shapes
+(B=1, GQA 8Q/1KV, head_dim=256, seq=848 vs padded 864):
+
+```
+real-part max abs diff : 0.000000e+00
+real-part mean row-cos : 1.0000000000
+pad-part nan=False inf=False
+```
+
+Sits at ``csrc/attention/fa2_wrapper.cu`` as a sibling entry
+``fvk_attention_fa2_fwd_bf16_varlen`` (same dispatch as
+``fvk_attention_fa2_fwd_bf16`` but accepts ``cu_seqlens_q`` /
+``cu_seqlens_k`` device int32 pointers; the kernel iterates the
+full ``max_seqlen`` grid and masks via ``BlockInfo::actual_seqlen_q/k``).
+Exposed in Python as ``flash_rt.flash_rt_fa2.fwd_bf16_varlen``.
+The kernel templates are already compiled for
+``is_even_MN=false`` — no new CUTLASS instantiations, the
+incremental rebuild was ~10 s.
+
+Designed for CUDA Graph capture: the cu_seqlens device pointers
+are baked into the captured kernel arg; their values can be
+updated between replays via ``cudaMemcpyAsync``. This is the
+building block for full encoder-attention-masking, but the
+pipeline isn't wired to use it yet — see deferred work below.
+
+**Deferred — full varlen end-to-end.** The wrapper alone doesn't
+eliminate rebuilds because Pi0.5's decoder cross-attention writes
+its chunk K/V into the shared encoder K/V cache at offset
+``enc_seq`` (see ``flash_rt/models/pi05/pipeline_rtx.py:1753``,
+``_enc_kv_layer_ptrs(i, offset_tokens=enc_seq)``). That offset
+is baked into the captured graph as a Python int via pointer
+arithmetic. With encoder padded to ``max_enc_seq``, the K-cache
+layout becomes ``[real_enc | garbage_pad | chunk]`` — a
+discontinuous valid region that neither FA2's ``cu_seqlens_k``
+(masks a contiguous prefix) nor ``seqused_k`` (truncates from
+start) can handle alone.
+
+Two ways to close the gap, both estimated 3–5 hours:
+
+1. **Kernel mod (lower risk).** Add
+   ``qkv_split_rope_dev_offset`` BF16 variant in
+   ``csrc/kernels/rope.cu`` that reads the K/V row offset from a
+   ``const int*`` device pointer instead of from a pre-offset
+   Python pointer. The decoder layer then writes chunk K/V at
+   ``actual_enc_seq`` (read at graph-replay time from a device
+   int32 buf the frontend updates via ``cudaMemcpyAsync`` in
+   ``set_prompt``). K cache layout becomes
+   ``[real_enc | chunk | trailing_garbage]`` — contiguous valid
+   prefix, ``cu_seqlens_k = [0, actual_enc_seq + chunk]`` masks
+   the trailing garbage cleanly. Encoder kept on offset=0
+   (existing kernel unchanged).
+2. **Two-call LSE merge (no new C++).** Decoder writes chunk at
+   ``max_enc_seq`` always; cross-attn becomes TWO FA2 calls per
+   layer (one against ``enc_K[:actual_enc_seq]``, one against
+   ``enc_K[max_enc_seq:max_enc_seq+chunk]``) combined via FA2's
+   ``softmax_lse``-merge math. ~150 LoC Python with the LSE
+   arithmetic to get right; bit-exact validation overhead is
+   higher.
+
+Path (1) is the planned next step. After landing, the bucket
+cache stays as the fallback path behind an env toggle
+(``FLASHRT_ENCODER_VARLEN=0``); varlen becomes default once one
+clean Phase 4 n=30 run posts cos median ≥ 0.99 AND zero rebuilds
+during inference.
+
+The bucket cache implementation is the right thing to ship today:
+it covers the OpenArm production case (5 distinct prompt-lens with
+``prewarm_prompt_buckets([78,79,80,81,82])`` = zero rebuild spikes
+after startup) and the LIBERO case (1 prompt-len, never spikes).
+Open-vocabulary deployments are the case that demand varlen, and
+those aren't shipping this week.
+
 ## Phase 5 hardware-verified results
 
 `scripts/spark_phase5_serve_smoke.py` (single-shell smoke against

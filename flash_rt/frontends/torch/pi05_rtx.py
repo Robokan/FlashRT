@@ -594,6 +594,55 @@ class Pi05TorchFrontendRtx:
         self._fp8_scales_snapshot: dict[str, np.ndarray] = {}
         self.current_prompt_len = 0
         self.pipeline: Optional[Pi05Pipeline] = None
+        # Cache of fully-built pipelines keyed by exact prompt_len. State-in-prompt
+        # mode (Pi0.5 discrete_state_input) produces a small set of prompt token
+        # counts per task (OpenArm chocolate_bars: 78..82 → 5 distinct lengths;
+        # LIBERO 7-DOF: ~45 → 1 length). Building one Pi05Pipeline per observed
+        # length and caching them turns the second visit to a known length into a
+        # pure pointer swap (no autotune, no warmup, no graph re-capture), which
+        # eliminates the ~600 ms per-frame rebuild spike that otherwise breaks
+        # 25 Hz robot control.
+        #
+        # We key on EXACT prompt_len (not on a bucket bound) so the captured
+        # graph is shape-matched to the prompt — no encoder padding, no
+        # attention pollution. The earlier zero-pad-to-max experiment dropped
+        # cos(FlashRT, teleop) from 0.989 to 0.892; bucketing-with-padding
+        # would re-introduce that. With state-in-prompt this means typically
+        # 3-6 cached pipelines per task; on Spark (121 GB pool) each pipeline
+        # adds ~200-300 MB of scratch + activations, which is trivial.
+        #
+        # FP8 scales are restored from self._fp8_scales_snapshot into every
+        # newly-built bucket pipeline so they inherit the multi-frame
+        # calibration instead of degenerating to single-frame scales (see
+        # _restore_fp8_scales docstring).
+        #
+        # TODO(varlen-encoder): the bucket cache is a deliberate workaround
+        # for variable prompt length, not the long-term solution. The cache
+        # still pays one ~600 ms build the first time each new prompt_len is
+        # seen — fine for tasks with a small, predictable token-count set
+        # (OpenArm, LIBERO), but a real production deployment with
+        # open-vocabulary prompts will eventually need encoder-attention
+        # masking via FA2 varlen so ONE captured graph at max_prompt_len
+        # covers every length with zero rebuild risk forever.
+        #
+        # The native FA2 varlen wrapper is already built and bit-exact
+        # verified — see ``csrc/attention/fa2_wrapper.cu``
+        # (``fvk_attention_fa2_fwd_bf16_varlen``) and Python binding
+        # ``flash_rt.flash_rt_fa2.fwd_bf16_varlen``. The remaining work
+        # to flip the pipeline to varlen is documented in
+        # ``docs/spark_status.md`` § G4 (deferred work). The blocker
+        # there is decoder cross-attn's K/V cache layout (chunk K/V is
+        # written at offset ``enc_seq`` inside the shared encoder cache —
+        # see ``pipeline_rtx.py:1753`` — which today bakes ``enc_seq``
+        # into the captured graph as a Python int via pointer arithmetic;
+        # the dev_offset kernel mod to fix this is sketched in G4 too).
+        self._pipeline_cache: dict[int, Pi05Pipeline] = {}
+        # Soft-cap warning: if the cache exceeds this many entries the
+        # operator is likely seeing far more prompt-length variance than
+        # expected, which would balloon memory + amortise build time
+        # uncontrollably. Override with FLASHRT_PIPELINE_CACHE_WARN=N.
+        self._pipeline_cache_warn_threshold = int(
+            os.environ.get("FLASHRT_PIPELINE_CACHE_WARN", "8"))
         # Last prompt text passed to set_prompt() — used as a fallback by
         # _calibrate_multi_frame when calibration samples don't carry
         # their own per-sample prompt string.
@@ -1102,6 +1151,103 @@ class Pi05TorchFrontendRtx:
             "RL mode enabled: cfg_beta=%.2f, advantage_positive=%s",
             new_config["cfg_beta"], new_config["advantage_positive"])
 
+    def _build_pipeline_for_prompt_len(self, prompt_len: int) -> Pi05Pipeline:
+        """Build (don't cache) a fresh Pi05Pipeline shaped for prompt_len.
+
+        Pure factory. Sets vision-INT8 reset flags and restores the
+        multi-frame FP8 scales snapshot (no-op if calibration hasn't run
+        yet) so the new pipeline inherits the same activation scales as
+        the initial 80-sample pass. Caller is responsible for caching.
+        """
+        logger.info("Building Pi05Pipeline for prompt_len=%d...", prompt_len)
+        pipeline_weights = self._build_pipeline_weights()
+        pipe = Pi05Pipeline(
+            gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
+            weights=pipeline_weights,
+            num_views=self.num_views,
+            max_prompt_len=prompt_len,
+            chunk_size=self.chunk_size,
+            num_steps=self._num_steps,
+            vision_pool_factor=self._vision_pool_factor,
+            vision_num_layers=self._vision_num_layers,
+            **self._pipeline_precision_kwargs())
+        # Static INT8 vision scales are per-pipeline-instance. Reset so
+        # the predict-time single-frame fallback collects fresh scales.
+        if pipe.use_int8_vision_static:
+            pipe.vis_int8_static_calibrated = False
+            pipe.vis_int8_static_scales = {}
+        # Restore the multi-frame FP8 scales snapshot into the new pipeline
+        # (no-op if no snapshot exists yet — first-build flow). _restore_fp8_scales
+        # operates on self.pipeline, so temporarily point at the new one.
+        prior_pipeline = self.pipeline
+        self.pipeline = pipe
+        try:
+            self._restore_fp8_scales()
+        finally:
+            self.pipeline = prior_pipeline
+        return pipe
+
+    def _get_or_build_pipeline_for_prompt_len(
+            self, prompt_len: int) -> tuple[Pi05Pipeline, bool]:
+        """Return cached pipeline for prompt_len (build + cache on miss).
+
+        Returns
+        -------
+        (pipeline, was_built)
+            ``was_built`` is True iff a fresh Pi05Pipeline was constructed
+            on this call (cache miss). Callers use this to decide whether
+            to reset graph_recorded / calibrated flags and to log the
+            higher-cost-rebuild event vs the cheap pointer swap.
+        """
+        cached = self._pipeline_cache.get(prompt_len)
+        if cached is not None:
+            return cached, False
+
+        pipe = self._build_pipeline_for_prompt_len(prompt_len)
+        self._pipeline_cache[prompt_len] = pipe
+        n_cached = len(self._pipeline_cache)
+        if n_cached >= self._pipeline_cache_warn_threshold:
+            logger.warning(
+                "Pi05 pipeline cache has %d entries (keys=%s). Each entry "
+                "owns ~200-300 MB of scratch + activations. If you expect "
+                "this many distinct prompt-lengths, raise the warning "
+                "threshold via FLASHRT_PIPELINE_CACHE_WARN=N. Otherwise "
+                "check why prompt tokenisation is so unstable across "
+                "frames — production Pi0.5 state-in-prompt typically "
+                "produces 3-6 lengths per task.",
+                n_cached, sorted(self._pipeline_cache.keys()))
+        return pipe, True
+
+    def prewarm_prompt_buckets(self, prompt_lens: list[int]) -> None:
+        """Pre-build cached pipelines for an explicit list of prompt lengths.
+
+        Pays the per-bucket ~600 ms build cost up-front at startup instead
+        of letting it land as per-frame spikes during inference. Each
+        bucket pipeline inherits the current FP8 scales snapshot (call
+        AFTER ``calibrate_with_real_data`` so the multi-frame scales
+        already exist). Idempotent: lengths already cached are skipped.
+
+        Graph capture for each bucket still happens lazily on first
+        :meth:`set_prompt` + :meth:`infer` for that bucket, because graph
+        recording requires an actual observation for warmup. The
+        pre-built pipeline is fully calibrated and autotuned, so the
+        lazy graph capture is just one short single-frame warmup pass
+        (~120 ms) instead of the full 600 ms rebuild.
+
+        Typical usage::
+
+            api.calibrate_with_real_data(obs_list)
+            # OpenArm chocolate_bars seen prompt-lens in calibration:
+            api.frontend.prewarm_prompt_buckets([78, 80, 82])
+        """
+        for plen in prompt_lens:
+            if plen in self._pipeline_cache:
+                continue
+            self._pipeline_cache[plen] = self._build_pipeline_for_prompt_len(plen)
+        logger.info(
+            "Pi05 pipeline cache: prewarm complete (cached prompt_lens=%s)",
+            sorted(self._pipeline_cache.keys()))
+
     def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.
 
@@ -1195,39 +1341,33 @@ class Pi05TorchFrontendRtx:
                 prompt_text, self.embedding_weight,
                 max_len=MAX_PROMPT_LEN_DEFAULT)
 
-        will_rebuild = (self.pipeline is None
-                        or prompt_len != self.current_prompt_len)
-        if will_rebuild:
-            logger.info("Building Pi05Pipeline for prompt_len=%d...", prompt_len)
-            # Rebuild the pipeline with the exact prompt length to avoid
-            # wasted compute on padding tokens.
+        # Pipeline cache lookup. Three cases:
+        #   1) First-ever call: cache empty → build, cache, set as active
+        #   2) Same prompt_len as last call: same Pi05Pipeline instance
+        #      already active → pointer-stable, just re-upload embeds
+        #   3) Different prompt_len already in cache: pointer-swap to
+        #      the cached pipeline (no rebuild, no autotune, no warmup)
+        # The cache replaces the old "rebuild on every length change"
+        # path; per-frame 25 Hz operation in state-in-prompt mode
+        # bounces between 3-6 distinct lengths typically and now pays
+        # the rebuild cost ONCE per length over the whole task instead
+        # of repeatedly.
+        prior_pipeline_id = id(self.pipeline) if self.pipeline is not None else None
+        new_pipeline, was_built = self._get_or_build_pipeline_for_prompt_len(
+            prompt_len)
+        pipeline_changed = id(new_pipeline) != prior_pipeline_id
+        if pipeline_changed:
+            self.pipeline = new_pipeline
             self.current_prompt_len = prompt_len
+            # Flags reflect the ACTIVE pipeline. Freshly-built buckets need
+            # a graph-record on first predict(); cached-hit swaps that
+            # already captured a graph carry calibrated=True / graph_recorded=True
+            # in the pipeline itself, but the frontend's own flags are
+            # invalidated here so the api.predict fallback rebuild path can
+            # decide based on pipeline state (pipeline.fp8_calibrated +
+            # whether record_infer_graph has run for this instance).
             self.graph_recorded = False
             self.calibrated = False
-
-            pipeline_weights = self._build_pipeline_weights()
-            self.pipeline = Pi05Pipeline(
-                gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
-                weights=pipeline_weights,
-                num_views=self.num_views,
-                max_prompt_len=prompt_len,
-                chunk_size=self.chunk_size,
-                num_steps=self._num_steps,
-                vision_pool_factor=self._vision_pool_factor,
-                vision_num_layers=self._vision_num_layers,
-                **self._pipeline_precision_kwargs())
-            # Static INT8 vision scales are per-pipeline-instance.
-            # Reset so calibrate_single_frame collects fresh scales.
-            if self.pipeline.use_int8_vision_static:
-                self.pipeline.vis_int8_static_calibrated = False
-                self.pipeline.vis_int8_static_scales = {}
-            # Restore the multi-frame FP8 scales (if we have them) so the
-            # rebuilt pipeline uses the same calibration as the initial
-            # 80-sample pass. Without this, the predict-time
-            # _calibrate_single_frame fallback overwrites them with
-            # single-frame scales that don't cover diffusion-noise variance
-            # — cos drops from ~0.96 to ~0.6 (see Phase 4 parity).
-            self._restore_fp8_scales()
 
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
@@ -1235,12 +1375,20 @@ class Pi05TorchFrontendRtx:
         self._frame_count = 0
         self._current_prompt = prompt_text
         # Per-frame Pi0.5 state-in-prompt calls would flood the log at
-        # 25-30 Hz. Demote the per-call line to DEBUG and emit a single
-        # INFO on rebuild + first-fill.
-        if will_rebuild:
+        # 25-30 Hz. Three-tier log:
+        #   - was_built (cache miss + new build): INFO with build note
+        #   - pipeline_changed but cache hit (pointer-swap): DEBUG
+        #   - same-pipeline (re-upload embeds only): DEBUG
+        if was_built:
             logger.info(
-                "Set prompt: '%s' (%d tokens%s)", prompt_text, prompt_len,
-                ", state-in-prompt" if is_state_in_prompt else "")
+                "Set prompt: '%s' (%d tokens%s, NEW pipeline cached, "
+                "cache size=%d)", prompt_text, prompt_len,
+                ", state-in-prompt" if is_state_in_prompt else "",
+                len(self._pipeline_cache))
+        elif pipeline_changed:
+            logger.debug(
+                "Set prompt: '%s' (%d tokens, pipeline cache hit)",
+                prompt_text, prompt_len)
         else:
             logger.debug("Set prompt: '%s' (%d tokens, in-place)",
                          prompt_text, prompt_len)

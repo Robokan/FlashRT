@@ -286,7 +286,13 @@ MODE_FACTORIES = {
 
 HELP = """
 Commands:
-  <any prompt>     send a new natural-language prompt to the policy
+  <any prompt>     send a new natural-language prompt to the policy.
+                   If the env is currently in its done/goal state, this
+                   also auto-resets the env to the initial state, so
+                   the new prompt actually gets a chance to steer the
+                   policy (pi05_libero outputs near-zero actions for
+                   any prompt when it sees a "task complete" scene --
+                   that case is far OOD from training).
   1 / 2 / 3 / 4    switch chunk execution mode (see header for descriptions)
   r                reset env to the current task's initial state
   t <n>            change task within the current suite (0-indexed)
@@ -483,7 +489,28 @@ def main() -> int:
                     else:
                         current_prompt = cmd
                         mode.set_prompt(current_prompt)
-                        if current_prompt == task.language:
+                        # If the env is currently in its done/goal state
+                        # (task object already in its target zone, robot
+                        # in a "task complete" pose), the policy will
+                        # mostly produce near-zero actions for ANY new
+                        # prompt -- pi05_libero never saw "completed
+                        # scene + new task" during training, so the
+                        # scene prior says "nothing to do, hold gripper".
+                        # Auto-reset to give the new prompt a fair chance.
+                        if prev_done:
+                            env.reset()
+                            env.set_init_state(init_states[0])
+                            for _ in range(10):
+                                obs, _, _, _ = env.step(DUMMY_ACTION)
+                            mode.reset()
+                            mode.set_prompt(current_prompt)
+                            step_counter = 0
+                            prev_done = False
+                            print(f"[prompt+reset] {current_prompt!r}  "
+                                  f"(env was done; auto-reset to initial state "
+                                  f"so the new prompt actually gets a chance to "
+                                  f"steer the policy)")
+                        elif current_prompt == task.language:
                             print(f"[prompt] {current_prompt!r}  "
                                   f"(matches env's task)")
                         else:

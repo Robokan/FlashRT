@@ -1072,13 +1072,29 @@ class Pi0Pipeline:
         return self.bufs["encoder_x"]
 
     def set_language_embeds(self, lang_embeds_np):
+        # See flash_rt/models/pi05/pipeline_rtx.py::set_language_embeds
+        # for the long-form note: the lang-embeds buffer must keep a
+        # stable device pointer across calls because the captured
+        # forward() CUDA graph baked it into a memcpyAsync node at
+        # capture time. Reallocating each call silently broke prompt
+        # conditioning for any new prompt that tokenised to the same
+        # length as the first (the graph kept reading from the original
+        # — now stale or freed — allocation).
         prompt_len = lang_embeds_np.shape[0]
-        assert prompt_len <= self.max_prompt_len, (
-            f"prompt_len {prompt_len} > max_prompt_len {self.max_prompt_len}")
+        assert prompt_len == self.max_prompt_len, (
+            f"prompt_len {prompt_len} != pipeline max_prompt_len "
+            f"{self.max_prompt_len}; prompt-length changes require a new "
+            "Pi0Pipeline (see Pi0TorchFrontendRtx.set_prompt)")
         assert lang_embeds_np.shape[1] == ENC_D
 
         arr = np.ascontiguousarray(lang_embeds_np)
-        self._lang_embeds_buf = CudaBuffer.from_numpy(arr)
+        if not hasattr(self, "_lang_embeds_buf"):
+            # FP16 here is a 2-byte sizing placeholder (bf16/fp16 share
+            # itemsize); the actual content is whatever the upstream
+            # embedder produced (bf16 for pi0/pi05).
+            self._lang_embeds_buf = CudaBuffer.device_empty(
+                self.max_prompt_len * ENC_D, FP16)
+        self._lang_embeds_buf.upload(arr)
         self._current_prompt_len = prompt_len
 
         self._set_decoder_rope_for_prompt(prompt_len)

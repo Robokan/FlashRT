@@ -1874,15 +1874,40 @@ class Pi05Pipeline:
 
         ``lang_embeds_np`` is a numpy array of shape ``(prompt_len, ENC_D)``
         with 2-byte (bf16) elements.
+
+        The language-embeds device buffer is allocated ONCE (lazily, at
+        the first call) sized to ``max_prompt_len * ENC_D * 2 B`` and
+        subsequent prompts are uploaded INTO that buffer rather than
+        replacing it. The buffer's device pointer must stay stable
+        across :meth:`set_language_embeds` calls because
+        :meth:`_copy_lang_embeds_to_encoder_x` runs inside the captured
+        :meth:`forward` CUDA graph: that graph baked a specific
+        ``self._lang_embeds_buf.ptr`` value into its ``cudaMemcpyAsync``
+        node at capture time, and replays read from that exact address.
+        If we re-allocated ``_lang_embeds_buf`` each call (the original
+        behaviour with ``CudaBuffer.from_numpy``), every new prompt that
+        tokenised to the same length as the first one — which is most
+        of them within a single benchmark suite — would silently keep
+        executing the first prompt, because the graph kept memcpying
+        from the stale / freed original allocation.
+
+        Prompt-length changes still trigger a full pipeline rebuild
+        upstream in ``Pi05TorchFrontendRtx.set_prompt``, so a single
+        Pi05Pipeline instance only ever sees one ``prompt_len`` (always
+        equal to ``self.max_prompt_len``).
         """
         prompt_len = lang_embeds_np.shape[0]
-        assert prompt_len <= self.max_prompt_len, \
-            f"prompt_len {prompt_len} exceeds max_prompt_len {self.max_prompt_len}"
+        assert prompt_len == self.max_prompt_len, (
+            f"prompt_len {prompt_len} != pipeline max_prompt_len "
+            f"{self.max_prompt_len}; prompt-length changes require a new "
+            "Pi05Pipeline (see Pi05TorchFrontendRtx.set_prompt)")
         assert lang_embeds_np.shape[1] == ENC_D
 
-        # Store a persistent device copy of the (prompt_len, ENC_D) embeds.
         arr = np.ascontiguousarray(lang_embeds_np)
-        self._lang_embeds_buf = CudaBuffer.from_numpy(arr)
+        if not hasattr(self, "_lang_embeds_buf"):
+            self._lang_embeds_buf = CudaBuffer.device_empty(
+                self.max_prompt_len * ENC_D, BF16)
+        self._lang_embeds_buf.upload(arr)
         self._current_prompt_len = prompt_len
 
         # Update decoder RoPE slice for this prompt length

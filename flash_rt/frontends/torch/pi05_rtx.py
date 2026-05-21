@@ -1359,15 +1359,36 @@ class Pi05TorchFrontendRtx:
         if pipeline_changed:
             self.pipeline = new_pipeline
             self.current_prompt_len = prompt_len
-            # Flags reflect the ACTIVE pipeline. Freshly-built buckets need
-            # a graph-record on first predict(); cached-hit swaps that
-            # already captured a graph carry calibrated=True / graph_recorded=True
-            # in the pipeline itself, but the frontend's own flags are
-            # invalidated here so the api.predict fallback rebuild path can
-            # decide based on pipeline state (pipeline.fp8_calibrated +
-            # whether record_infer_graph has run for this instance).
-            self.graph_recorded = False
-            self.calibrated = False
+            # The "is calibrated + graph captured" state lives on the
+            # pipeline itself. Read it back to set the frontend's flags
+            # correctly:
+            #   - Cache MISS (was_built=True): the new pipeline has FP8
+            #     scales (restored by _build) but no captured graph yet.
+            #     Reset frontend flags so api.predict's fallback fires
+            #     calibrate_with_real_data once, which short-circuits
+            #     calibrate_fp8 (pipeline.fp8_calibrated=True) and
+            #     proceeds straight to record_infer_graph + warmup.
+            #   - Cache HIT (was_built=False) with graph NOT YET captured:
+            #     same as miss — graph capture is still needed. This
+            #     covers the corner case where pipeline_A was built and
+            #     cached but never had predict() called before the
+            #     caller swapped to pipeline_B and back.
+            #   - Cache HIT with graph already captured: leave flags
+            #     untouched so api.predict skips its calibrate re-fire.
+            #     This is the steady-state case after each bucket has
+            #     been used once — the swap is a pure pointer move and
+            #     the next infer() is straight graph replay (~165 ms
+            #     vs ~600 ms if calibrate re-fired).
+            pipeline_has_graph = (
+                getattr(new_pipeline, "_graph", None) is not None)
+            if was_built or not pipeline_has_graph:
+                self.graph_recorded = False
+                self.calibrated = False
+            else:
+                logger.debug(
+                    "Pipeline cache HIT for prompt_len=%d (pre-built + "
+                    "pre-calibrated + graph captured \u2014 next infer() is "
+                    "pure graph replay)", prompt_len)
 
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()

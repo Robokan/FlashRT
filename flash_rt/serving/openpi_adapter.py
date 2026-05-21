@@ -97,6 +97,7 @@ _WRIST_IMAGE_RIGHT_CANDIDATES = (
     "right_wrist",
 )
 _PROMPT_CANDIDATES = ("prompt", "task", "language")
+_STATE_CANDIDATES = ("observation/state", "state", "proprio", "robot_state")
 
 
 def _normalize_image(img: Any, target_hw: int = 224) -> np.ndarray:
@@ -148,6 +149,48 @@ def _extract_first(obs: dict, candidates: tuple[str, ...]) -> Any | None:
     return None
 
 
+def _parse_delta_action_mask(spec: Any) -> np.ndarray | None:
+    """Parse an openpi-style delta-action mask specification.
+
+    Accepted forms:
+      - None or empty -> None (no delta-state output transform; default)
+      - List/tuple of ints in the openpi convention used by
+        `_transforms.make_bool_mask`: positive N = N True, negative N
+        = -N False. Examples:
+          OpenArm v4 16-DOF: [7, -1, 7, -1] -> 16-bool mask, True for
+                             the 7 arm joints of each arm, False for
+                             each arm's gripper (already absolute).
+          DROID:             [7, -1]         -> 8-bool, True for 7 arm
+                                                joints, False for the
+                                                gripper.
+      - CSV string of the same ints: "7,-1,7,-1" (CLI-friendly)
+      - Boolean iterable: passes through as-is.
+
+    Returns a numpy bool array, or None.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        spec = spec.strip()
+        if not spec:
+            return None
+        parts = [int(p) for p in spec.split(",") if p.strip()]
+    elif isinstance(spec, np.ndarray):
+        return spec.astype(bool)
+    else:
+        parts = list(spec)
+    if all(isinstance(p, (bool, np.bool_)) for p in parts):
+        return np.asarray(parts, dtype=bool)
+    bools: list[bool] = []
+    for dim in parts:
+        dim_i = int(dim)
+        if dim_i > 0:
+            bools.extend([True] * dim_i)
+        else:
+            bools.extend([False] * (-dim_i))
+    return np.asarray(bools, dtype=bool) if bools else None
+
+
 class FlashRTPolicyAdapter(_base_policy.BasePolicy):
     """Wrap a FlashRT VLAModel as an openpi BasePolicy.
 
@@ -171,11 +214,31 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
         default_prompt: str | None = None,
         chunk_size: int = 10,
         metadata: dict[str, Any] | None = None,
+        delta_action_mask: Any = None,
     ) -> None:
         self._model = model
         self._default_prompt = default_prompt
         self._chunk_size = chunk_size
         self._metadata = metadata or {}
+        # See _parse_delta_action_mask for the accepted formats. When
+        # set, infer() reads 'state' from each observation and applies
+        # AbsoluteActions(state, mask) on the model output so it
+        # matches the openpi server's delta-state -> joint-radian
+        # output transform. This is required for any robot whose
+        # training config wraps DeltaActions/AbsoluteActions around
+        # its action stream (OpenArm v4 = [7, -1, 7, -1], DROID =
+        # [7, -1], etc.). Leave None for robots where the model
+        # already outputs absolute actions (LIBERO, base pi05).
+        self._delta_action_mask = _parse_delta_action_mask(delta_action_mask)
+        if self._delta_action_mask is not None:
+            logger.info(
+                "FlashRTPolicyAdapter: delta_action_mask enabled "
+                "(len=%d, n_delta=%d, n_abs=%d). Per-step deltas will "
+                "be added to obs['state'] on the delta channels.",
+                len(self._delta_action_mask),
+                int(self._delta_action_mask.sum()),
+                int((~self._delta_action_mask).sum()),
+            )
         if hasattr(model, "_pipe") and not getattr(model._pipe, "calibrated", False):
             logger.warning(
                 "FlashRTPolicyAdapter: model is not calibrated; first infer "
@@ -224,6 +287,26 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
 
         actions = self._model.predict(images=images, prompt=str(prompt))
         actions_np = np.asarray(actions)
+
+        if self._delta_action_mask is not None:
+            state_raw = _extract_first(obs, _STATE_CANDIDATES)
+            if state_raw is None:
+                raise KeyError(
+                    "FlashRTPolicyAdapter: delta_action_mask is set but no "
+                    "'state' / 'observation/state' found in obs. Tried "
+                    f"{_STATE_CANDIDATES}. Observed keys: "
+                    f"{list(obs.keys())[:20]}"
+                )
+            state_np = np.asarray(state_raw, dtype=actions_np.dtype).reshape(-1)
+            mask = self._delta_action_mask
+            dims = min(mask.shape[0], state_np.shape[0], actions_np.shape[-1])
+            if dims > 0:
+                offset = np.where(mask[:dims], state_np[:dims], 0.0).astype(
+                    actions_np.dtype, copy=False
+                )
+                actions_np = actions_np.copy()
+                actions_np[..., :dims] += offset[None, :]
+
         elapsed = time.monotonic() - t0
 
         # RTC pass-through: the client (AsyncActionChunkBroker) reads

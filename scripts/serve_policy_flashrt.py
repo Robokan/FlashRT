@@ -59,6 +59,12 @@ def main() -> int:
                         help="CUDA Graph autotune intensity (0=off, 3=default, 5=thorough)")
     parser.add_argument("--default-prompt", default=None,
                         help="Prompt fallback when the client sends no 'prompt' field")
+    parser.add_argument("--delta-action-mask", default=None,
+                        help="openpi-style mask for delta-state action channels "
+                             "(CSV of ints, positive N=N True, negative N=-N False). "
+                             "Required for OpenArm v4: '7,-1,7,-1'. "
+                             "Required for DROID: '7,-1'. "
+                             "Leave unset for LIBERO/base pi05 (already absolute).")
     parser.add_argument("--calib-data", default=None,
                         help="Optional path to an npz of stratified observations "
                              "(see scripts/spark_phase3_prepare_calib.py). "
@@ -169,6 +175,7 @@ def main() -> int:
         default_prompt=args.default_prompt,
         chunk_size=model._pipe.chunk_size,
         metadata=metadata,
+        delta_action_mask=args.delta_action_mask,
     )
 
     # 5. Serve.

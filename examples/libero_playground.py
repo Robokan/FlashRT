@@ -194,7 +194,8 @@ class TruncateReplanMode:
 
     def set_prompt(self, prompt: str) -> None:
         self._prompt = prompt
-        self._queue.clear()  # invalidate old plan
+        self._queue.clear()
+        print(f"[set_prompt:sync] {prompt!r}", flush=True)
 
     def reset(self) -> None:
         self._queue.clear()
@@ -204,6 +205,7 @@ class TruncateReplanMode:
     def next_action(self, obs: dict) -> np.ndarray:
         if not self._queue:
             agent, wrist = _policy_inputs_from_obs(obs)
+            print(f"[infer:sync] prompt={self._prompt!r}", flush=True)
             t0 = time.perf_counter()
             actions = self._model.predict(images=[agent, wrist], prompt=self._prompt)
             self._last_latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -233,8 +235,10 @@ class AsyncBlendMode:
 
         def _infer(observation: dict) -> np.ndarray:
             agent, wrist = _policy_inputs_from_obs(observation)
+            p = self._prompt
+            print(f"[infer:async] prompt={p!r}", flush=True)
             return np.asarray(
-                model.predict(images=[agent, wrist], prompt=self._prompt),
+                model.predict(images=[agent, wrist], prompt=p),
                 dtype=np.float64,
             )
 
@@ -250,10 +254,11 @@ class AsyncBlendMode:
 
     def set_prompt(self, prompt: str) -> None:
         self._prompt = prompt
+        print(f"[set_prompt:async] {prompt!r}", flush=True)
         # AsyncChunkRunner has no in-flight invalidation hook; let the
         # current chunk drain. The next chunk will be generated against
-        # the new prompt automatically. (For a hard cut, call reset()
-        # after this; see the "p" command handler.)
+        # the new prompt automatically. (For a hard cut, type the prompt
+        # and then 'r' to reset both env and runner.)
 
     def reset(self) -> None:
         # AsyncChunkRunner.reset takes an observation. We do it lazily
@@ -390,6 +395,7 @@ def main() -> int:
 
     # ── main loop ─────────────────────────────────────────────────────
     step_counter = 0
+    prev_done = False
     last_stats_print = time.perf_counter()
     try:
         while viewer.is_running():
@@ -417,6 +423,7 @@ def main() -> int:
                         mode.reset()
                         mode.set_prompt(current_prompt)
                         step_counter = 0
+                        prev_done = False
                         print(f"[reset] task={args.task} initial_state[0]; prompt={current_prompt!r}")
                     elif cmd.startswith("t "):
                         try:
@@ -450,6 +457,7 @@ def main() -> int:
                         mode.reset()
                         mode.set_prompt(current_prompt)
                         step_counter = 0
+                        prev_done = False
                         print(f"[task] {new_tid}: {task.language!r}")
                     elif cmd in MODE_FACTORIES:
                         new_name, new_factory = MODE_FACTORIES[cmd]
@@ -471,14 +479,19 @@ def main() -> int:
             viewer.sync()
             step_counter += 1
 
-            if done:
-                print(f"[goal!] step={step_counter} reward={reward:.2f}  "
-                      f"(env will keep running; press 'r' to reset)")
+            # Print goal-reached ONCE per success (on False->True transition)
+            # to avoid spamming the terminal at 20 lines/sec, which makes it
+            # impossible to type the next prompt or command.
+            if done and not prev_done:
+                print(f"[goal reached!] step={step_counter} reward={reward:.2f}  "
+                      f"(env keeps running; type a new prompt, 't N' for another "
+                      f"task, or 'r' to retry)")
+            prev_done = bool(done)
 
-            # Periodic stats line every 5s
+            # Periodic stats every 10s
             now = time.perf_counter()
-            if now - last_stats_print > 5.0:
-                print(f"[periodic] step={step_counter} {mode.stats()}")
+            if now - last_stats_print > 10.0:
+                print(f"[stats] step={step_counter} done={bool(done)} {mode.stats()}")
                 last_stats_print = now
 
             # Throttle to target_hz

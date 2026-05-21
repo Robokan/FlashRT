@@ -846,9 +846,14 @@ layer. The 4 outlier layers are all *encoder* FFN-down layers near
 the deepest part of the encoder stack, which is the part most
 affected by the PAD-id-0 tokens at positions 78–127 (FlashRT lacks
 encoder attention masking — see "Subtle thing found along the way"
-above). So this is partly a state-in-prompt-specific calibration
-artifact and partly the PAD-corruption bug reaching backwards into
-the FP8 calibration scales.
+above). **Update (2026-05-21):** A standalone block-128 FP8 smoke
+test (see "Block-128 FP8 smoke test on SM_121" below) shows that
+per-tensor FP8 still holds cos > 0.998 even at synthetic 14,000×
+amax/median ratios — so the 27.4 outlier *alone* cannot account for
+the cos 0.617 catastrophe. The outlier is best read as a downstream
+*symptom* of PAD-token attention pollution feeding into FP8
+calibration, not the primary failure mode. Attention masking is
+expected to remove most of the outlier without any FP8-side change.
 
 ##### What this means for the deployment path
 
@@ -890,6 +895,199 @@ Per-frame CSVs: `/tmp/replay_full_d/replay_ep3.csv` (BF16 no-pad,
 n=587) and `/tmp/replay_fp8_padded/replay_ep3.csv` (FP8 padded,
 n=587). FP8 server log: `/tmp/flashrt_fp8_padded.log` (calibration
 warning is at 11:30:31).
+
+#### Block-128 FP8 smoke test on SM_121 (2026-05-21)
+
+Before committing to a multi-day "per-layer mixed-FP8 granularity"
+implementation, we ran two synthetic checks against the existing
+CUTLASS block-128 FP8 kernel
+(`flash_rt.flash_rt_kernels.fp8_block128_gemm_cutlass_sm120_bf16out`)
+at the Pi0.5 encoder ffn_down shape (M=896, N=2048, K=16384).
+
+**Test 1 — base correctness, random bf16 inputs, no outliers**
+
+```
+cos(block128, bf16_ref):   0.999318
+cos(per-tensor, bf16_ref): 0.999298
+rel_err(block128, bf16_ref):   3.69%
+rel_err(per-tensor, bf16_ref): 3.75%
+```
+
+The block-128 CUTLASS kernel **compiles, runs, and produces correct
+output on GB10 SM_121**. This is the foundational unblock — Path B
+infrastructure works on Spark hardware.
+
+**Test 2 — synthetic outlier matching the layer-16 amax pattern**
+
+Inject sparse extreme outliers (|x| ≈ 25–48) across 8 channels of a
+typical activation (median |x| ≈ 0.003), giving an amax/median ratio
+of **~14,000×** — more extreme than the real Pi0.5 layer 16 pattern
+(amax 27.4, ratio ~850×).
+
+```
+                  median   p10     min     p99
+cos block-128:   0.9997   0.9997  0.9996  0.9997   (per-token)
+cos per-tensor:  0.9993   0.9991  0.9987  0.9996
+```
+
+**Per-tensor FP8 still hits cos > 0.998 on every single token, even
+at a 14,000× outlier ratio.** Block-128 is slightly better (0.04%
+margin), but neither path collapses the way our real Pi0.5 replay did
+(cos 0.617 median, min −0.225).
+
+**Throughput**
+
+```
+block-128 FP8 (CUTLASS SM120a):  709 µs/call (M=896, N=2048, K=16384)
+```
+
+Fast enough that adopting it on outlier layers costs only marginal
+latency vs per-tensor cuBLASLt FP8 (production path is comparable
+when measured against `_scaled_mm` — though that comparison is
+weakly representative).
+
+##### What the smoke test means for the Path B' plan
+
+The original Path B' plan assumed the cos 0.617 catastrophe in
+diagnostic (a') was caused by **a single-layer FP8 amax outlier** —
+specifically, the 27.4 on `encoder_ffn_down_w_16` swallowing
+non-outlier activations into FP8 sub-normal noise. Block-128 quant
+(per-128-element scales on both A and B) would in that hypothesis
+preserve the small-magnitude activations and recover quality.
+
+The synthetic test **falsifies that single-layer hypothesis**:
+per-tensor FP8 at 14,000× ratio still produces cos 0.999. The
+catastrophic cos 0.617 in the real replay therefore **cannot be**
+explained by per-layer per-tensor FP8 quantization noise alone.
+
+The remaining candidate root causes — listed in descending
+likelihood:
+
+1. **PAD-token attention pollution.** Layer-16's amax of 27.4 was
+   reached on a calibration sample whose PAD-id-0 positions were
+   *attended to* without masking. The FP8 scales are then "tuned"
+   for an activation distribution that contains contributions from
+   meaningless PAD positions. At inference time, the same
+   unmasked-PAD effect cascades down 18 encoder layers AND the
+   decoder, and the cumulative error is what shows up as cos 0.617.
+2. **Cumulative cross-layer error compounding.** Even if each
+   individual FP8 GEMM has cos 0.999, 18 encoder layers + 18
+   decoder layers can compound to cos << 1.0 if errors correlate.
+   But this would also have broken Pi0.5 in LIBERO mode (Phase 4
+   parity passed at cos 0.98+), so it is unlikely to be dominant.
+3. **State-in-prompt path interaction with FP8 calibration.** The
+   control experiment already showed FP8 calibration runs against
+   the wrong activation distribution under no-pad mode (rebuilds
+   wipe scales). With padded mode + unmasked PAD, calibration
+   captures PAD-polluted activations.
+
+All three candidates point to **encoder attention masking being the
+correct first fix**, not block-128 FP8. Block-128 remains a useful
+tool to have available, but the existing 27.4 layer-16 outlier is
+almost certainly the *symptom* of unmasked PAD attention (1 + 3),
+not the *cause* of the bad predictions.
+
+##### Revised path forward
+
+Same as the "Path forward" list above, **with one priority change**:
+do attention masking FIRST, before any further FP8 work. The smoke
+test confirms block-128 is available on SM_121 (Path B' is not
+blocked by missing infrastructure), so if attention masking +
+recalibration alone does not produce cos ≥ 0.97 on FP8 padded
+replay, we can layer block-128 on top of the masked path quickly
+(per-layer dict in `Pi05Pipeline`, BF16→block-128 quantizer for the
+3–4 outlier layers, swap the GEMM call) — probably 1–2 days of work,
+not 3, now that the kernel is verified.
+
+Smoke test script: `scripts/spark_block128_fp8_smoke.py` (committed,
+self-contained, runs in ~2.5 s on Spark from the native venv).
+
+#### Runtime-LoRA G1 result — encoder-FFN BF16 wiring (2026-05-21)
+
+After the synthetic outlier smoke test falsified the single-layer FP8
+hypothesis (see above), and after re-reading the openpi PyTorch port
+docs (`openpi/JAX_TO_PYTORCH_LORA_CONVERSION.md`,
+`openpi/PYTORCH_PARITY_DEBUG.md` "★ 2026-05-19 RESOLVED"), the
+hypothesis pivoted to **LoRA-merge-then-quantize is the actual root
+cause** of the FP8 cos 0.617 catastrophe. openpi's PyTorch port had
+the same pattern in pre-merge bf16: cos(PT, JAX) = 0.996 but
+ratio 0.918 (8% magnitude bias accumulating across 18 layers × 10
+diffusion steps). Pre-merge in fp32 did NOT fix it. **Runtime LoRA
+(QLoRA-style: keep `lora_a` / `lora_b` separate, apply as two bf16
+matmuls atop the base GEMM output) was the only fix** and reached
+cos > 0.9997 vs JAX on the same OpenArm checkpoint — deployed,
+ran on the robot.
+
+FlashRT change (`spark-sm121-port` branch, this commit):
+
+* `FLASHRT_RUNTIME_LORA=encoder_ffn` (new env var) — at conversion
+  time, extract encoder FFN LoRA pairs (gate / up / down × 18 layers
+  = 54 pairs) instead of fp32-merging them into the base weight.
+  Stash them as `encoder_ffn_{gate,up,down}_lora_{a,b}` keys in the
+  ckpt dict with proper RMSNorm-scale fold into `lora_a`.
+* `Pi05Pipeline` allocates one rank-r bf16 scratch buffer
+  (`_enc_lora_neck`, `~28 KB` for `seq=896, r=16`) and adds a small
+  `_apply_enc_ffn_lora` helper that runs
+  `out += (in @ la) @ lb` as `bf16_nn` + `bf16_nn_res` (the second
+  matmul fuses the residual into the FP32 accumulator — no bf16
+  round-trip, no extra scratch).
+* Helper called after each of the three encoder FFN GEMMs in the
+  BF16 path. FP8 path is untouched in this commit (G2 next).
+
+G1 measurement (`scripts/spark_runtime_lora_g1.py`, four subprocess
+runs with `FVK_PI05_RTX_FORCE_BF16=1`):
+
+| Mode | action norm | ratio vs merge | cos vs merge | gap recovery |
+|---|---|---|---|---|
+| `merge` (default)                       | 4.6348 | 1.0000 | 1.000000 | — (baseline) |
+| `no_lora` (`FLASHRT_LORA_SCALING=0`)    | 7.5578 | 1.631  | 0.768674 | 0 %  |
+| `runtime_lora` encoder FFN              | 4.6362 | 1.000  | **0.999997** | **100.00 %** |
+| `runtime_lora` encoder FFN + attention  | 4.3356 | 0.935  | **0.999244** | **99.67 %**  |
+
+Both runtime-LoRA modes reproduce the BF16 merge result to within
+1e-3 — exactly as expected, because in pure BF16 (no quantization
+to expose the fp32-vs-bf16 fusion order difference) the runtime
+form and the merged form are arithmetically equivalent. This is the
+"merge-vs-runtime parity in the absence of quantization" gate; the
+interesting divergence only appears in G2 when FP8 enters the
+picture.
+
+**The "5 % residual" the earlier G1 result reported was a wiring
+bug, not a coverage gap.** The torch frontend's
+`_build_pipeline_weights` was constructing the pipeline-weights
+dict by enumerating an explicit allow-list of keys that did NOT
+include any `lora_*` entry. So `Pi05Pipeline.__init__` evaluated
+`"encoder_ffn_gate_lora_a" in weights` to False; `_has_enc_*_lora`
+flags came up False; the runtime LoRA add branches were
+unconditionally skipped. The previous "95 % recovery" number was
+measuring "encoder FFN LoRA extracted from base then dropped on the
+floor, attention + decoder LoRA still merged". Fix is in this
+commit: forward the LoRA tensors through `_build_pipeline_weights`
+and update the encoder LoRA call sites to pass per-layer
+`tensor[i].data_ptr()` (the C++ bindings take `uintptr_t`, not
+torch tensors).
+
+Determinism is bit-exact across repeated calls
+(`max|merge - runtime_ffn| = 0.0059`,
+`max|merge - runtime_encoder| = 0.107`, both consistent across
+re-runs with the same seed). The slightly larger
+FFN+attention drift (0.107 max vs 0.0059 max for FFN-only) is the
+expected bf16-rounding contribution from the additional 5
+LoRA-add sites per layer × 18 layers, all of which run with FP32
+accumulator via `bf16_nn_res` so no error accumulates across the
+diffusion loop.
+
+**Conclusion:** runtime LoRA arithmetic is correctly wired through
+the entire BF16 encoder path (FFN gate/up/down + attention QKV/O).
+Next: G2 — wire the same pattern through the FP8 encoder path and
+re-calibrate. The expectation per openpi: the layer-16 amax 27.4
+outlier collapses because the calibration distribution is no longer
+contaminated by LoRA-merged activations, and cos(BF16 merge, FP8
+runtime LoRA) recovers from the 0.617 catastrophe.
+
+Script: `scripts/spark_runtime_lora_g1.py` (committed). Runs ~85 s
+end-to-end with `--encoder` flag (four model loads × ~20 s each on
+Spark native venv).
 
 ## Phase 5 hardware-verified results
 

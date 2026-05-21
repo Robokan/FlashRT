@@ -142,6 +142,204 @@ def _resolve_lora_pair(
     return None
 
 
+def _build_padded_attn_lora_a(
+    la_q: np.ndarray,         # (NH, D, r_q)
+    la_k: np.ndarray,         # (D, r_kv)
+    la_v: np.ndarray,         # (D, r_kv)
+    fuse_attn: np.ndarray,    # (D,)
+) -> np.ndarray:
+    """Stack Q/K/V LoRA ``lora_a`` matrices into one (D, NH*r_q + 2*r_kv) tensor.
+
+    The runtime path computes ``neck = x @ la_full`` (single ``bf16_nn``),
+    giving ``(seq, NH*r_q + 2*r_kv)`` where each contiguous rank-r block
+    corresponds to one Q head (NH blocks) or to K / V (one block each).
+    The matching ``_build_padded_attn_lora_b`` lays out the per-block
+    output projections so a single ``bf16_nn_res`` accumulates the right
+    LoRA delta into the fused QKV output slice in one pass.
+
+    ``fuse_attn`` (= ``1 + pre_attention_norm.scale``) is folded into the
+    input axis of every la-block, mirroring the same fold the base QKV
+    weight already received in ``convert_pi05_orbax``.
+    """
+    NH, D, r_q = la_q.shape
+    D_k, r_kv = la_k.shape
+    assert D_k == D, f"K la in_dim {D_k} != Q la in_dim {D}"
+    assert la_v.shape == (D, r_kv), f"V la shape {la_v.shape} != ({D}, {r_kv})"
+    # Q: (NH, D, r_q) → flatten heads on the column axis → (D, NH*r_q)
+    la_q_flat = la_q.transpose(1, 0, 2).reshape(D, NH * r_q)
+    # Concatenate K and V columns. KV LoRA already has D as the second axis.
+    la_full = np.concatenate([la_q_flat, la_k, la_v], axis=1).astype(np.float32)
+    # Fold the RMSNorm scale into the input axis. The base QKV weights
+    # had the same fold; matching it on la keeps the runtime forward
+    # mathematically equivalent to JAX's "(x * fuse_attn) @ la".
+    la_full = la_full * fuse_attn[:, None]
+    return la_full
+
+
+def _interleave_lora_b_hd_axis(lb: np.ndarray) -> np.ndarray:
+    """Apply the RoPE-friendly HD-axis interleave to a LoRA ``lb`` matrix.
+
+    ``_interleave_qk_np`` operates on the FIRST axis (``out_dim``) of a
+    ``(out_dim, in_dim)`` weight, swapping the first / second halves of
+    each head_dim block. For LoRA ``lb`` we have shape ``(r, HD)`` and
+    need to apply the SAME swap pattern to the LAST axis (HD). We
+    transpose so HD becomes the first axis, reuse the existing helper
+    with ``num_heads=1``, and transpose back. This produces a per-row
+    permutation of HD identical to what the base Q / K weight already
+    received in ``convert_pi05_orbax``.
+    """
+    r, HD = lb.shape
+    # _interleave_qk_np expects (out_dim, in_dim). Pass (HD, r) so HD is
+    # the "out" axis it operates on. num_heads=1 keeps the whole HD
+    # within one head; head_dim = HD then splits into (2, HD//2).
+    return _interleave_qk_np(lb.T, num_heads=1).T
+
+
+def _build_padded_attn_lora_b(
+    lb_q: np.ndarray,          # (NH, r_q, HD)
+    lb_k: np.ndarray,          # (r_kv, HD)
+    lb_v: np.ndarray,          # (r_kv, HD)
+) -> np.ndarray:
+    """Build the block-diagonal LoRA ``lora_b`` for fused QKV addition.
+
+    Output shape: ``(NH * r_q + 2 * r_kv, NH * HD + 2 * NKV * HD)``.
+
+    The QKV output buffer of the base GEMM is laid out as
+    ``[Q_head_0 | Q_head_1 | ... | Q_head_{NH-1} | K | V]`` along the
+    column axis, each block of width HD (or NKV*HD = HD for NKV=1).
+    The neck buffer (output of ``_build_padded_attn_lora_a``) is laid
+    out as ``[Q_head_0_neck | ... | Q_head_{NH-1}_neck | K_neck | V_neck]``,
+    each block of width r_q (for Q) or r_kv (for K/V). We place each
+    block's ``lb`` at the diagonal cell ``(rows_for_neck, cols_for_out)``
+    so a single ``bf16_nn_res`` does the strided accumulation in one
+    pass without needing a custom kernel.
+
+    For Q and K, ``lb``'s HD axis is interleaved (RoPE swap pattern)
+    so the runtime delta matches the base GEMM's output ordering.
+    V has no interleave (V skips RoPE).
+    """
+    NH, r_q, HD = lb_q.shape
+    r_kv, HD_k = lb_k.shape
+    assert HD_k == HD, f"K lb HD {HD_k} != Q lb HD {HD}"
+    assert lb_v.shape == (r_kv, HD), f"V lb shape {lb_v.shape} != ({r_kv}, {HD})"
+    NKV = 1  # Pi0.5 GQA — see pipeline_rtx.ENC_NKV / DEC_NKV.
+    total_in = NH * r_q + 2 * r_kv
+    total_out = NH * HD + 2 * NKV * HD
+    lb_full = np.zeros((total_in, total_out), dtype=np.float32)
+    # Q: one block per head along the diagonal. Interleave HD per head.
+    for h in range(NH):
+        lb_h_int = _interleave_lora_b_hd_axis(lb_q[h])  # (r_q, HD)
+        lb_full[h * r_q : (h + 1) * r_q,
+                h * HD  : (h + 1) * HD] = lb_h_int
+    # K: one block after all Q blocks, in the K columns. Interleave HD.
+    lb_k_int = _interleave_lora_b_hd_axis(lb_k)
+    lb_full[NH * r_q : NH * r_q + r_kv,
+            NH * HD : NH * HD + NKV * HD] = lb_k_int
+    # V: one block after K, in the V columns. NO interleave (V skips RoPE).
+    lb_full[NH * r_q + r_kv : NH * r_q + 2 * r_kv,
+            NH * HD + NKV * HD :] = lb_v
+    return lb_full
+
+
+def _build_o_lora(
+    la_o: np.ndarray,    # (NH, HD, r)
+    lb_o: np.ndarray,    # (NH, r, D)
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flatten + N-sum the attention output LoRA matrices.
+
+    JAX's ``attn_vec_einsum`` LoRA computes
+    ``lora_int = einsum("BTNH,NHL->BTL", x, la)`` (sums over N and H)
+    and ``lora_out = einsum("BTL,NLD->BTD", lora_int, lb)`` (sums over N
+    and L). The N axis in lb is a free axis (not in the output, not
+    contracted with ``lora_int``), so it can be pre-summed once in fp32
+    at conversion time. Per openpi (``lora_runtime.py::_patch_o_proj_forward``):
+
+      la_full = la_o.reshape(NH*HD, r)  # match the (B, T, NH*HD) base input
+      lb_summed = lb_o.sum(axis=0)       # (r, D), pre-summed in fp32
+
+    Runtime then does a standard two-matmul pattern: ``out += x @ la_full @ lb_summed``.
+    No norm fold here (O sits between FMHA and the residual_add, no norm).
+    """
+    NH, HD, r = la_o.shape
+    r_check, D = lb_o.shape[1], lb_o.shape[2]
+    assert lb_o.shape == (NH, r_check, D), (
+        f"O lb shape {lb_o.shape} != ({NH}, {r_check}, {D})")
+    assert r == r_check, f"O la r={r} != lb r={r_check}"
+    la_full = la_o.reshape(NH * HD, r).astype(np.float32)
+    lb_summed = lb_o.sum(axis=0).astype(np.float32)
+    return la_full, lb_summed
+
+
+def _extract_lora_pairs(
+    raw: dict,
+    *,
+    base_key_patterns: tuple[str, ...],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Pop LoRA tensors whose base key matches any of ``base_key_patterns``.
+
+    Mirrors openpi's runtime-LoRA extraction (see
+    ``openpi/JAX_TO_PYTORCH_LORA_CONVERSION.md`` §3): instead of merging
+    the LoRA delta into the base weight before quantization, we keep
+    ``lora_a`` / ``lora_b`` separate so the runtime forward can apply them
+    as two bf16 matmuls AFTER the (FP8) base GEMM. This is the only way
+    openpi's PyTorch port reached cos > 0.9997 vs JAX on
+    ``pi05_openarm_ngc_lora_v4`` — pre-merging at fp32 still lost ~8%
+    magnitude (Bug #2 in ``PYTORCH_PARITY_DEBUG.md``).
+
+    For each ``lora_a`` key that resolves to a (base_key, lora_b_key)
+    triple AND whose ``base_key`` contains any of ``base_key_patterns`` as
+    a substring, this function:
+
+    * removes the ``lora_a`` and ``lora_b`` entries from ``raw`` (so the
+      subsequent ``_maybe_merge_lora`` call leaves those bases alone), and
+    * returns ``{base_key: (la_fp32, lb_fp32)}`` so the caller can stash
+      the extracted pair into the pipeline's weights dict under whatever
+      naming the runtime path expects.
+
+    The base weight itself is left in ``raw`` untouched so the regular
+    conversion code can pick it up exactly as before — just without the
+    LoRA delta baked in.
+
+    Args:
+        raw: flat dict from ``_load_orbax``. Mutated in place: matching
+            ``lora_a`` / ``lora_b`` entries are removed. The corresponding
+            base entries are *not* touched.
+        base_key_patterns: substrings; a LoRA pair is extracted iff its
+            ``base_key`` contains at least one of these. Use e.g.
+            ``("mlp.gating_einsum", "mlp.linear")`` to extract only the
+            encoder/decoder FFN LoRA pairs. The "_1" suffix used by
+            openpi for action-expert layers is matched too because the
+            substring is contained in both variants.
+
+    Returns:
+        Dict ``{base_key: (lora_a_fp32, lora_b_fp32)}`` for every pair
+        that was extracted. Both arrays are cast to fp32; the caller is
+        responsible for the eventual bf16 truncation that matches the
+        JAX runtime path.
+    """
+    lora_a_keys = sorted(k for k in raw if k.endswith("lora_a"))
+    extracted: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for la_key in lora_a_keys:
+        pair = _resolve_lora_pair(la_key, raw)
+        if pair is None:
+            continue
+        base_key, lb_key = pair
+        if not any(pat in base_key for pat in base_key_patterns):
+            continue
+        la = raw[la_key].astype(np.float32, copy=False)
+        lb = raw[lb_key].astype(np.float32, copy=False)
+        extracted[base_key] = (la, lb)
+        del raw[la_key]
+        del raw[lb_key]
+    if extracted:
+        logger.info(
+            "Runtime LoRA: extracted %d LoRA pair(s) for patterns %s "
+            "(those bases will skip merge and be applied at runtime)",
+            len(extracted), list(base_key_patterns),
+        )
+    return extracted
+
+
 def _maybe_merge_lora(
     raw: dict,
     *,
@@ -245,12 +443,88 @@ def convert_pi05_orbax(
     logger.info("Loading Pi0.5 Orbax checkpoint: %s", checkpoint_dir)
     raw = _load_orbax(str(checkpoint_dir))
 
-    # LoRA merge (no-op if the checkpoint has no .lora_a entries). Done
-    # BEFORE the fp32→bf16 truncation below so the rank-r LoRA neck
-    # never sees bf16 — matches the JAX server's effective accuracy
-    # without the runtime LoRA cost. Override scaling via env if your
-    # training used non-default alpha/rank.
+    # LoRA scaling = alpha / rank (or alpha / sqrt(rank) for rslora).
+    # Override via env if training used non-default alpha/rank.
     lora_scaling = float(os.environ.get("FLASHRT_LORA_SCALING", "1.0"))
+
+    # Optional runtime LoRA extraction. See openpi/JAX_TO_PYTORCH_LORA_CONVERSION.md
+    # §3 and PYTORCH_PARITY_DEBUG.md "★ 2026-05-19 RESOLVED": pre-merging
+    # LoRA (even in fp32) costs ~8% magnitude vs JAX through 18 layers ×
+    # 10 diffusion steps because the rank-r intermediate's rounding order
+    # differs from JAX's two-matmul forward. Only runtime LoRA — keep
+    # ``lora_a`` / ``lora_b`` separate, apply as two bf16 matmuls added
+    # to the base GEMM output — recovers parity (cos > 0.9997 deployed
+    # on the OpenArm robot per openpi's measurements). For FlashRT this
+    # also fixes the FP8 cos 0.617 catastrophe: per-tensor FP8 calibrated
+    # against LoRA-merged activations sees outliers up to amax/median 850×
+    # at ``encoder_ffn_down_w_16``; once LoRA is removed from the merge,
+    # the base-only activation distribution is well-behaved.
+    #
+    # FLASHRT_RUNTIME_LORA (default 0):
+    #   0          — merge all LoRA into base (current production)
+    #   1, "all"   — extract every LoRA pair (252 modules on Pi0.5)
+    #   "encoder_ffn" — only encoder MLP gating_einsum + linear (54 pairs,
+    #                   the suspected outlier source); day-1 scope.
+    #
+    # The extracted pairs are stashed into the *raw* dict under
+    # ``__runtime_lora_pairs__`` for the converter loop below to pick up
+    # and route to the right ckpt key names.
+    runtime_lora_mode = os.environ.get("FLASHRT_RUNTIME_LORA", "0").lower()
+    runtime_lora_pairs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if runtime_lora_mode not in ("", "0", "false", "no"):
+        if runtime_lora_mode in ("1", "true", "yes", "all"):
+            # All 252 LoRA modules in Pi0.5: encoder + decoder, attention
+            # (q/kv/o) + MLP (gating/down). The attn.* substrings also
+            # match the action-expert "_1"-suffixed keys
+            # (e.g. "layers.attn.q_einsum_1") because the encoder key is
+            # a prefix of the decoder key. The mlp/mlp_1 split requires
+            # two patterns each because "mlp." is NOT a substring of
+            # "mlp_1." (the underscore breaks the match).
+            patterns = (
+                "layers.mlp.gating_einsum",
+                "layers.mlp.linear",
+                "layers.mlp_1.gating_einsum",
+                "layers.mlp_1.linear",
+                "layers.attn.q_einsum",         # matches q_einsum and q_einsum_1
+                "layers.attn.kv_einsum",        # matches kv_einsum and kv_einsum_1
+                "layers.attn.attn_vec_einsum",  # matches attn_vec_einsum and _1
+            )
+        elif runtime_lora_mode == "encoder_ffn":
+            # Day-1 scope: only encoder MLP (54 pairs = 18 layers × 3 modules).
+            # Substring "layers.mlp.gating_einsum" matches the encoder key
+            # "PaliGemma.llm.layers.mlp.gating_einsum" but NOT the decoder
+            # key "PaliGemma.llm.layers.mlp_1.gating_einsum" (the "_1."
+            # between "mlp" and "gating" breaks the contiguous substring).
+            patterns = (
+                "layers.mlp.gating_einsum",
+                "layers.mlp.linear",
+            )
+        elif runtime_lora_mode == "encoder":
+            # Day-2 morning scope: full encoder LoRA — MLP gate/up/down +
+            # attention q/kv/o. Closes the residual 5 % cosine gap that
+            # encoder-FFN-only leaves (which is the bias from the
+            # still-merged encoder attention LoRA). The decoder LoRA
+            # stays merged. q_einsum and the others use the substring
+            # form that matches encoder names only (no "_1" suffix).
+            patterns = (
+                "layers.mlp.gating_einsum",
+                "layers.mlp.linear",
+                "layers.attn.q_einsum.",          # encoder Q (trailing dot
+                "layers.attn.kv_einsum.",         # excludes "_1." variant)
+                "layers.attn.attn_vec_einsum.",
+            )
+        else:
+            raise ValueError(
+                f"FLASHRT_RUNTIME_LORA={runtime_lora_mode!r} not recognised; "
+                "expected '0', '1'/'all', or 'encoder_ffn'.")
+        runtime_lora_pairs = _extract_lora_pairs(
+            raw, base_key_patterns=patterns)
+
+    # LoRA merge (no-op if the checkpoint has no .lora_a entries, or if
+    # FLASHRT_RUNTIME_LORA extracted everything above). Done BEFORE the
+    # fp32→bf16 truncation below so the rank-r LoRA neck never sees bf16
+    # — matches the JAX server's effective accuracy without the runtime
+    # LoRA cost.
     raw = _maybe_merge_lora(raw, scaling=lora_scaling)
 
     # Bit-truncate fp32 → bf16 → fp32. Production loads everything as
@@ -355,6 +629,37 @@ def convert_pi05_orbax(
     # ── Encoder (18 Gemma-2B layers with RMSNorm fold) ──
     enc_qkv_list, enc_o_list = [], []
     enc_gate_list, enc_up_list, enc_down_list = [], [], []
+    # Runtime-LoRA tensors per-encoder-layer (only populated when the
+    # corresponding base key was extracted above). The same fp32 RMSNorm
+    # fold that the base weights get also applies to ``lora_a`` here so
+    # the runtime forward needs no extra norm-fold step.
+    enc_gate_la_list, enc_gate_lb_list = [], []
+    enc_up_la_list, enc_up_lb_list = [], []
+    enc_down_la_list, enc_down_lb_list = [], []
+    # Encoder attention LoRA (added in the "encoder" mode). Q, K, V are
+    # combined into one padded la/lb per layer so the runtime path runs
+    # a single bf16_nn + bf16_nn_res for all three projections at once
+    # (see _build_padded_attn_lora_{a,b}). O is a standard 2D LoRA after
+    # N-summing lb in fp32 (see _build_o_lora).
+    enc_attn_qkv_la_list, enc_attn_qkv_lb_list = [], []
+    enc_attn_o_la_list,   enc_attn_o_lb_list   = [], []
+    _gating_base = "PaliGemma.llm.layers.mlp.gating_einsum"
+    _linear_base = "PaliGemma.llm.layers.mlp.linear"
+    _gating_pair = runtime_lora_pairs.get(_gating_base)
+    _linear_pair = runtime_lora_pairs.get(_linear_base)
+    _q_pair      = runtime_lora_pairs.get("PaliGemma.llm.layers.attn.q_einsum.w")
+    _kv_pair     = runtime_lora_pairs.get("PaliGemma.llm.layers.attn.kv_einsum.w")
+    _o_pair      = runtime_lora_pairs.get("PaliGemma.llm.layers.attn.attn_vec_einsum.w")
+    _has_enc_ffn_lora  = _gating_pair is not None or _linear_pair is not None
+    _has_enc_attn_lora = (_q_pair is not None and _kv_pair is not None
+                          and _o_pair is not None)
+    if (_q_pair is not None) != (_kv_pair is not None) or \
+       (_q_pair is not None) != (_o_pair is not None):
+        raise ValueError(
+            "Runtime LoRA: partial encoder-attention extraction is not "
+            "supported — q/kv/o must all be present or all merged. Got "
+            f"q={_q_pair is not None}, kv={_kv_pair is not None}, "
+            f"o={_o_pair is not None}.")
 
     for i in range(ENC_L):
         # CRITICAL: fuse in fp32 — bf16 rounds values near -1.0 to exactly
@@ -393,6 +698,37 @@ def convert_pi05_orbax(
         o_w = raw["PaliGemma.llm.layers.attn.attn_vec_einsum.w"][i].astype(np.float32)
         enc_o_list.append(o_w.reshape(-1, o_w.shape[-1]))
 
+        # Runtime LoRA — encoder attention (Q + KV merged via padding; O via N-sum).
+        if _has_enc_attn_lora:
+            # Per-layer slices: orbax stacks all 18 layers leading-axis.
+            la_q_full, lb_q_full = _q_pair       # (L, NH, D, r), (L, NH, r, HD)
+            la_kv_full, lb_kv_full = _kv_pair    # (L, 2, NKV, D, r), (L, 2, NKV, r, HD)
+            la_o_full, lb_o_full   = _o_pair     # (L, NH, HD, r), (L, NH, r, D)
+
+            la_q  = la_q_full[i]                              # (NH, D, r)
+            lb_q  = lb_q_full[i]                              # (NH, r, HD)
+            # KV stacks K (axis 1 == 0) and V (axis 1 == 1). NKV=1 → squeeze.
+            la_k  = la_kv_full[i, 0, 0]                       # (D, r)
+            la_v  = la_kv_full[i, 1, 0]
+            lb_k  = lb_kv_full[i, 0, 0]                       # (r, HD)
+            lb_v  = lb_kv_full[i, 1, 0]
+            la_o  = la_o_full[i]                              # (NH, HD, r)
+            lb_o  = lb_o_full[i]                              # (NH, r, D)
+
+            # Build padded QKV LoRA tensors. fuse_attn folds into la (input
+            # axis), exactly like the base QKV weight got it above (`q_2d
+            # = q_2d * fuse_attn[None, :]` etc.). The interleave_fn matches
+            # the per-head RoPE-friendly interleave the base weights get.
+            qkv_la = _build_padded_attn_lora_a(la_q, la_k, la_v, fuse_attn)
+            qkv_lb = _build_padded_attn_lora_b(lb_q, lb_k, lb_v)
+            enc_attn_qkv_la_list.append(qkv_la)
+            enc_attn_qkv_lb_list.append(qkv_lb)
+
+            # Build O LoRA (N-summed lb).
+            o_la, o_lb = _build_o_lora(la_o, lb_o)
+            enc_attn_o_la_list.append(o_la)
+            enc_attn_o_lb_list.append(o_lb)
+
         # Gate / Up: JAX (2, 2048, 16384) — both already (in, out)
         ffn_scale = raw[
             "PaliGemma.llm.layers.pre_ffw_norm.scale"][i].astype(np.float32)
@@ -404,15 +740,99 @@ def convert_pi05_orbax(
         enc_gate_list.append(gate_w)
         enc_up_list.append(up_w)
 
+        # Runtime LoRA — encoder gate/up. JAX storage for the merged
+        # gating_einsum LoRA pair is:
+        #   la (2, D, r)   — gate/up stacked along leading axis
+        #   lb (2, r, H)
+        # We slice gate (idx 0) and up (idx 1), and fold the FFN RMSNorm
+        # scale into ``la`` (in_dim axis) so it matches the corresponding
+        # fold already baked into ``gate_w`` / ``up_w`` above. ``lb``
+        # stays unfolded because the JAX einsum order is
+        # ``(x * fuse_ffn) @ la → (x * fuse_ffn) @ la @ lb``: only the
+        # first matmul touches the in_dim norm-folded path.
+        if _gating_pair is not None:
+            # Orbax stacks all 18 layers along the leading axis:
+            #   la_gu shape: (ENC_L, 2, D, r) — (layers, gate/up, in, rank)
+            #   lb_gu shape: (ENC_L, 2, r, H)
+            # Pull this layer's slice and split gate (idx 0) from up (idx 1).
+            la_gu, lb_gu = _gating_pair
+            la_gate = la_gu[i, 0] * fuse_ffn[:, None]  # (D, r)
+            la_up   = la_gu[i, 1] * fuse_ffn[:, None]
+            lb_gate = lb_gu[i, 0]                       # (r, H)
+            lb_up   = lb_gu[i, 1]
+            enc_gate_la_list.append(la_gate)
+            enc_gate_lb_list.append(lb_gate)
+            enc_up_la_list.append(la_up)
+            enc_up_lb_list.append(lb_up)
+
         # Down: JAX (16384, 2048) — already (in, out), no fold
         enc_down_list.append(
             raw["PaliGemma.llm.layers.mlp.linear"][i].astype(np.float32))
+
+        # Runtime LoRA — encoder down. JAX storage:
+        #   la (H, r)
+        #   lb (r, D)
+        # No norm fold (no RMSNorm sits between gate_geglu output and
+        # the down projection input — fuse_ffn was already folded into
+        # the gate/up weights).
+        if _linear_pair is not None:
+            # Orbax stacks all 18 layers along the leading axis:
+            #   la_down shape: (ENC_L, H, r)
+            #   lb_down shape: (ENC_L, r, D)
+            la_down, lb_down = _linear_pair
+            enc_down_la_list.append(la_down[i].astype(np.float32, copy=False))
+            enc_down_lb_list.append(lb_down[i].astype(np.float32, copy=False))
 
     ckpt["encoder_attn_qkv_w"] = _to_bf16_cuda(np.stack(enc_qkv_list))
     ckpt["encoder_attn_o_w"] = _to_bf16_cuda(np.stack(enc_o_list))
     ckpt["encoder_ffn_gate_w"] = _to_bf16_cuda(np.stack(enc_gate_list))
     ckpt["encoder_ffn_up_w"] = _to_bf16_cuda(np.stack(enc_up_list))
     ckpt["encoder_ffn_down_w"] = _to_bf16_cuda(np.stack(enc_down_list))
+
+    # Runtime LoRA — stash the extracted (la, lb) tensors next to the
+    # base weights, stacked across all 18 encoder layers so the pipeline
+    # can index them by layer in the encoder loop. Same dtype + device
+    # convention as the base weights (bf16 cuda) so the bf16_nn GEMM in
+    # the runtime forward sees a homogeneous bf16 input.
+    if enc_gate_la_list:
+        ckpt["encoder_ffn_gate_lora_a"] = _to_bf16_cuda(np.stack(enc_gate_la_list))
+        ckpt["encoder_ffn_gate_lora_b"] = _to_bf16_cuda(np.stack(enc_gate_lb_list))
+        ckpt["encoder_ffn_up_lora_a"]   = _to_bf16_cuda(np.stack(enc_up_la_list))
+        ckpt["encoder_ffn_up_lora_b"]   = _to_bf16_cuda(np.stack(enc_up_lb_list))
+        logger.info(
+            "Runtime LoRA: stashed encoder gate/up lora_a/lora_b (shape %s, %s) "
+            "across %d layers",
+            tuple(ckpt["encoder_ffn_gate_lora_a"].shape),
+            tuple(ckpt["encoder_ffn_gate_lora_b"].shape),
+            ENC_L,
+        )
+    if enc_down_la_list:
+        ckpt["encoder_ffn_down_lora_a"] = _to_bf16_cuda(np.stack(enc_down_la_list))
+        ckpt["encoder_ffn_down_lora_b"] = _to_bf16_cuda(np.stack(enc_down_lb_list))
+        logger.info(
+            "Runtime LoRA: stashed encoder down lora_a/lora_b (shape %s, %s) "
+            "across %d layers",
+            tuple(ckpt["encoder_ffn_down_lora_a"].shape),
+            tuple(ckpt["encoder_ffn_down_lora_b"].shape),
+            ENC_L,
+        )
+    if enc_attn_qkv_la_list:
+        ckpt["encoder_attn_qkv_lora_a"] = _to_bf16_cuda(np.stack(enc_attn_qkv_la_list))
+        ckpt["encoder_attn_qkv_lora_b"] = _to_bf16_cuda(np.stack(enc_attn_qkv_lb_list))
+        ckpt["encoder_attn_o_lora_a"]   = _to_bf16_cuda(np.stack(enc_attn_o_la_list))
+        ckpt["encoder_attn_o_lora_b"]   = _to_bf16_cuda(np.stack(enc_attn_o_lb_list))
+        logger.info(
+            "Runtime LoRA: stashed encoder attention qkv+o lora_a/lora_b "
+            "(qkv la=%s, qkv lb=%s, o la=%s, o lb=%s) across %d layers",
+            tuple(ckpt["encoder_attn_qkv_lora_a"].shape),
+            tuple(ckpt["encoder_attn_qkv_lora_b"].shape),
+            tuple(ckpt["encoder_attn_o_lora_a"].shape),
+            tuple(ckpt["encoder_attn_o_lora_b"].shape),
+            ENC_L,
+        )
+    # Stash the scaling factor for the pipeline to use at runtime.
+    if enc_gate_la_list or enc_down_la_list or enc_attn_qkv_la_list:
+        ckpt["runtime_lora_scaling"] = float(lora_scaling)
 
     # ── Decoder (18 Gemma-300M expert layers) ──
     dec_qkv_list, dec_o_list = [], []

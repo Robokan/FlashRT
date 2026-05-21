@@ -239,6 +239,80 @@ class Pi05Pipeline:
         self._rms_ones_enc = CudaBuffer.from_numpy(_ones_2048)
         self._rms_ones_dec = CudaBuffer.from_numpy(_ones_1024)
 
+        # ── Runtime-LoRA setup (encoder FFN only, day-1 scope) ──
+        # See openpi/JAX_TO_PYTORCH_LORA_CONVERSION.md §3 and the JAX
+        # frontend's _extract_lora_pairs for the rationale.  When the
+        # weights dict carries ``encoder_ffn_{gate,up,down}_lora_a/b``,
+        # we run the matching base GEMM as usual then add a bf16 LoRA
+        # delta on top (two small rank-r matmuls + one residual_add).
+        # Tensors come stacked across all ENC_L=18 layers; the per-layer
+        # slice is indexed inside ``_run_encoder_layer``.
+        self._has_enc_ffn_gateup_lora = (
+            "encoder_ffn_gate_lora_a" in weights
+            and "encoder_ffn_gate_lora_b" in weights
+            and "encoder_ffn_up_lora_a" in weights
+            and "encoder_ffn_up_lora_b" in weights
+        )
+        self._has_enc_ffn_down_lora = (
+            "encoder_ffn_down_lora_a" in weights
+            and "encoder_ffn_down_lora_b" in weights
+        )
+        self._has_enc_attn_lora = (
+            "encoder_attn_qkv_lora_a" in weights
+            and "encoder_attn_qkv_lora_b" in weights
+            and "encoder_attn_o_lora_a" in weights
+            and "encoder_attn_o_lora_b" in weights
+        )
+        self._lora_scaling = float(weights.get("runtime_lora_scaling", 1.0))
+        _any_enc_lora = (self._has_enc_ffn_gateup_lora
+                         or self._has_enc_ffn_down_lora
+                         or self._has_enc_attn_lora)
+        if _any_enc_lora:
+            # All Pi0.5 encoder LoRA in the OpenArm checkpoint uses r=16.
+            # Read the actual rank off whichever standard 2D tensor is
+            # present so a non-standard checkpoint still works. Attention
+            # QKV uses a *padded* lora_a (D, NH*r + 2*r_kv) — don't read
+            # rank off that one; use a non-padded site.
+            if self._has_enc_ffn_gateup_lora:
+                self._lora_rank = int(
+                    weights["encoder_ffn_gate_lora_a"].shape[-1])
+            elif self._has_enc_ffn_down_lora:
+                self._lora_rank = int(
+                    weights["encoder_ffn_down_lora_a"].shape[-1])
+            else:
+                # Attn O is also a standard (NH*HD, r) layout.
+                self._lora_rank = int(
+                    weights["encoder_attn_o_lora_a"].shape[-1])
+            es = self.encoder_seq_len
+            r = self._lora_rank
+            # The neck buffer has to be wide enough for the largest LoRA
+            # contraction width seen on the encoder. The padded QKV
+            # path uses width ``NH*r + 2*r`` (= 160 with r=16, NH=8),
+            # all other sites are width ``r``. We pick a single buffer
+            # at the max so it can be reused sequentially across every
+            # encoder LoRA site within a layer.
+            max_neck = r
+            if self._has_enc_attn_lora:
+                max_neck = max(
+                    max_neck,
+                    int(weights["encoder_attn_qkv_lora_a"].shape[-1]))
+            self._enc_lora_neck_max = max_neck
+            self._enc_lora_neck = CudaBuffer.device_empty(es * max_neck, BF16)
+            logger.info(
+                "Pi05Pipeline: runtime LoRA enabled for encoder FFN "
+                "(gate/up=%s, down=%s, rank=%d, scaling=%.4f)",
+                self._has_enc_ffn_gateup_lora, self._has_enc_ffn_down_lora,
+                self._lora_rank, self._lora_scaling,
+            )
+            if self._lora_scaling != 1.0:
+                # TODO: non-unit scaling needs either a scaled residual_add
+                # kernel or pre-multiplying scaling into lb at conversion.
+                # Pi0.5 OpenArm uses alpha=rank=16 so this is unit.
+                raise NotImplementedError(
+                    "runtime LoRA with scaling != 1.0 not yet wired "
+                    f"(got scaling={self._lora_scaling}); pre-multiply "
+                    "into lora_b at conversion or add a scaled add kernel.")
+
         # FP8 activation scratch buffers + per-layer static scales
         self.fp8_act_scales = {}  # name -> CudaBuffer(1, fp32)
         self.fp8_calibrated = False
@@ -707,6 +781,61 @@ class Pi05Pipeline:
         self._int8_gemm_fused(
             act_i8_ptr, weight_name, out_bf16_ptr, M, N, K,
             layer_scale.ptr.value, stream)
+
+    def _apply_enc_lora(
+        self,
+        in_bf16_ptr: int,
+        la_ptr: int,        # device pointer to (in_dim, neck_dim) bf16 cuda
+        lb_ptr: int,        # device pointer to (neck_dim, out_dim) bf16 cuda
+        out_bf16_ptr: int,
+        seq: int,
+        in_dim: int,
+        out_dim: int,
+        neck_dim: int,
+        stream: int,
+    ) -> None:
+        """Add a runtime LoRA contribution to an encoder GEMM output.
+
+        Computes ``out += (in @ la) @ lb`` via two GEMMs through the
+        ``_enc_lora_neck`` scratch:
+
+          1. ``bf16_nn``     : neck = in @ la            (seq, neck_dim)
+          2. ``bf16_nn_res`` : out += neck @ lb           (seq, out_dim)
+
+        ``bf16_nn_res`` fuses the residual add into the GEMM's FP32
+        accumulator — same precision as JAX's two-matmul forward
+        ``base_out + (x @ la) @ lb`` (which gave cos > 0.9997 vs JAX
+        in openpi). No output-side delta scratch is needed.
+
+        For standard 2D LoRA (FFN gate/up/down, attention O after
+        N-sum, decoder mirror), ``neck_dim`` is the LoRA rank ``r``
+        (e.g. 16). For the encoder attention "padded QKV" LoRA, the
+        Q/K/V matrices are stacked along the column axis of ``la`` and
+        block-diagonal along the row axis of ``lb`` so a single pair
+        of GEMMs covers all three projections; here ``neck_dim`` is
+        ``NH*r + 2*r_kv`` (= 160 for the OpenArm checkpoint), and
+        ``out_dim`` is the full fused QKV width
+        ``NH*HD + 2*NKV*HD`` (= 2560).
+
+        Caller must ensure ``out_bf16_ptr`` already holds the base GEMM
+        result before invoking this helper; the LoRA delta is added
+        in-place. ``in_bf16_ptr`` is the SAME activation that was fed
+        to the base GEMM.
+
+        The single ``_enc_lora_neck`` scratch is sized for the maximum
+        ``neck_dim`` we'll see (set in ``__init__``) and reused
+        sequentially across every encoder LoRA site within a layer.
+        """
+        # Step 1: x @ la → neck (seq, neck_dim).
+        self.gemm.bf16_nn(
+            in_bf16_ptr, la_ptr,
+            self._enc_lora_neck.ptr.value,
+            seq, neck_dim, in_dim, stream=stream)
+        # Step 2: out += neck @ lb — fused residual GEMM.
+        self.gemm.bf16_nn_res(
+            self._enc_lora_neck.ptr.value, lb_ptr,
+            out_bf16_ptr,
+            seq, out_dim, neck_dim, stream=stream)
 
     def _fp8_gemm(self, act_bf16_ptr: int, act_n: int, weight_name: str,
                   out_bf16_ptr: int, M: int, N: int, K: int, stream: int) -> None:
@@ -1190,6 +1319,44 @@ class Pi05Pipeline:
                 B["encoder_x_norm"].ptr.value, W["encoder_attn_qkv_w"][i],
                 B["encoder_QKV"].ptr.value,
                 seq, (ENC_NH + 2 * ENC_NKV) * ENC_HD, ENC_D, stream=stream)
+            # Diagnostic env vars (do not commit any code that relies on
+            # these long-term): set FLASHRT_LORA_SKIP_ENC_QKV=1 to skip
+            # the encoder QKV runtime LoRA add for A/B isolation,
+            # FLASHRT_LORA_SKIP_ENC_O=1 to skip the O add. Both unset by
+            # default = full encoder-attention LoRA path active.
+            import os as _os  # local import to keep top-level imports clean
+            _skip_qkv = _os.environ.get("FLASHRT_LORA_SKIP_ENC_QKV", "0") == "1"
+            if i == 0 and not getattr(self, "_logged_attn_lora_flags", False):
+                logger.info(
+                    "Pi05Pipeline encoder layer 0: _has_enc_attn_lora=%s "
+                    "skip_qkv=%s skip_o=%s",
+                    self._has_enc_attn_lora, _skip_qkv,
+                    _os.environ.get("FLASHRT_LORA_SKIP_ENC_O", "0") == "1",
+                )
+                self._logged_attn_lora_flags = True
+            # Runtime LoRA QKV — combined Q/K/V LoRA in one bf16_nn +
+            # one bf16_nn_res (see _build_padded_attn_lora_{a,b} in the
+            # JAX converter). The padded lora_a has columns
+            # ``[Q_h0_r | Q_h1_r | ... | Q_h{NH-1}_r | K_r | V_r]`` of
+            # width ``NH*r + 2*r_kv``; the padded lora_b is block-
+            # diagonal so a single residual GEMM adds the right delta
+            # into each of the [Q | K | V] slices of encoder_QKV at
+            # once. Must run BEFORE qkv_split_rope so the LoRA
+            # contribution gets the same RoPE / cache treatment as the
+            # base QKV.
+            if self._has_enc_attn_lora and not _skip_qkv:
+                la_qkv = W["encoder_attn_qkv_lora_a"][i]
+                lb_qkv = W["encoder_attn_qkv_lora_b"][i]
+                neck_qkv = int(la_qkv.shape[-1])  # NH*r + 2*r_kv (= 160)
+                self._apply_enc_lora(
+                    B["encoder_x_norm"].ptr.value,
+                    la_qkv.data_ptr(), lb_qkv.data_ptr(),
+                    B["encoder_QKV"].ptr.value,
+                    seq,
+                    ENC_D,
+                    (ENC_NH + 2 * ENC_NKV) * ENC_HD,
+                    neck_qkv,
+                    stream)
 
         # Split QKV + apply RoPE. K/V go into attn_backend's layer cache slice.
         k_ptr, v_ptr = self._enc_kv_layer_ptrs(i, offset_tokens=0)
@@ -1227,6 +1394,20 @@ class Pi05Pipeline:
                 enc_o_ptr, W["encoder_attn_o_w"][i],
                 B["encoder_x_norm"].ptr.value,
                 seq, ENC_D, ENC_D, stream=stream)
+            # Runtime LoRA attention O — standard 2D LoRA after
+            # N-summing lb in fp32 at conversion time. The input is the
+            # attention output (enc_o_ptr) — same activation the base
+            # GEMM consumed. The output goes into encoder_x_norm — same
+            # buffer the base writes to — added in-place via bf16_nn_res.
+            import os as _os
+            _skip_o = _os.environ.get("FLASHRT_LORA_SKIP_ENC_O", "0") == "1"
+            if self._has_enc_attn_lora and not _skip_o:
+                self._apply_enc_lora(
+                    enc_o_ptr,
+                    W["encoder_attn_o_lora_a"][i].data_ptr(),
+                    W["encoder_attn_o_lora_b"][i].data_ptr(),
+                    B["encoder_x_norm"].ptr.value,
+                    seq, ENC_D, ENC_D, self._lora_rank, stream)
 
         # B4: (residual_add + RMSNorm) fused → INT8 gate GEMM + SiLU-gated up GEMM
         if use_int8_enc:
@@ -1299,6 +1480,21 @@ class Pi05Pipeline:
                 B["encoder_x_norm"].ptr.value, W["encoder_ffn_up_w"][i],
                 B["encoder_hidden"].ptr.value,
                 seq, ENC_H, ENC_D, stream=stream)
+            # Runtime LoRA gate/up — add bf16 delta on top of each base GEMM.
+            if self._has_enc_ffn_gateup_lora:
+                r = self._lora_rank
+                self._apply_enc_lora(
+                    B["encoder_x_norm"].ptr.value,
+                    W["encoder_ffn_gate_lora_a"][i].data_ptr(),
+                    W["encoder_ffn_gate_lora_b"][i].data_ptr(),
+                    B["encoder_gate_merged"].ptr.value,
+                    seq, ENC_D, ENC_H, r, stream)
+                self._apply_enc_lora(
+                    B["encoder_x_norm"].ptr.value,
+                    W["encoder_ffn_up_lora_a"][i].data_ptr(),
+                    W["encoder_ffn_up_lora_b"][i].data_ptr(),
+                    B["encoder_hidden"].ptr.value,
+                    seq, ENC_D, ENC_H, r, stream)
 
         # SiLU(gate) * up → hidden (already done by silu_gated EVT above for INT8),
         # then FFN down GEMM.
@@ -1341,6 +1537,16 @@ class Pi05Pipeline:
                 B["encoder_hidden"].ptr.value, W["encoder_ffn_down_w"][i],
                 B["encoder_x_norm"].ptr.value,
                 seq, ENC_D, ENC_H, stream=stream)
+            # Runtime LoRA down — input is post-geglu encoder_hidden, NOT
+            # the pre-geglu gate_merged. This matches JAX's two-matmul
+            # forward: ``(silu(gate)*up) @ (W_down + la_down @ lb_down)``.
+            if self._has_enc_ffn_down_lora:
+                self._apply_enc_lora(
+                    B["encoder_hidden"].ptr.value,
+                    W["encoder_ffn_down_lora_a"][i].data_ptr(),
+                    W["encoder_ffn_down_lora_b"][i].data_ptr(),
+                    B["encoder_x_norm"].ptr.value,
+                    seq, ENC_H, ENC_D, self._lora_rank, stream)
 
         # B5: Residual (skipped in fused mode — next layer's B1 handles it)
         if not fused:

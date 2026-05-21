@@ -988,6 +988,32 @@ class Pi05TorchFrontendRtx:
             # Precomputed decoder styles (numpy bf16 as uint16 view)
             "precomputed": self._precomputed_styles,
         }
+
+        # Runtime LoRA passthrough (Pi05Pipeline auto-detects by key
+        # presence). The JAX frontend stashes these in ``_ckpt_bf16``
+        # when ``FLASHRT_RUNTIME_LORA`` is set (see
+        # ``frontends/jax/pi05_rtx.py::_extract_lora_pairs``). They are
+        # stored as full torch tensors of shape ``(L, ...)`` so the
+        # pipeline can both read ``.shape[-1]`` (rank/neck detection)
+        # AND get a per-layer pointer via ``W[key][i].data_ptr()``.
+        # Skipped silently if not present (normal merged-LoRA path).
+        for _k in (
+            "encoder_ffn_gate_lora_a", "encoder_ffn_gate_lora_b",
+            "encoder_ffn_up_lora_a",   "encoder_ffn_up_lora_b",
+            "encoder_ffn_down_lora_a", "encoder_ffn_down_lora_b",
+            "encoder_attn_qkv_lora_a", "encoder_attn_qkv_lora_b",
+            "encoder_attn_o_lora_a",   "encoder_attn_o_lora_b",
+            "decoder_ffn_gate_lora_a", "decoder_ffn_gate_lora_b",
+            "decoder_ffn_up_lora_a",   "decoder_ffn_up_lora_b",
+            "decoder_ffn_down_lora_a", "decoder_ffn_down_lora_b",
+            "decoder_attn_qkv_lora_a", "decoder_attn_qkv_lora_b",
+            "decoder_attn_o_lora_a",   "decoder_attn_o_lora_b",
+        ):
+            if _k in W:
+                weights[_k] = W[_k]
+        if "runtime_lora_scaling" in W:
+            weights["runtime_lora_scaling"] = float(W["runtime_lora_scaling"])
+
         return weights
 
     # -----------------------------------------------------------------

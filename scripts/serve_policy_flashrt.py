@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import socket
 import sys
 from pathlib import Path
@@ -167,6 +168,14 @@ def main() -> int:
         prompts = data["prompts"]
         first_prompt = (str(prompts[0]) if len(prompts) > 0 and prompts[0]
                         else args.default_prompt or "pick up the red block")
+        # Pi0.5 discrete_state_input: state vector ships in the language
+        # tokens (see flash_rt/frontends/torch/pi05_rtx.py:set_prompt).
+        # Pass it through to calibration so the per-sample obs carries
+        # the right state and prompt — Pi05TorchFrontendRtx
+        # ._calibrate_multi_frame will re-fire set_prompt per sample
+        # when FLASHRT_PAD_STATE=1 (the only mode where per-sample state
+        # is safe — see the warning in that method for the rationale).
+        states = data["state"] if "state" in keys else None
         n = len(per_cam[0])
         obs_list = []
         for i in range(n):
@@ -176,11 +185,27 @@ def main() -> int:
                 obs["wrist_image"] = imgs[1]
             if len(imgs) >= 3:
                 obs["wrist_image_right"] = imgs[2]
+            if states is not None:
+                obs["state"] = states[i]
+            if len(prompts) > i and prompts[i]:
+                obs["prompt"] = str(prompts[i])
             obs_list.append(obs)
-        model._pipe.set_prompt(first_prompt)
+        # When state is available, prime set_prompt with the first
+        # sample's state so the pipeline is built at the right
+        # state-in-prompt length from the start. Without this, the
+        # pipeline would first be built for first_prompt's bare
+        # ~13-token length, then immediately rebuilt to the ~80-token
+        # state-augmented length on the first calibration sample,
+        # wasting the initial build.
+        first_state = states[0] if states is not None else None
+        model._pipe.set_prompt(first_prompt, state=first_state)
         model._current_prompt = first_prompt
-        logger.info("Calibrating with %d samples, %d cams (percentile=99.9)",
-                    len(obs_list), len(per_cam))
+        pad_mode = os.environ.get("FLASHRT_PAD_STATE") == "1"
+        logger.info(
+            "Calibrating with %d samples, %d cams (percentile=99.9, "
+            "state_per_sample=%s, pad_state=%s)",
+            len(obs_list), len(per_cam),
+            states is not None, pad_mode)
         model.calibrate(obs_list, percentile=99.9)
         logger.info("Calibration complete; first robot frame will replay "
                     "the CUDA graph immediately.")

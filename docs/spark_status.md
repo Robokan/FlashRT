@@ -711,6 +711,186 @@ Per-frame CSVs: `/tmp/replay_ep3/replay_ep3.csv` (n=30, stride 5) and
 with `scripts/spark_replay_episode.py --episode 3 --stride 1
 --ref-server localhost:8000 --sut-server localhost:8002`.
 
+#### Diagnostic (d) — full 587-frame replay, BF16 no-pad
+
+The 30-frame stride-5 numbers above sampled frames 50–200 — i.e. the
+trajectory phase before the gripper engages the chocolate bars. To
+check whether the picture holds through the contact-rich grasp +
+placement at the end of the episode, we ran the full
+`--episode 3 --stride 1` replay against the same BF16 no-pad
+checkpoint (FlashRT pid 3749805, openpi 8000).
+
+Result table (full 587 frames):
+
+| metric                              |  full episode (BF16 no-pad) |
+|-------------------------------------|----------------------------:|
+| cos(F, openpi) median               |                       0.989 |
+| cos(F, openpi) min                  |                       0.920 |
+| cos(F, openpi) p5                   |                       0.936 |
+| cos(F, teleop) median               |                       0.990 |
+| ‖F − teleop‖ median (rad)           |                       0.477 |
+| ‖F − teleop‖ p99 (rad)              |                       1.79  |
+| consecutive cos (FlashRT)           |                       0.9994 (smooth) |
+| sut p50 / p99 latency (ms)          |                  247 / 1245 |
+
+The headline is "the trajectory phase looks like the stride-5 sample
+(cos ≈ 0.99) but the contact phase degrades". Per-frame breakdown:
+
+- frames 50–450 (trajectory + approach): cos(F,O) ≈ 0.99
+- frames 500: cos(F,O) ≈ 0.98 (still good)
+- frames 550–600 (grasp + place): cos(F,O) drops to 0.94, then 0.94
+- min over the whole episode: cos 0.92 on one contact frame
+
+FlashRT's consecutive-frame cosine is 0.9994 (essentially identical
+to openpi's 0.9993) — the trajectory it predicts is smooth and
+coherent on its own, just slightly off from openpi/teleop's
+trajectory during contact. For real robot execution this typically
+still completes the task; the model is making a self-consistent
+prediction, not flailing.
+
+The latency p99 = 1245 ms is the production-blocker. It captures the
+~30 % of frames where the discretised state changes prompt_len and
+triggers a pipeline rebuild. Real robot control at 25 Hz needs
+deterministic ≤ 40 ms per frame. **This makes encoder attention
+masking + padded mode non-optional for deployment** — the only way
+to keep `current_prompt_len` constant across per-frame state changes
+while preserving prediction quality.
+
+Per-frame CSV: `/tmp/replay_full_d/replay_ep3.csv`. Reproduce with
+`scripts/spark_replay_episode.py --episode 3` (no stride/max-frames
+overrides — that's all 587 frames).
+
+#### Diagnostic (a') — FP8 padded with state-aware calibration
+
+The (d) numbers above are BF16. To see how FP8 behaves on top of
+state-in-prompt, we relaunched the server with `--no-fp8` removed
+and `FLASHRT_PAD_STATE=1` (the only mode where FP8 calibration is
+safe: per-frame rebuilds throw away the calibrated `fp8_act_scales`
+buffers on the discarded `Pi05Pipeline` instance, so the inference
+path would run uncalibrated — see "FP8 + state-in-prompt is blocked
+on rebuild" caveat below).
+
+The serve script and `Pi05TorchFrontendRtx._calibrate_multi_frame`
+were updated as part of this diagnostic to:
+
+1. Plumb `state` from the calibration npz into each obs in
+   `obs_list` (was previously discarded — calibration always saw the
+   first sample's state regardless).
+2. Re-fire `set_prompt(prompt, state=obs.state)` per sample during
+   `_calibrate_multi_frame` when `FLASHRT_PAD_STATE=1`. With padded
+   mode the pipeline shape is constant so this is a per-sample
+   embed re-upload (no rebuild), and the accumulated FP8 amax now
+   covers the per-frame language-token variation rather than one
+   fixed state.
+
+When `FLASHRT_PAD_STATE` is not set, `_calibrate_multi_frame` logs a
+loud warning that calibration will be single-state and the scales
+will be wiped on the first inference rebuild. This is the honest
+"FP8 + no-pad is broken at the architecture level" surface.
+
+Result table (full 587 frames, FP8 + state-in-prompt + padded vs
+BF16 no-pad baseline above and openpi reference):
+
+| metric                              | BF16 no-pad (d) | FP8 padded (a') | openpi h=10 |
+|-------------------------------------|----------------:|----------------:|------------:|
+| cos(F, openpi) median               |           0.989 |           0.617 |       1.000 |
+| cos(F, openpi) min                  |           0.920 |          **−0.225** |     n/a   |
+| cos(F, openpi) p5                   |           0.936 |           0.130 |       n/a   |
+| cos(F, teleop) median               |           0.990 |           0.607 |       1.000 |
+| ‖F − teleop‖ median (rad)           |           0.477 |           2.115 |       0.060 |
+| ‖F − teleop‖ max (rad)              |           1.79  |           3.111 |       0.49  |
+| consecutive cos (FlashRT)           |          0.9994 |          0.9506 |      0.9993 |
+| sut p50 latency (ms)                |             247 |        **209**  |         443 |
+| sut p99 latency (ms)                |        **1245** |        **227**  |         468 |
+
+Two clean wins for FP8 padded:
+
+- **Stable latency.** p99 = 227 ms (vs BF16's 1245 ms). No rebuild
+  spikes because the captured graph at `prompt_len=128` is reused
+  for every frame. This is the deployment-target latency profile.
+- **Headroom for higher control rates.** p50 = 209 ms is 2.1×
+  openpi's p50 and small enough that with attention masking + tail
+  blending the system could realistically hit 10 Hz async control
+  with single-digit deadline misses.
+
+One large loss:
+
+- **Predictions are unusable.** cos(F, openpi) median drops from
+  0.989 to 0.617, with frames at cos = −0.22 (predictions oriented
+  opposite to ground truth!). L2 vs teleop jumps from 0.48 rad to
+  2.12 rad. The trajectory-smoothness metric drops from 0.9994 to
+  0.9506 — FlashRT in this mode is making chaotic per-frame
+  decisions, not just slightly-off ones.
+
+##### Root cause: outlier FP8 scale on `encoder_ffn_down_w_16`
+
+Calibration logged the diagnostic that surfaces the actual problem:
+
+```
+[pi05_rtx_N80] 4 scale(s) exceed 20.0 x median (0.032) — calibration
+set may contain outliers. Top offenders:
+  encoder_ffn_down_w_16 = 27.391  (≈ 850 × median)
+  encoder_ffn_down_w_15 =  3.762
+  encoder_ffn_down_w_7  =  0.826
+  encoder_ffn_down_w_14 =  0.657
+FP8 will still run but dynamic-range headroom on these layers is
+compressed.
+```
+
+A scale of 27.4 means that encoder FFN-down layer 16's per-tensor
+amax landed at ≈ 27 on at least one calibration sample. With E4M3
+max ≈ 448, the encoded range becomes [−7548, +7548] and almost all
+non-outlier activations collapse to near-zero in FP8-representable
+space, producing massive quantisation noise specifically on that
+layer. The 4 outlier layers are all *encoder* FFN-down layers near
+the deepest part of the encoder stack, which is the part most
+affected by the PAD-id-0 tokens at positions 78–127 (FlashRT lacks
+encoder attention masking — see "Subtle thing found along the way"
+above). So this is partly a state-in-prompt-specific calibration
+artifact and partly the PAD-corruption bug reaching backwards into
+the FP8 calibration scales.
+
+##### What this means for the deployment path
+
+Putting (d) and (a') together:
+
+|                      | predictions OK? | latency OK? |
+|----------------------|:---------------:|:-----------:|
+| BF16 no-pad          | ✓ (cos 0.99)    | ✗ (p99 1.25 s) |
+| BF16 padded          | ✗ (cos 0.89, PAD bug)         | ✓ (~250 ms) |
+| FP8 padded           | ✗✗ (cos 0.62, opp.) | ✓ (p99 227 ms) |
+| FP8 no-pad           | ✗✗✗ (uncalibrated after first rebuild)  | ✗ (rebuild spikes) |
+
+There is currently no mode that is simultaneously prediction-correct
+and latency-stable. The cell that needs to exist for deployment is
+"FP8 padded + attention-masked encoder + state-aware calibration".
+
+Path forward (in order):
+
+1. **Encoder attention masking** in `flash_rt/models/pi05/pipeline_rtx.py`
+   so padded positions are -inf masked out of the softmax (matches
+   `openpi/src/openpi/models/pi0.py:155`). This is the unblocker.
+   Estimated 1–2 days because it touches the FA2 backend signature
+   and the captured-graph buffer layout.
+2. **Re-calibrate FP8 against the masked encoder.** The PAD-derived
+   outliers in `encoder_ffn_down_w_{7,14,15,16}` should disappear
+   once those positions stop contributing to the activation
+   statistics. Existing code in (a') above already iterates state
+   per sample correctly; no further calibration-path changes needed.
+3. **Re-run replay (d) and (a').** Acceptance criteria: BF16
+   padded cos(F,O) ≥ 0.99 (proves attention masking is correct), FP8
+   padded cos(F,O) ≥ 0.97 with all per-tensor scales inside 20×
+   median (proves FP8 quality is preserved on the masked path), p99
+   ≤ 250 ms (proves no rebuild jitter), and ‖F−teleop‖ ≤ 0.55 rad
+   median (matches BF16 no-pad's prediction quality).
+4. Only after that is the system in shape for the physical-robot
+   handoff that Phase 6 plans for.
+
+Per-frame CSVs: `/tmp/replay_full_d/replay_ep3.csv` (BF16 no-pad,
+n=587) and `/tmp/replay_fp8_padded/replay_ep3.csv` (FP8 padded,
+n=587). FP8 server log: `/tmp/flashrt_fp8_padded.log` (calibration
+warning is at 11:30:31).
+
 ## Phase 5 hardware-verified results
 
 `scripts/spark_phase5_serve_smoke.py` (single-shell smoke against

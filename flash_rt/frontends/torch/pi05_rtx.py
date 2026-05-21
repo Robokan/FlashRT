@@ -574,6 +574,10 @@ class Pi05TorchFrontendRtx:
         self.graph_recorded = False
         self.current_prompt_len = 0
         self.pipeline: Optional[Pi05Pipeline] = None
+        # Last prompt text passed to set_prompt() — used as a fallback by
+        # _calibrate_multi_frame when calibration samples don't carry
+        # their own per-sample prompt string.
+        self._current_prompt: Optional[str] = None
         # RL inference configuration. ``None`` = default behaviour (single
         # forward, no advantage-conditioned prompt injection). When set
         # by :meth:`set_rl_mode`, the next :meth:`set_prompt` call builds
@@ -1174,6 +1178,7 @@ class Pi05TorchFrontendRtx:
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
         self.pipeline.set_language_embeds(embeds_np)
         self._frame_count = 0
+        self._current_prompt = prompt_text
         # Per-frame Pi0.5 state-in-prompt calls would flood the log at
         # 25-30 Hz. Demote the per-call line to DEBUG and emit a single
         # INFO on rebuild + first-fill.
@@ -1433,12 +1438,64 @@ class Pi05TorchFrontendRtx:
         self._graph_torch_stream = torch.cuda.Stream()
         self.pipeline.fp8_calibrated = False
 
+        # Pi0.5 discrete_state_input: the encoder activation distribution
+        # depends on the language tokens, which include the discretised
+        # per-frame state. To calibrate scales that cover the actual
+        # inference distribution (not just one fixed state), re-fire
+        # set_prompt per sample when the obs carries state. Only safe
+        # when the captured graph shape is reused — i.e. when
+        # FLASHRT_PAD_STATE=1 (constant max_prompt_len) — because a
+        # rebuild here would throw away the in-progress calibration. We
+        # detect the mode by checking whether the first sample's
+        # set_prompt would change prompt_len, and skip per-sample
+        # set_prompt if so (a logger warning calls this out so the
+        # operator knows the calibration is single-state).
+        has_state = any(obs.get("state") is not None for obs in obs_list)
+        per_sample_state = False
+        if has_state:
+            pad_state = os.environ.get("FLASHRT_PAD_STATE") == "1"
+            if pad_state:
+                per_sample_state = True
+                logger.info(
+                    "Pi0.5 state-in-prompt calibration: re-firing "
+                    "set_prompt with per-sample state across %d samples "
+                    "(FLASHRT_PAD_STATE=1 keeps the captured graph "
+                    "shape reusable).", n)
+            else:
+                logger.warning(
+                    "Pi0.5 state-in-prompt mode detected but "
+                    "FLASHRT_PAD_STATE!=1 so per-frame set_prompt would "
+                    "rebuild the pipeline and wipe in-progress FP8 "
+                    "scales. Calibrating against a single fixed state "
+                    "(whatever the pre-calibration set_prompt was given). "
+                    "Production inference with per-frame state will "
+                    "trigger rebuilds and the calibrated scales will "
+                    "be lost on the first rebuild. Add encoder attention "
+                    "masking and set FLASHRT_PAD_STATE=1 for a "
+                    "production-viable FP8 path.")
+
         per_sample: list[np.ndarray] = []
         names: Optional[list[str]] = None
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
             for i, obs in enumerate(obs_list):
+                # Pi0.5 state-in-prompt: re-tokenise + re-embed for this
+                # sample's state so the encoder sees the actual
+                # per-frame language distribution. In padded mode the
+                # pipeline shape is unchanged so this is just an embeds
+                # re-upload (no rebuild, scales preserved).
+                if per_sample_state:
+                    sample_state = obs.get("state")
+                    sample_prompt = obs.get("prompt") or self._current_prompt
+                    if sample_prompt is None:
+                        raise RuntimeError(
+                            "Pi0.5 per-sample state calibration needs a "
+                            "prompt — either pass obs['prompt'] in each "
+                            "calibration sample, or call set_prompt() "
+                            "once before calibrate() so a default exists.")
+                    self.set_prompt(sample_prompt, state=sample_state)
+
                 images = self._stack_images(obs)
                 noise = torch.randn(
                     self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")

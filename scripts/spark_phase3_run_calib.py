@@ -79,7 +79,13 @@ def main() -> int:
                         help="amax reduction percentile (default 99.9)")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Cap on samples used (default: all in npz)")
-    parser.add_argument("--num-views", type=int, default=2)
+    parser.add_argument("--num-views", type=int, default=3,
+                        help="Camera count. OpenArm = 3 "
+                             "(cam_high + left_wrist + right_wrist).")
+    parser.add_argument("--robot-action-dim", type=int, default=None,
+                        help="Override per-call slice. Default uses "
+                             "$FLASHRT_ROBOT_ACTION_DIM or LIBERO=7. "
+                             "Set 16 for OpenArm bimanual.")
     args = parser.parse_args()
 
     ckpt = Path(args.checkpoint)
@@ -93,25 +99,63 @@ def main() -> int:
 
     failures: list[str] = []
 
-    # Load calib samples.
+    # Load calib samples. Two npz schemas are supported:
+    #   - legacy (LIBERO-style): {images, wrist_images, prompts, ...}
+    #     2 cams, no state.
+    #   - openarm v4 (current spark_phase3_prepare_calib output):
+    #     {images_ego, images_left, images_right, state, prompts, ...}
+    #     3 cams + 16-dim state.
     data = np.load(npz, allow_pickle=True)
-    images = data["images"]
-    wrists = data["wrist_images"]
-    prompts = data["prompts"]
+    keys = list(data.files)
+    if "images_ego" in keys:
+        per_cam = [data["images_ego"]]
+        if "images_left" in keys:
+            per_cam.append(data["images_left"])
+        if "images_right" in keys:
+            per_cam.append(data["images_right"])
+        prompts = data["prompts"]
+        state = data["state"] if "state" in keys else None
+    elif "images" in keys:
+        per_cam = [data["images"]]
+        if "wrist_images" in keys:
+            per_cam.append(data["wrist_images"])
+        prompts = data["prompts"]
+        state = None
+    else:
+        _fail("calib data", f"unrecognised npz schema (keys={keys})")
+        return 1
+
+    # Trim per --num-views and --max-samples.
+    per_cam = per_cam[: args.num_views]
     if args.max_samples is not None:
-        images = images[: args.max_samples]
-        wrists = wrists[: args.max_samples]
+        per_cam = [arr[: args.max_samples] for arr in per_cam]
         prompts = prompts[: args.max_samples]
-    n = len(images)
+        if state is not None:
+            state = state[: args.max_samples]
+
+    n = len(per_cam[0])
     if n == 0:
         _fail("calib data", "0 samples")
         return 1
-    _pass("calib data", f"{n} samples, image shape={images[0].shape}")
+    _pass("calib data",
+          f"{n} samples, {len(per_cam)} cams, "
+          f"image shape={per_cam[0][0].shape}")
 
-    # Build observation dicts.
+    # Build FlashRT observation dicts. Use the multi-view 'images' list
+    # form so the rtx pipeline picks up all num_views slots; the
+    # singular 'image'/'wrist_image'/'wrist_image_right' keys are
+    # populated as a fallback for older code paths.
     obs_list: list[dict] = []
-    for img, wrist in zip(images, wrists):
-        obs_list.append({"image": img, "wrist_image": wrist})
+    for i in range(n):
+        imgs = [per_cam[k][i] for k in range(len(per_cam))]
+        obs = {"images": imgs, "image": imgs[0]}
+        if len(imgs) >= 2:
+            obs["wrist_image"] = imgs[1]
+        if len(imgs) >= 3:
+            obs["wrist_image_right"] = imgs[2]
+        if state is not None:
+            obs["state"] = state[i]
+        obs_list.append(obs)
 
     # Load the model.
     try:
@@ -155,50 +199,74 @@ def main() -> int:
         traceback.print_exc()
         return 1
 
-    # Inspect cached scales.
+    # Inspect calibration results. The real Pi05Pipeline surfaces:
+    #   pipeline.fp8_calibrated   bool (set True after first calibrate_fp8)
+    #   pipeline.fp8_act_scales   dict[str, CudaBuffer]  (one f32 per GEMM)
     pipeline = model._pipe.pipeline
-    scale_attrs = [
-        "_enc_calib_scales", "_dec_calib_scales",
-        "_enc_alpha_host", "_dec_alpha_host",
-    ]
-    found_any = False
-    for attr in scale_attrs:
-        scales = getattr(pipeline, attr, None) or getattr(model._pipe, attr, None)
-        if scales is None:
-            continue
-        found_any = True
-        arr = np.asarray(scales).flatten()
-        if len(arr) == 0:
-            continue
-        n_zero = int((arr == 0.0).sum())
-        n_inf = int((~np.isfinite(arr)).sum())
-        n_sat = int((arr >= 1.0 - 1e-3).sum())  # alpha ~ 1 means amax ≈ 448 ≈ FP8 max
-        msg = f"n={len(arr)} min={arr.min():.4e} med={np.median(arr):.4e} max={arr.max():.4e}"
-        if n_zero or n_inf or n_sat:
-            _warn(f"scales[{attr}]", f"{msg} | zero={n_zero} nonfinite={n_inf} near-saturate={n_sat}")
-            if n_zero or n_inf:
-                failures.append(f"{attr}_bad")
-        else:
-            _pass(f"scales[{attr}]", msg)
-    if not found_any:
-        _warn("scale inspection", "no scale attrs on the pipeline (internal API drift); skipping")
-
-    # Locate the persistent calibration cache.
-    cache_root = Path(os.path.expanduser("~/.flash_rt/calibration"))
-    if cache_root.is_dir():
-        latest = sorted(cache_root.glob("*.json"), key=lambda p: p.stat().st_mtime)
-        if latest:
-            _pass("calibration cache", str(latest[-1]))
-        else:
-            _warn("calibration cache", f"no .json found under {cache_root}")
+    if not getattr(pipeline, "fp8_calibrated", False):
+        _fail("fp8 calibration", "pipeline.fp8_calibrated stayed False")
+        failures.append("not_calibrated")
     else:
-        _warn("calibration cache", f"{cache_root} does not exist (no on-disk cache produced)")
+        scales_dict = getattr(pipeline, "fp8_act_scales", None) or {}
+        # Bring each 4-byte CudaBuffer back to host so we can run
+        # finite/zero/saturate checks. host_copy() is FlashRT's canonical
+        # device->host fetch; falls back to ctypes if absent.
+        host_vals: list[float] = []
+        for key, buf in scales_dict.items():
+            try:
+                if hasattr(buf, "host_copy"):
+                    arr = np.asarray(buf.host_copy()).view(np.float32)
+                elif hasattr(buf, "to_numpy"):
+                    arr = buf.to_numpy().view(np.float32)
+                else:
+                    # Last resort: pull 4 bytes from the device pointer.
+                    import ctypes
+                    raw = (ctypes.c_float * 1)()
+                    model._pipe._cudart.cudaMemcpy(
+                        ctypes.byref(raw),
+                        ctypes.c_void_p(buf.ptr.value),
+                        4, 2)  # cudaMemcpyDeviceToHost
+                    arr = np.asarray([raw[0]], dtype=np.float32)
+                host_vals.append(float(arr.flatten()[0]))
+            except Exception as e:
+                print(f"  WARN: could not read scale for {key}: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
 
-    # Sample inference.
+        vals = np.asarray(host_vals, dtype=np.float32) if host_vals else np.zeros(0)
+        n_zero = int((vals == 0.0).sum())
+        n_inf = int((~np.isfinite(vals)).sum())
+        # FlashRT stores each scale as approximately amax / FP8_E4M3_MAX
+        # (median ~0.03 corresponds to amax ~14 on bf16-scale activations).
+        # A scale >= 1.0 means the recorded amax already meets or exceeds
+        # FP8's representable range, so any peak above the calibration
+        # sample saturates and loses precision; >= 0.5 leaves <2x headroom.
+        n_sat = int((vals >= 1.0).sum())
+        n_tight = int(((vals >= 0.5) & (vals < 1.0)).sum())
+        msg = (f"n={len(vals)} min={vals.min() if len(vals) else 0:.4e} "
+               f"med={float(np.median(vals)) if len(vals) else 0:.4e} "
+               f"max={vals.max() if len(vals) else 0:.4e}")
+        if n_zero or n_inf:
+            _fail("fp8 scales", f"{msg} | zero={n_zero} nonfinite={n_inf}")
+            failures.append("scale_bad")
+        elif n_sat:
+            _warn("fp8 scales", f"{msg} | saturating={n_sat} (amax >= "
+                  f"FP8 E4M3 max=448), tight-headroom={n_tight} "
+                  f"(amax in [224, 448)); these layers lose FP8 precision "
+                  f"on activations above the calibration peak")
+        elif n_tight:
+            _warn("fp8 scales", f"{msg} | tight-headroom={n_tight} "
+                  f"(amax in [224, 448)); within FP8 range but <2x "
+                  f"safety margin")
+        else:
+            _pass("fp8 scales",
+                  f"{msg}, sites={len(scales_dict)}, all finite, no saturation")
+
+    # Sample inference using all configured cameras + the matching
+    # prompt for sample 0.
     try:
         t0 = time.perf_counter()
         actions = model.predict(
-            images=[images[0], wrists[0]],
+            images=[per_cam[k][0] for k in range(len(per_cam))],
             prompt=first_prompt,
         )
         elapsed = time.perf_counter() - t0

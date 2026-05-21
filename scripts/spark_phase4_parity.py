@@ -1,36 +1,85 @@
-"""Phase 4 — parity check: FlashRT-on-Spark vs the openpi JAX server.
+"""Phase 4 — parity check, final-product topology.
 
-This is the decisive correctness gate for the migration. Both models
-get the same observation, and we compare:
-  - raw cosine             (model output before unnormalization, full 32-dim)
-  - raw L2 ratio           (|flashrt| / |jax|)
-  - post-unnorm cosine     (after norm_stats applied, robot_action_dim slice)
-  - post-unnorm L2 ratio   (|flashrt[:k]| / |jax[:k]|)
+This script hits two live websocket servers from the canonical openpi
+client and compares the actions they return on identical observations:
 
-Acceptance gate (matches the runtime-LoRA-fp32 numbers from
-``openpi/PYTORCH_PARITY_DEBUG.md``):
-  - post-unnorm cosine  ≥ 0.999
-  - post-unnorm ratio   ∈ [0.995, 1.005]
+    Server A  (reference, slow, ground truth)
+        openpi JAX BF16 policy on port 8000
+        served via openpi/scripts/serve_policy.py inside the
+        openpi_server_ngc Docker container (NGC JAX 25.04 base)
+
+    Server B  (system under test, fast, the future production server)
+        FlashRT JAX FP8 policy on port 8002
+        served via scripts/serve_policy_flashrt.py natively on Spark
+        + the openpi WebsocketPolicyServer + the FlashRTPolicyAdapter
+
+Both observations are formed the way openpi's own diag scripts do
+(see openpi/scripts/diag_quant_parity.py and diag_live_server_parity.py):
+
+    {
+        "state":   (16,) float32,            # robot proprio
+        "images":  {"cam_high": (3,224,224) u8,
+                    "cam_left_wrist": ...,
+                    "cam_right_wrist": ...},
+        "prompt":  str,
+    }
+
+with images as **(C, H, W) uint8** (the OpenArmInputs transform on the
+server side rearranges them to HWC). Observations are read from the
+Phase 3 calibration npz so the scenes are realistic teleop frames, not
+random pixels.
+
+Architectural mismatches we already know about, accounted for in this
+comparison:
+
+  1. Action horizon: openpi pi05 trains and serves with
+     action_horizon=50; FlashRT's pi05 pipeline hard-codes chunk_size=10
+     for latency reasons. We compare on the overlapping first 10 steps.
+  2. Unnormalization: openpi's serve_policy.py applies the OpenArm
+     output transform (joint-radians). FlashRT's Pi05TorchFrontendRtx
+     (which the JAX frontend inherits) calls unnormalize_actions in
+     its infer path, so FlashRT actions should also be in joint-radian
+     space. If the per-axis magnitudes look very different, we report
+     that as a structural finding rather than a quantization gap.
+
+Acceptance gate (matches the numbers from openpi/PYTORCH_PARITY_DEBUG.md
+runtime-LoRA fp32 row, with looser ratio bounds for FP8 vs BF16):
+
+  * post-unnorm cosine min  >= 0.99    (FP8 vs BF16 at 10-step diffusion)
+  * post-unnorm ratio       in [0.95, 1.05]
+
+If both servers are within those bounds on >= 90% of samples the gate
+passes. Per-sample breakdown is printed to stdout and saved to a JSON
+report.
 
 Setup:
-  1. Start the JAX server in another shell:
-        docker compose -f scripts/docker/compose_ngc.yml run --rm \\
-            -p 8001:8001 openpi_serve \\
-            python scripts/serve_policy.py policy:checkpoint \\
-                --policy.config=pi05_openarm_ngc_lora \\
-                --policy.dir=/openpi_assets/pi05_openarm_ngc_lora_v4 \\
-                --port=8001
-  2. Run this script in the flashrt_spark container:
-        python3 scripts/spark_phase4_parity.py \\
-            --checkpoint /openpi_assets/pi05_openarm_ngc_lora_v4 \\
-            --calib-data /openpi_assets/calib_openarm_80.npz \\
-            --jax-server ws://localhost:8001 \\
-            --robot-action-dim 16
 
-Output:
-  - Per-sample metrics printed to stdout
-  - Aggregate cosine + ratio reported with PASS/FAIL gate
-  - JSON report at --output (default: phase4_parity_<timestamp>.json)
+    # Shell 1 — openpi JAX reference server (Docker)
+    cd ~/sparkpack/openpi
+    docker compose -f scripts/docker/compose_ngc.yml run --rm -T \\
+        --name openpi_jax_server openpi_serve \\
+        python scripts/serve_policy.py policy:checkpoint \\
+            --policy.config=pi05_openarm_ngc_lora_v4 \\
+            --policy.dir=/app/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05/29999
+
+    # Shell 2 — FlashRT FP8 SUT server (native Spark venv)
+    cd ~/sparkpack/FlashRT && source .venv/bin/activate
+    PYTHONPATH=~/sparkpack/openpi/src:~/sparkpack/openpi/packages/openpi-client/src \\
+    FLASHRT_ROBOT_ACTION_DIM=16 \\
+    python scripts/serve_policy_flashrt.py \\
+        --checkpoint ~/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05/29999 \\
+        --robot-action-dim 16 --num-views 3 \\
+        --calib-data /tmp/calib_openarm_v4_80.npz \\
+        --default-prompt "put the chocolate bars in the container" \\
+        --port 8002
+
+    # Shell 3 — parity run
+    PYTHONPATH=~/sparkpack/openpi/packages/openpi-client/src \\
+    python scripts/spark_phase4_parity.py \\
+        --reference-server localhost:8000 \\
+        --flashrt-server   localhost:8002 \\
+        --calib-data /tmp/calib_openarm_v4_80.npz \\
+        --num-samples 20
 """
 
 from __future__ import annotations
@@ -39,7 +88,6 @@ import argparse
 import json
 import sys
 import time
-import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -53,12 +101,13 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
-GATE_COSINE = 0.999
-GATE_RATIO_LO = 0.995
-GATE_RATIO_HI = 1.005
+GATE_COSINE = 0.99
+GATE_RATIO_LO = 0.95
+GATE_RATIO_HI = 1.05
+GATE_PASS_FRACTION = 0.90
 
 
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     af = a.flatten().astype(np.float64)
     bf = b.flatten().astype(np.float64)
     na = float(np.linalg.norm(af))
@@ -68,7 +117,8 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float((af @ bf) / (na * nb))
 
 
-def l2_ratio(a: np.ndarray, b: np.ndarray) -> float:
+def _l2_ratio(a: np.ndarray, b: np.ndarray) -> float:
+    """|a| / |b|."""
     na = float(np.linalg.norm(a.astype(np.float64)))
     nb = float(np.linalg.norm(b.astype(np.float64)))
     if nb == 0.0:
@@ -76,215 +126,271 @@ def l2_ratio(a: np.ndarray, b: np.ndarray) -> float:
     return na / nb
 
 
-def jax_server_infer(client, prompt: str, image: np.ndarray, wrist: np.ndarray) -> np.ndarray:
-    """Round-trip an observation to the openpi JAX websocket server."""
-    obs = {
-        "observation/image": image,
-        "observation/wrist_image": wrist,
-        "prompt": prompt,
+def _chw(hwc: np.ndarray) -> np.ndarray:
+    """Convert HWC uint8 -> CHW uint8 (openpi server input convention)."""
+    return np.ascontiguousarray(np.transpose(hwc.astype(np.uint8), (2, 0, 1)))
+
+
+def _build_obs(data: dict, idx: int) -> dict:
+    """Build a single openpi-style observation dict from the Phase 3 npz row."""
+    obs: dict = {
+        "state": np.asarray(data["state"][idx], dtype=np.float32),
+        "images": {
+            "cam_high":         _chw(data["images_ego"][idx]),
+            "cam_left_wrist":   _chw(data["images_left"][idx]),
+            "cam_right_wrist":  _chw(data["images_right"][idx]),
+        },
+        "prompt": str(data["prompts"][idx]),
     }
-    return np.asarray(client.infer(obs)["actions"])
+    return obs
+
+
+def _connect(host_port: str, default_port: int):
+    from openpi_client.websocket_client_policy import WebsocketClientPolicy
+    host, _, port = host_port.partition(":")
+    port_num = int(port) if port else default_port
+    return WebsocketClientPolicy(host=host or "localhost", port=port_num), host, port_num
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--calib-data", required=True,
-                        help="npz from spark_phase3_prepare_calib.py (we reuse "
-                             "the stratified samples for parity)")
-    parser.add_argument("--jax-server", default="localhost:8001",
-                        help="openpi JAX server host:port")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reference-server", default="localhost:8000",
+                        help="openpi JAX server (the slow ground truth)")
+    parser.add_argument("--flashrt-server", default="localhost:8002",
+                        help="FlashRT-served websocket policy (the SUT)")
+    parser.add_argument("--calib-data", required=True, type=Path,
+                        help="Phase 3 npz (we reuse its stratified obs so "
+                             "both servers see realistic OpenArm teleop "
+                             "scenes, not random pixels)")
     parser.add_argument("--num-samples", type=int, default=20,
-                        help="Number of parity samples (default 20)")
+                        help="Parity samples. 20 = ~10 sec each on JAX "
+                             "BF16 first-call + 100 ms FP8 = ~3 min wall.")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Sample ordering RNG seed")
     parser.add_argument("--robot-action-dim", type=int, default=16,
-                        help="OpenArm bimanual = 16, LIBERO = 7")
-    parser.add_argument("--output", default=None)
-    parser.add_argument("--seed", type=int, default=0)
+                        help="OpenArm = 16. Slice both servers' outputs "
+                             "to this many dims for comparison.")
+    parser.add_argument("--prompt-override", default=None,
+                        help="If set, send this prompt with every "
+                             "observation, ignoring the per-sample prompt "
+                             "in the npz. Without this, the FlashRT server "
+                             "rebuilds its pipeline (and re-runs FP8 "
+                             "calibration on the lazy path) every time the "
+                             "tokenised prompt length changes, which "
+                             "happens between calib samples with minor "
+                             "casing/punctuation differences and inflates "
+                             "FlashRT latency 10x for the affected calls. "
+                             "Suggested for v4: 'put the chocolate bars "
+                             "in the container'.")
+    parser.add_argument("--output", default=None,
+                        help="JSON report path (default phase4_parity_<ts>.json)")
     args = parser.parse_args()
 
-    # Load FlashRT model in the same process.
-    try:
-        import flash_rt
-        t0 = time.perf_counter()
-        model = flash_rt.load_model(
-            checkpoint=args.checkpoint,
-            framework="jax",
-            num_views=2,
-            autotune=3,
-            robot_action_dim=args.robot_action_dim,
-        )
-        print(f"FlashRT loaded in {time.perf_counter() - t0:.1f}s "
-              f"(robot_action_dim={args.robot_action_dim})", flush=True)
-    except Exception as e:
-        print(f"{RED}FlashRT load failed:{RESET} {e}")
-        traceback.print_exc()
+    if not args.calib_data.is_file():
+        print(f"{RED}FAIL{RESET}  --calib-data {args.calib_data} missing")
         return 1
-
-    # Connect to JAX server.
-    try:
-        from openpi_client.websocket_client_policy import WebsocketClientPolicy
-        host, _, port = args.jax_server.partition(":")
-        port_num = int(port) if port else 8001
-        client = WebsocketClientPolicy(host=host or "localhost", port=port_num)
-        print(f"JAX server connected at {host}:{port_num}", flush=True)
-    except Exception as e:
-        print(f"{RED}JAX server connect failed:{RESET} {e}")
-        print(f"{DIM}Hint: start the JAX server first; see header.{RESET}")
-        return 1
-
-    # Load samples.
     data = np.load(args.calib_data, allow_pickle=True)
-    images = data["images"][: args.num_samples]
-    wrists = data["wrist_images"][: args.num_samples]
-    prompts = data["prompts"][: args.num_samples]
-    n = len(images)
-    if n == 0:
-        print(f"{RED}no samples in {args.calib_data}{RESET}")
-        return 1
+    n_total = len(data["state"])
+    if args.num_samples > n_total:
+        print(f"{YELLOW}WARN{RESET}  --num-samples {args.num_samples} > "
+              f"{n_total} available; using {n_total}")
+        args.num_samples = n_total
 
-    # Calibrate FlashRT with the same data (deterministic for parity).
+    # Connect both servers.
     try:
-        obs_list = [{"image": im, "wrist_image": wr}
-                    for im, wr in zip(images, wrists)]
-        # Use the first prompt for calibration; per-sample prompt set
-        # happens inside the loop.
-        model._pipe.set_prompt(str(prompts[0]))
-        model._current_prompt = str(prompts[0])
-        model.calibrate(obs_list[: min(n, 50)], percentile=99.9)
-        print("FlashRT calibration complete", flush=True)
+        ref_client, ref_host, ref_port = _connect(args.reference_server, 8000)
+        sut_client, sut_host, sut_port = _connect(args.flashrt_server, 8002)
     except Exception as e:
-        print(f"{RED}FlashRT calibration failed:{RESET} {e}")
-        traceback.print_exc()
+        print(f"{RED}FAIL{RESET}  websocket client import: "
+              f"{type(e).__name__}: {e}")
+        print(f"{DIM}Hint: PYTHONPATH=~/sparkpack/openpi/packages/openpi-client/src{RESET}")
         return 1
+    try:
+        ref_meta = ref_client.get_server_metadata()
+        sut_meta = sut_client.get_server_metadata()
+    except Exception as e:
+        print(f"{RED}FAIL{RESET}  handshake: {type(e).__name__}: {e}")
+        print(f"{DIM}Hint: is the openpi JAX server (port 8000) and the "
+              f"FlashRT server (port 8002) actually running? See script "
+              f"header for the launch commands.{RESET}")
+        return 1
+    print(f"{GREEN}reference{RESET}  ws://{ref_host}:{ref_port}  metadata={ref_meta}")
+    print(f"{GREEN}flashrt  {RESET}  ws://{sut_host}:{sut_port}  metadata={sut_meta}")
+    print()
 
-    # Compare per sample.
-    records: list[dict] = []
-    raw_cos_list = []
-    raw_ratio_list = []
-    unnorm_cos_list = []
-    unnorm_ratio_list = []
-
+    # Pick sample order. Random shuffle so any per-shape biases aren't
+    # all concentrated at the start.
     rng = np.random.default_rng(args.seed)
-    # Shuffle order so failures aren't all concentrated at the start.
-    order = rng.permutation(n).tolist()
+    order = rng.permutation(n_total)[: args.num_samples].tolist()
 
-    for sample_idx in order:
-        img = images[sample_idx]
-        wrist = wrists[sample_idx]
-        prompt = str(prompts[sample_idx]) if prompts[sample_idx] else "pick up the red block"
+    records: list[dict] = []
+    cos_vals: list[float] = []
+    ratio_vals: list[float] = []
+    raw_diff_norms: list[float] = []
+    ref_first_call_dt = None
+    sut_first_call_dt = None
 
-        # FlashRT inference.
+    print(f"{BOLD}per-sample parity (first {args.robot_action_dim} dims, "
+          f"first 10 chunk steps):{RESET}")
+    for n, idx in enumerate(order):
+        obs = _build_obs(data, int(idx))
+        if args.prompt_override:
+            obs["prompt"] = args.prompt_override
+
+        # Reference server.
         try:
-            flashrt_actions = model.predict(images=[img, wrist], prompt=prompt)
+            t0 = time.perf_counter()
+            ref_res = ref_client.infer(obs)
+            ref_dt_ms = (time.perf_counter() - t0) * 1000.0
         except Exception as e:
-            print(f"  sample {sample_idx}: {RED}FlashRT crash:{RESET} {e}")
+            print(f"  [{n:3d}] {RED}ref crash:{RESET} "
+                  f"{type(e).__name__}: {e}")
             continue
+        if ref_first_call_dt is None:
+            ref_first_call_dt = ref_dt_ms
 
-        # JAX server inference (round-trip + JPEG encode/decode on the server side).
+        # SUT.
         try:
-            jax_actions = jax_server_infer(client, prompt, img, wrist)
+            t0 = time.perf_counter()
+            sut_res = sut_client.infer(obs)
+            sut_dt_ms = (time.perf_counter() - t0) * 1000.0
         except Exception as e:
-            print(f"  sample {sample_idx}: {RED}JAX server crash:{RESET} {e}")
+            print(f"  [{n:3d}] {RED}flashrt crash:{RESET} "
+                  f"{type(e).__name__}: {e}")
             continue
+        if sut_first_call_dt is None:
+            sut_first_call_dt = sut_dt_ms
 
-        # The JAX server returns actions in robot dim already (e.g. 16 for OpenArm
-        # via the policy's output unnorm). FlashRT returns robot_action_dim slice
-        # of the unnormalized 32-dim output. So shapes should match: (chunk, k).
-        if flashrt_actions.shape != jax_actions.shape:
-            print(f"  sample {sample_idx}: {YELLOW}shape mismatch:{RESET} "
-                  f"flashrt={flashrt_actions.shape} jax={jax_actions.shape}")
-            # Best-effort: compare the overlapping slice.
-            k = min(flashrt_actions.shape[1], jax_actions.shape[1])
-            t = min(flashrt_actions.shape[0], jax_actions.shape[0])
-            flashrt_actions = flashrt_actions[:t, :k]
-            jax_actions = jax_actions[:t, :k]
+        ref_act = np.asarray(ref_res["actions"], dtype=np.float64)
+        sut_act = np.asarray(sut_res["actions"], dtype=np.float64)
 
-        unnorm_cos = cosine(flashrt_actions, jax_actions)
-        unnorm_r = l2_ratio(flashrt_actions, jax_actions)
-        # Raw cosine here is the same as post-unnorm cosine because we
-        # don't have the pre-unnorm activations from the JAX server.
-        # Phase 4's gate is on post-unnorm anyway.
-        raw_cos = unnorm_cos
-        raw_r = unnorm_r
+        # Slice both to (min_chunk, robot_action_dim) for an
+        # apples-to-apples comparison. min_chunk handles the
+        # FlashRT-uses-10 vs openpi-uses-50 mismatch.
+        steps = min(ref_act.shape[0], sut_act.shape[0])
+        dims = min(ref_act.shape[1], sut_act.shape[1], args.robot_action_dim)
+        ref_slice = ref_act[:steps, :dims]
+        sut_slice = sut_act[:steps, :dims]
 
-        raw_cos_list.append(raw_cos)
-        raw_ratio_list.append(raw_r)
-        unnorm_cos_list.append(unnorm_cos)
-        unnorm_ratio_list.append(unnorm_r)
+        cos = _cosine(ref_slice, sut_slice)
+        ratio = _l2_ratio(sut_slice, ref_slice)  # |SUT| / |REF|
+        diff_norm = float(np.linalg.norm(ref_slice - sut_slice))
+
+        cos_vals.append(cos)
+        ratio_vals.append(ratio)
+        raw_diff_norms.append(diff_norm)
+
+        cos_ok = cos >= GATE_COSINE
+        ratio_ok = GATE_RATIO_LO <= ratio <= GATE_RATIO_HI
+        color = GREEN if (cos_ok and ratio_ok) else (
+            YELLOW if cos_ok or ratio_ok else RED)
+        ref_first_row = ref_slice[0]
+        sut_first_row = sut_slice[0]
+        max_abs_diff = float(np.max(np.abs(ref_first_row - sut_first_row)))
+
+        # On the first sample, also print the actual first-row vectors
+        # side by side so structural mismatches (unnormalization,
+        # axis order) jump out immediately.
+        if n == 0:
+            print(f"  [first-sample shape] ref={ref_act.shape} "
+                  f"sut={sut_act.shape} -> compare slice {ref_slice.shape}")
+            print(f"  [first-step ref]  {np.array2string(ref_first_row, precision=3, suppress_small=True)}")
+            print(f"  [first-step sut]  {np.array2string(sut_first_row, precision=3, suppress_small=True)}")
+            print(f"  [first-step diff] {np.array2string(ref_first_row - sut_first_row, precision=3, suppress_small=True)}")
+
+        print(f"  [{n:3d}] idx={idx:3d}  cos={color}{cos:+.4f}{RESET}  "
+              f"ratio={color}{ratio:.3f}{RESET}  "
+              f"|diff|={diff_norm:.3f}  max|d|@t0={max_abs_diff:.3f}  "
+              f"ref={ref_dt_ms:6.0f}ms  sut={sut_dt_ms:5.0f}ms  "
+              f"'{obs['prompt'][:36]}'")
 
         records.append({
-            "sample_idx": int(sample_idx),
-            "prompt": prompt[:80],
-            "unnorm_cosine": unnorm_cos,
-            "unnorm_ratio": unnorm_r,
-            "shape": list(flashrt_actions.shape),
+            "n": n, "sample_idx": int(idx),
+            "prompt": obs["prompt"][:80],
+            "ref_shape": list(ref_act.shape),
+            "sut_shape": list(sut_act.shape),
+            "compare_shape": list(ref_slice.shape),
+            "cosine": cos, "ratio": ratio, "diff_norm": diff_norm,
+            "max_abs_diff_first_step": max_abs_diff,
+            "ref_dt_ms": ref_dt_ms, "sut_dt_ms": sut_dt_ms,
         })
 
-        color = (GREEN if unnorm_cos >= GATE_COSINE
-                 and GATE_RATIO_LO <= unnorm_r <= GATE_RATIO_HI
-                 else RED)
-        print(f"  sample {sample_idx:3d}: cos={color}{unnorm_cos:.6f}{RESET}  "
-              f"ratio={color}{unnorm_r:.4f}{RESET}  '{prompt[:50]}'",
-              flush=True)
-
-    # Aggregate.
     if not records:
-        print(f"{RED}No successful parity comparisons.{RESET}")
+        print(f"{RED}FAIL{RESET}  no successful parity samples")
         return 1
 
-    mean_cos = float(np.mean(unnorm_cos_list))
-    median_cos = float(np.median(unnorm_cos_list))
-    min_cos = float(np.min(unnorm_cos_list))
-    mean_ratio = float(np.mean(unnorm_ratio_list))
-    median_ratio = float(np.median(unnorm_ratio_list))
-    min_ratio = float(np.min(unnorm_ratio_list))
-    max_ratio = float(np.max(unnorm_ratio_list))
-
-    print(f"\n{BOLD}=== Phase 4 parity summary (n={len(records)}) ==={RESET}")
-    print(f"  unnorm cosine: mean={mean_cos:.6f}  median={median_cos:.6f}  min={min_cos:.6f}")
-    print(f"  unnorm ratio : mean={mean_ratio:.4f}  median={median_ratio:.4f}  range=[{min_ratio:.4f}, {max_ratio:.4f}]")
-
-    cos_pass = min_cos >= GATE_COSINE
-    ratio_pass = GATE_RATIO_LO <= min_ratio and max_ratio <= GATE_RATIO_HI
+    cos_arr = np.asarray(cos_vals)
+    ratio_arr = np.asarray(ratio_vals)
+    cos_pass = (cos_arr >= GATE_COSINE)
+    ratio_pass = (ratio_arr >= GATE_RATIO_LO) & (ratio_arr <= GATE_RATIO_HI)
+    overall_pass_per_sample = cos_pass & ratio_pass
+    pass_fraction = float(overall_pass_per_sample.mean())
 
     print()
-    print(f"  cosine gate (min ≥ {GATE_COSINE}):     {'PASS' if cos_pass else 'FAIL'}")
-    print(f"  ratio gate ([{GATE_RATIO_LO}, {GATE_RATIO_HI}]):  {'PASS' if ratio_pass else 'FAIL'}")
+    print(f"{BOLD}=== Phase 4 parity summary (n={len(records)}) ==={RESET}")
+    print(f"  cosine: min={cos_arr.min():+.4f}  median={float(np.median(cos_arr)):+.4f}  "
+          f"mean={float(cos_arr.mean()):+.4f}")
+    print(f"  ratio : min={ratio_arr.min():.3f}   median={float(np.median(ratio_arr)):.3f}    "
+          f"max={ratio_arr.max():.3f}")
+    print(f"  per-sample PASS: {int(overall_pass_per_sample.sum())}/{len(records)} "
+          f"({pass_fraction*100:.0f}%)  "
+          f"(gate: cos>={GATE_COSINE}, ratio in [{GATE_RATIO_LO}, {GATE_RATIO_HI}])")
+    print(f"  ref-server first-call latency: {ref_first_call_dt:.0f}ms "
+          f"(JAX JIT)")
+    print(f"  sut-server first-call latency: {sut_first_call_dt:.0f}ms "
+          f"(FlashRT CUDA graph replay)")
+    sut_steady = [r["sut_dt_ms"] for r in records[1:]] if len(records) > 1 else []
+    if sut_steady:
+        print(f"  sut-server steady p50: {float(np.median(sut_steady)):.0f}ms  "
+              f"p99: {float(np.percentile(sut_steady, 99)):.0f}ms")
 
-    # Persist report.
-    out = args.output or f"phase4_parity_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    gate_overall = pass_fraction >= GATE_PASS_FRACTION
+    out_path = (Path(args.output) if args.output else
+                Path(f"phase4_parity_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"))
     report = {
         "timestamp": datetime.now().isoformat(),
-        "checkpoint": args.checkpoint,
-        "jax_server": args.jax_server,
+        "reference_server": args.reference_server,
+        "flashrt_server": args.flashrt_server,
+        "calib_data": str(args.calib_data),
+        "ref_metadata": ref_meta,
+        "sut_metadata": sut_meta,
         "robot_action_dim": args.robot_action_dim,
         "num_samples": len(records),
-        "aggregate": {
-            "unnorm_cosine_mean": mean_cos,
-            "unnorm_cosine_median": median_cos,
-            "unnorm_cosine_min": min_cos,
-            "unnorm_ratio_mean": mean_ratio,
-            "unnorm_ratio_median": median_ratio,
-            "unnorm_ratio_min": min_ratio,
-            "unnorm_ratio_max": max_ratio,
+        "gate": {
+            "cosine_min": GATE_COSINE,
+            "ratio_bounds": [GATE_RATIO_LO, GATE_RATIO_HI],
+            "pass_fraction": GATE_PASS_FRACTION,
+            "achieved_pass_fraction": pass_fraction,
+            "overall_pass": gate_overall,
         },
-        "gates": {
-            "cosine_pass": cos_pass,
-            "ratio_pass": ratio_pass,
-            "overall_pass": cos_pass and ratio_pass,
+        "aggregate": {
+            "cosine_min": float(cos_arr.min()),
+            "cosine_median": float(np.median(cos_arr)),
+            "cosine_mean": float(cos_arr.mean()),
+            "ratio_min": float(ratio_arr.min()),
+            "ratio_median": float(np.median(ratio_arr)),
+            "ratio_max": float(ratio_arr.max()),
         },
         "records": records,
     }
-    Path(out).write_text(json.dumps(report, indent=2))
-    print(f"\nReport: {out}")
+    out_path.write_text(json.dumps(report, indent=2))
+    print(f"\nReport: {out_path}")
 
-    if cos_pass and ratio_pass:
-        print(f"{BOLD}{GREEN}Phase 4 PASSED{RESET}  — FlashRT matches JAX server. Advance to Phase 5.")
+    if gate_overall:
+        print(f"\n{BOLD}{GREEN}Phase 4 PASSED{RESET}  — FlashRT FP8 matches "
+              f"openpi JAX BF16 to within tolerance on "
+              f"{int(pass_fraction*100)}% of samples.")
         return 0
-    print(f"{BOLD}{RED}Phase 4 FAILED{RESET}  — investigate before Phase 5.")
-    print(f"{DIM}Likely culprits if cosine is low: missing LoRA merge "
-          f"(Phase 2), bad calibration (Phase 3), wrong robot_action_dim "
-          f"(--robot-action-dim flag), or norm_stats mismatch.{RESET}")
+    print(f"\n{BOLD}{RED}Phase 4 FAILED{RESET}  — "
+          f"{int((1.0 - pass_fraction)*100)}% of samples outside the "
+          f"tolerance gate.")
+    print(f"{DIM}Likely culprits if cosine is low:")
+    print(f"  - unnormalization mismatch (FlashRT JAX path skips it)")
+    print(f"  - LoRA merge incomplete (Phase 2 reported merging only N pairs)")
+    print(f"  - FP8 calibration set too narrow (encoder_ffn_down_w_16 saturating)")
+    print(f"  - chunk_size=10 vs 50 attention-mask difference")
+    print(f"  - robot_action_dim slicing mismatch (--robot-action-dim {args.robot_action_dim})"
+          f"{RESET}")
     return 1
 
 

@@ -339,21 +339,53 @@ def lerobot_candidates(checkpoint_dir: pathlib.Path) -> list[pathlib.Path]:
 def pi05_candidates(checkpoint_dir: pathlib.Path) -> list[pathlib.Path]:
     """Common norm-stats locations for Pi0.5 checkpoints.
 
-    Supports both the original ``pi05_libero`` openpi layout and the
-    ``pi05_droid`` / ``pi05_droid_pytorch`` layout used by DROID
-    checkpoints. The latter stores stats under ``assets/droid`` instead
-    of ``assets/physical-intelligence/libero``.
+    Supports the original ``pi05_libero`` openpi layout
+    (``assets/physical-intelligence/libero``), the ``pi05_droid`` /
+    ``pi05_droid_pytorch`` layout (``assets/droid``), and the OpenArm
+    fine-tunes (``assets/openarm``). For new robot embodiments a
+    generic ``assets/<asset_id>/norm_stats.json`` glob fallback also
+    fires — that picks up any single ``assets/<dir>/norm_stats.json``
+    sitting under the checkpoint without requiring a code change here.
+
+    Order matters: checkpoint-local candidates come BEFORE the
+    ``~/.cache/openpi`` fallbacks so that a robot-specific checkpoint
+    is never silently unnormalized with another robot's stats (a real
+    bug we hit on OpenArm before this docstring existed — a 16-DOF
+    OpenArm action would get unnormalized with the LIBERO 7-DOF stats
+    that happened to be in the user's cache from a prior phase).
     """
     home = pathlib.Path.home()
-    return [
+    explicit_local = [
+        checkpoint_dir / "assets" / "openarm" / "norm_stats.json",
         checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
         checkpoint_dir / "assets" / "droid" / "norm_stats.json",
         checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
         checkpoint_dir.parent / "pi05_droid" / "assets" / "droid" / "norm_stats.json",
         checkpoint_dir.parent / "pi05_droid_pytorch" / "assets" / "droid" / "norm_stats.json",
         checkpoint_dir / "norm_stats.json",
+    ]
+    # Generic fallback: any other named asset folder under the checkpoint.
+    # Excludes the ones we already listed explicitly to keep the ordering
+    # deterministic (and to avoid hiding a deliberate cache hit if the
+    # user really wants the LIBERO stats on a LIBERO ckpt).
+    glob_local: list[pathlib.Path] = []
+    assets = checkpoint_dir / "assets"
+    if assets.is_dir():
+        seen = {p.resolve() for p in explicit_local if p.is_file()}
+        for d in sorted(assets.iterdir()):
+            if not d.is_dir():
+                continue
+            cand = d / "norm_stats.json"
+            if cand.is_file() and cand.resolve() not in seen:
+                glob_local.append(cand)
+    cache_fallback = [
         home / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
         home / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_droid" / "assets" / "droid" / "norm_stats.json",
         home / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_droid_pytorch" / "assets" / "droid" / "norm_stats.json",
+    ]
+    return [
+        *explicit_local,
+        *glob_local,
+        *cache_fallback,
         *lerobot_candidates(checkpoint_dir),
     ]

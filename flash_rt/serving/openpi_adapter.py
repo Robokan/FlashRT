@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -285,19 +285,27 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
                 )
             prompt = self._default_prompt
 
-        actions = self._model.predict(images=images, prompt=str(prompt))
+        # Extract state once: it's needed both for the model (Pi0/Pi0.5
+        # state input) and for the delta-action AbsoluteActions transform
+        # below. Avoid two scans of the obs dict.
+        state_raw = _extract_first(obs, _STATE_CANDIDATES)
+        state_for_model: Optional[np.ndarray] = None
+        if state_raw is not None:
+            state_for_model = np.asarray(state_raw, dtype=np.float32).reshape(-1)
+
+        actions = self._model.predict(
+            images=images, prompt=str(prompt), state=state_for_model)
         actions_np = np.asarray(actions)
 
         if self._delta_action_mask is not None:
-            state_raw = _extract_first(obs, _STATE_CANDIDATES)
-            if state_raw is None:
+            if state_for_model is None:
                 raise KeyError(
                     "FlashRTPolicyAdapter: delta_action_mask is set but no "
                     "'state' / 'observation/state' found in obs. Tried "
                     f"{_STATE_CANDIDATES}. Observed keys: "
                     f"{list(obs.keys())[:20]}"
                 )
-            state_np = np.asarray(state_raw, dtype=actions_np.dtype).reshape(-1)
+            state_np = state_for_model.astype(actions_np.dtype, copy=False)
             mask = self._delta_action_mask
             dims = min(mask.shape[0], state_np.shape[0], actions_np.shape[-1])
             if dims > 0:

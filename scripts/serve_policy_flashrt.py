@@ -77,6 +77,18 @@ def main() -> int:
                              "numerical regression is FP8-induced or lives "
                              "elsewhere in the serving path. Substantially "
                              "slower than FP8 mode.")
+    parser.add_argument("--max-prompt-len", type=int, default=128,
+                        help="PaliGemma token-buffer size. Pi0.5 with "
+                             "discrete_state_input encodes proprioceptive "
+                             "state as text prepended to the prompt; the "
+                             "resulting token count is ~80 for OpenArm "
+                             "16-DOF and ~45 for LIBERO 7-DOF. Default 128 "
+                             "leaves headroom for longer task strings. "
+                             "Plain prompt-only mode (no state input) uses "
+                             "MAX_PROMPT_LEN_DEFAULT=48 internally; the "
+                             "frontend only pads to this larger value when "
+                             "the adapter passes a state field, so LIBERO "
+                             "stays on the fast path.")
     parser.add_argument("--port", type=int, default=8002,
                         help="Websocket port. Default 8002 leaves 8001 free "
                              "for the openpi JAX reference server when "
@@ -104,8 +116,10 @@ def main() -> int:
         return 1
 
     use_fp8 = not args.no_fp8
-    logger.info("Loading FlashRT model from %s (framework=%s, robot_action_dim=%s, use_fp8=%s)",
-                args.checkpoint, args.framework, args.robot_action_dim, use_fp8)
+    logger.info("Loading FlashRT model from %s (framework=%s, robot_action_dim=%s, "
+                "use_fp8=%s, max_prompt_len=%d)",
+                args.checkpoint, args.framework, args.robot_action_dim,
+                use_fp8, args.max_prompt_len)
     model = flash_rt.load_model(
         checkpoint=args.checkpoint,
         framework=args.framework,
@@ -113,6 +127,7 @@ def main() -> int:
         autotune=args.autotune,
         robot_action_dim=args.robot_action_dim,
         use_fp8=use_fp8,
+        max_prompt_len=args.max_prompt_len,
     )
 
     if args.calib_data and not use_fp8:
@@ -178,6 +193,8 @@ def main() -> int:
         "chunk_size": model._pipe.chunk_size,
         "robot_action_dim": model._pipe.robot_action_dim,
         "use_fp8": use_fp8,
+        "max_prompt_len": args.max_prompt_len,
+        "state_in_prompt": True,
     }
     if args.metadata_config:
         import json

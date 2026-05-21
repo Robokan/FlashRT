@@ -62,21 +62,48 @@ class VLAModel:
                     Or a dict with 'image'/'wrist_image' keys.
             prompt: text prompt. Only needed on first call or when changing prompt.
                     If None, reuses the last prompt.
-            state: robot state array (Pi0/Pi0-FAST only). Passed to set_prompt().
-                   Pi0 uses continuous state projection; Pi0-FAST discretizes to text.
+            state: robot state array (physical units; the underlying
+                    pipeline normalises). Used by:
+                    - Pi0 (continuous state_proj path) — uploaded into
+                      ``input_state_buf`` once per inference.
+                    - Pi0.5 (``discrete_state_input`` path) — discretised
+                      into the language prompt as
+                      ``"Task: ..., State: 0 7 32 ...;\\nAction: "``.
+                      Because state changes per-frame, ``set_prompt`` is
+                      re-fired every call when state is given (the Pi0.5
+                      frontend pre-allocates a max-length embed buffer
+                      and uploads new embeds in-place, avoiding the
+                      pipeline rebuild that a token-count change would
+                      otherwise trigger).
+                    - Pi0-FAST — discretises to text.
 
         Returns:
             np.ndarray: actions
         """
-        if prompt is not None and prompt != self._current_prompt:
-            if hasattr(self._pipe, 'set_prompt'):
-                import inspect
-                sig = inspect.signature(self._pipe.set_prompt)
-                if 'state' in sig.parameters:
-                    self._pipe.set_prompt(prompt, state=state)
+        if hasattr(self._pipe, 'set_prompt'):
+            import inspect
+            sig = inspect.signature(self._pipe.set_prompt)
+            pipe_supports_state = 'state' in sig.parameters
+            # Re-fire set_prompt if (a) the prompt text changed, (b) we
+            # have a brand-new pipeline and need to seed it, or (c) the
+            # pipeline consumes per-frame state (Pi0/Pi0.5/Pi0-FAST). In
+            # case (c) the frontend's set_prompt is responsible for
+            # not-rebuilding when only the embed VALUES changed; the
+            # api shouldn't second-guess it.
+            should_set = (
+                (prompt is not None and prompt != self._current_prompt)
+                or (state is not None and pipe_supports_state))
+            if should_set:
+                effective_prompt = prompt or self._current_prompt
+                if effective_prompt is None:
+                    raise ValueError("prompt is required on first call")
+                if pipe_supports_state:
+                    self._pipe.set_prompt(effective_prompt, state=state)
                 else:
-                    self._pipe.set_prompt(prompt)
-            self._current_prompt = prompt
+                    self._pipe.set_prompt(effective_prompt)
+                self._current_prompt = effective_prompt
+            elif self._current_prompt is None:
+                raise ValueError("prompt is required on first call")
         elif self._current_prompt is None:
             raise ValueError("prompt is required on first call")
 
@@ -202,7 +229,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                vision_num_layers=None,
                cache_frames=None,
                use_fp8=True,
-               robot_action_dim=None):
+               robot_action_dim=None,
+               max_prompt_len=None):
     """Load a FlashRT model.
 
     Args:
@@ -276,6 +304,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
+        max_prompt_len: Pi0.5/Pi0 only. Override the PaliGemma language-
+            embed buffer size. Pi0.5 with ``discrete_state_input`` (the
+            default for all pi05 checkpoints, see
+            ``openpi/src/openpi/models/pi0_config.py:29-39``) discretises
+            16-DOF proprioceptive state into the prompt — actual token
+            counts are ~80 for OpenArm bimanual and ~45 for LIBERO 7-DOF,
+            both of which overflow FlashRT's legacy
+            ``MAX_PROMPT_LEN_DEFAULT=48`` silently. Pass 128 (or larger)
+            when serving Pi0.5 against a state-aware adapter.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -415,6 +452,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         # selected frontend supports it (Pi05*FrontendRtx today).
         if robot_action_dim is not None and "robot_action_dim" in sig.parameters:
             kwargs["robot_action_dim"] = robot_action_dim
+        # Pi0.5 discrete_state_input needs the language buffer sized for
+        # ~80-token state-in-prompt sequences (default is 48 = state-blind).
+        if max_prompt_len is not None and "max_prompt_len" in sig.parameters:
+            kwargs["max_prompt_len"] = max_prompt_len
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

@@ -570,25 +570,137 @@ Three findings:
    plumb state through, arm-dim quality should also improve toward
    openpi-normal's 0.009, not just grippers.
 
-Fix scope (estimated ~half day of careful work):
+#### Revised diagnosis: Pi0.5 does NOT use `state_proj` — state is text
 
-1. In the Orbax weight conversion (`jax/pi05_rtx.py`) load
-   `state_proj.weight` / `.bias` into the pipeline's weight dict.
-2. In `flash_rt/models/pi05/pipeline_rtx.py`: add `input_state_buf`,
-   add a state-token projection step at the start of the encoder
-   forward, account for the extra +1 token in attention shape /
-   position-embed indexing, re-capture the CUDA graph.
-3. In `Pi05TorchFrontendRtx.set_prompt` and the JAX sibling: accept
-   `state` argument, upload to `input_state_buf` per inference.
-4. In `flash_rt/api.VLAModel.predict`: pass `state` into `set_prompt`
-   if the underlying pipeline accepts it (already true for Pi0, just
-   needs the Pi0.5 pipeline to accept it).
-5. In `flash_rt/serving/openpi_adapter.py:infer`: extract `state`
-   from obs (already does this for `delta_action_mask`) and pass to
-   `self._model.predict(images=..., prompt=..., state=state)`.
-6. Also handle the LoRA merge for `state_proj` (the OpenArm LoRA may
-   have rank-decomposed updates for this layer; check
-   `training/jax/merge_lora.py`).
+The half-day fix scope above turned out to be the wrong fix entirely.
+A closer reading of `openpi/src/openpi/models/pi0.py:92-99` shows that
+`state_proj` only exists for **Pi0**:
+
+```python
+if config.pi05:
+    self.time_mlp_in = nnx.Linear(...)
+    self.time_mlp_out = nnx.Linear(...)
+else:
+    self.state_proj = nnx.Linear(config.action_dim, ...)
+    self.action_time_mlp_in = nnx.Linear(...)
+    self.action_time_mlp_out = nnx.Linear(...)
+```
+
+For Pi0.5 the state is wired in completely differently —
+`openpi/src/openpi/models/pi0_config.py:29-39`:
+
+```python
+# - the state input is part of the discrete language tokens rather than a
+#   continuous input that is part of the suffix
+pi05: bool = False
+discrete_state_input: bool = None
+def __post_init__(self):
+    if self.discrete_state_input is None:
+        object.__setattr__(self, "discrete_state_input", self.pi05)
+```
+
+The state vector is normalised to [-1, 1], then each dimension is
+`np.digitize`d into 256 bins and the bin indices are formatted as
+text and prepended to the prompt before tokenisation
+(`openpi/src/openpi/models/tokenizer.py:22-29`):
+
+```python
+def tokenize(self, prompt, state=None):
+    if state is not None:
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+        ...
+```
+
+So FlashRT's Pi0.5 path was failing for a much simpler reason than
+"missing `state_proj` weights and encoder rewrite": its
+`flash_rt/frontends/torch/pi05_rtx.py:_embed_prompt` was calling
+`PaligemmaTokenizer.tokenize(prompt_text)` without the `state` kwarg,
+so the state never made it into the language tokens.
+
+#### Fix (committed): state-in-prompt tokenisation
+
+Six small changes — no new pipeline buffers, no encoder rewrite, no
+`state_proj` weight loading needed:
+
+1. `flash_rt/frontends/torch/pi05_rtx.py::_embed_prompt` accepts
+   `state` and `pad_to_max`; passes `state` through to
+   `PaligemmaTokenizer.tokenize`; adds a sentencepiece fallback that
+   replicates openpi's `f"Task: ..., State: ...;\\nAction: "` format
+   for the no-`transformers` case.
+2. `Pi05TorchFrontendRtx.set_prompt` accepts `state`. When provided,
+   normalises raw physical state to [-1, 1] via
+   `self.norm_stats[state]` q01/q99, then re-tokenises and re-embeds
+   per call.
+3. New `_normalize_state_for_prompt` helper mirrors openpi's
+   `Normalize(use_quantiles=True)` (`openpi/src/openpi/transforms.py:144`
+   — Pi0.5 always uses quantile norm via
+   `training/config.py:190`).
+4. `flash_rt.api.VLAModel.predict` re-fires `set_prompt` every call
+   when state is provided (was previously only on prompt-text change),
+   feature-detected via inspect to avoid breaking non-state pipelines.
+5. `flash_rt/serving/openpi_adapter.py:infer` extracts `state` from
+   the obs dict (same source the delta-action-mask path uses) and
+   passes it to `model.predict(images, prompt, state=...)`.
+6. `scripts/serve_policy_flashrt.py` exposes `--max-prompt-len`
+   (default 128, headroom for OpenArm's ~80-token state-in-prompt;
+   was 48 → silent truncation of the state digits).
+
+Default behaviour rebuilds the pipeline to the actual unpadded token
+count on every state change. Cost is ~1 s for the ~30 % of frames
+whose discretised state crosses a token-count boundary
+(78↔82 for OpenArm); the other 70 % reuse the captured graph. See the
+performance trade-off discussion below.
+
+#### Validation: held-out chocolate_bars replay, h=10 LoRA, BF16
+
+Same harness as the diagnostic (`scripts/spark_replay_episode.py
+--episode 3 --stride 5 --max-frames 30`), comparing FlashRT-BF16-h10
+vs openpi-JAX-h10. No FP8 calibration (so we isolate the state-input
+fix from FP8 calibration drift).
+
+| metric                              |  no state | state padded | **state no-pad (default)** | openpi h=10 |
+|-------------------------------------|----------:|-------------:|---------------------------:|------------:|
+| cos(F, teleop) median               |    0.963 |        0.892 |                  **0.989** |       0.9998 |
+| cos(F, teleop) min                  |   ~0.85 |        0.576 |                   0.9505 |        0.994 |
+| ‖F − teleop‖ median (rad)           |     ~0.5 |         1.75 |                    0.470 |        0.057 |
+| per-dim arm err vs openpi           |   ~14×  |          31× |                     11×  |         1×  |
+| per-dim gripper err vs openpi       |   ~24×  |          24× |                     1.6× |         1×  |
+| sut p50 latency (ms)                |       92 |          224 |                      222 |        390 |
+| sut p99 latency (ms)                |      ~95 |        1039 |                     1150 |        413 |
+| speedup vs openpi (p50)             |     4.4× |         1.8× |                     1.8× |         1× |
+
+Reading the columns:
+
+- **no state** = pre-fix FlashRT. Cos looks great but L2 is hiding a
+  catastrophic gripper-channel failure (dim 15 alone carries 50 % of
+  the L2 budget; the model was state-blind and gripper got stuck at
+  saturated values like -2.9 rad).
+- **state padded** = zero-pad the embedded sequence to
+  `max_prompt_len=128` so the captured CUDA graph never needs to
+  rebuild. Faster at steady state but the PAD-id-0 tokens get
+  attended to (FlashRT doesn't apply an attention mask, openpi does
+  — see `openpi/src/openpi/models/pi0.py:155`) and corrupt the
+  encoder output. cos drops, L2 explodes.
+- **state no-pad (default)** = rebuild on token-count change. Per-frame
+  upload still avoids 70 % of rebuilds (the count is mostly stable at
+  80). Predictions match openpi's distribution shape — gripper error
+  ratio drops from 24× to 1.6× (on L\_GRIP we're actually *better*
+  than openpi: 0.011 vs 0.038 mean L1).
+
+`FLASHRT_PAD_STATE=1` opts back into padded mode for performance
+experiments. The eventual production fix is to add encoder attention
+masking so padded positions are -inf masked out of softmax — that
+gives us 222 ms steady-state with no rebuild jitter. Tracked as a
+follow-up; current numbers are good enough for parity testing and
+for the next phase of real-robot validation.
+
+The residual ~11× arm-channel gap is much smaller than the original
+30× and is consistent with BF16-vs-FP32 precision drift plus some
+small set of LoRA layers we haven't fully traced. Worth chasing
+before robot deployment, but not the same kind of fundamental gap
+the state-input bug was.
 
 3. **Latency win still real.** 94 ms p50 vs 405 ms p50 (4.3x speedup)
    on a per-frame single-client workload — that is the actual product

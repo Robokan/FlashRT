@@ -294,8 +294,32 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 
 
 def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
-                  max_len: int = 48) -> tuple[torch.Tensor, int]:
-    """Tokenise + embed via PaliGemma embedding table (CUDA, bf16)."""
+                  max_len: int = 48,
+                  state: Optional[np.ndarray] = None,
+                  pad_to_max: bool = False) -> tuple[torch.Tensor, int]:
+    """Tokenise + embed via PaliGemma embedding table (CUDA, bf16).
+
+    Args:
+        prompt_text: task language string.
+        embedding_weight: PaliGemma embedding matrix on CUDA, bf16.
+        max_len: tokenizer max length (also pad target if ``pad_to_max``).
+        state: optional normalised-to-[-1, 1] proprioceptive state vector.
+            When provided, the tokenizer uses the Pi0.5 discrete-state
+            format: ``f"Task: {prompt}, State: {state_str};\\nAction: "``
+            with each state dim discretised into 256 bins. Equivalent to
+            openpi's ``PaligemmaTokenizer.tokenize(prompt, state=state)``.
+            Caller must pre-normalise state (FlashRT's frontend does this
+            using ``self.norm_stats``).
+        pad_to_max: if True, return embeds of shape ``(max_len, emb_dim)``
+            with PaliGemma's PAD token id (0) filling unused positions
+            and the returned ``prompt_len`` equal to ``max_len``. This is
+            required when the caller wants to share a single
+            captured-graph pipeline across prompts whose unpadded token
+            counts vary (e.g. per-frame state changes in Pi0.5 — the
+            unpadded count drifts by ±2 tokens as 8-bit-quantised joint
+            values cross digit boundaries; without padding, each drift
+            would trigger a 3 s pipeline rebuild).
+    """
     # PaliGemma tokenizer resolution — see
     # `flash_rt.utils.paligemma_tokenizer` for the search order and
     # the download instructions emitted on failure.
@@ -304,10 +328,19 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
         # same prompt prefix logic FlashRT was built against).
         from openpi.models.tokenizer import PaligemmaTokenizer
         tokenizer = PaligemmaTokenizer(max_len=max_len)
-        tokens_np, mask_np = tokenizer.tokenize(prompt_text)
-        prompt_len = int(mask_np.sum())
-        token_ids = torch.tensor(
-            tokens_np[:prompt_len], dtype=torch.long, device="cuda")
+        tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
+        unpadded_len = int(mask_np.sum())
+        if pad_to_max:
+            # PaligemmaTokenizer already pads with PAD-id 0 to max_len;
+            # take the full sequence (real + PAD) and embed it. Captured
+            # graph stays valid because the buffer shape is constant.
+            token_ids = torch.tensor(
+                tokens_np, dtype=torch.long, device="cuda")
+            prompt_len = max_len
+        else:
+            token_ids = torch.tensor(
+                tokens_np[:unpadded_len], dtype=torch.long, device="cuda")
+            prompt_len = unpadded_len
     except (ImportError, FileNotFoundError, OSError, RuntimeError):
         # Fallback: locate the SentencePiece model directly via the
         # FlashRT helper (clear error if not found — never silent
@@ -316,9 +349,27 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
             load_paligemma_sentencepiece,
         )
         sp = load_paligemma_sentencepiece()
-        # 108 is PaliGemma's `\n` token, used by openpi as the
-        # prompt-end separator before the action prefix.
-        tokens = [sp.bos_id()] + sp.Encode(prompt_text) + [108]
+        if state is not None:
+            # Replicate openpi's Pi0.5 discrete-state-input format
+            # (openpi/src/openpi/models/tokenizer.py:22).
+            discretized = (np.digitize(
+                np.asarray(state, dtype=np.float32),
+                bins=np.linspace(-1.0, 1.0, 257)[:-1]) - 1).astype(int)
+            state_str = " ".join(str(int(d)) for d in discretized)
+            cleaned = prompt_text.strip().replace("_", " ").replace("\n", " ")
+            full_prompt = (
+                f"Task: {cleaned}, State: {state_str};\nAction: ")
+            tokens = [sp.bos_id()] + sp.Encode(full_prompt)
+        else:
+            # 108 is PaliGemma's `\n` token, used by openpi as the
+            # prompt-end separator before the action prefix.
+            tokens = [sp.bos_id()] + sp.Encode(prompt_text) + [108]
+        if pad_to_max and len(tokens) < max_len:
+            # PaliGemma PAD token id = 0.
+            tokens = tokens + [0] * (max_len - len(tokens))
+        elif len(tokens) > max_len:
+            # openpi truncates rather than raising; match that.
+            tokens = tokens[:max_len]
         token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
         prompt_len = len(token_ids)
 
@@ -688,6 +739,33 @@ class Pi05TorchFrontendRtx:
             raise FileNotFoundError(
                 f"norm_stats not found near checkpoint: {e}") from e
 
+    def _normalize_state_for_prompt(self, state) -> np.ndarray:
+        """Map raw physical state to ``[-1, 1]`` using state q01/q99.
+
+        Mirrors openpi's ``Normalize`` transform for the ``state`` field
+        (which fires upstream of ``TokenizePrompt`` in their data pipe).
+        Quantile-normalised values are then clipped to ``[-1, 1]`` so the
+        downstream ``np.digitize(..., linspace(-1, 1, 257)[:-1])`` lands
+        inside the 256 valid bins for every dimension (out-of-range
+        physical values would otherwise pile up at bin 255 and silently
+        lose state resolution at the tails).
+        """
+        s = np.asarray(state, dtype=np.float32).reshape(-1)
+        ns = self.norm_stats.get("state") if self.norm_stats else None
+        if ns is None or "q01" not in ns or "q99" not in ns:
+            raise RuntimeError(
+                "set_prompt(state=...) requires norm_stats with a 'state' "
+                "block (q01/q99). Loaded norm_stats keys: "
+                f"{list(self.norm_stats.keys()) if self.norm_stats else None}")
+        q01 = np.asarray(ns["q01"], dtype=np.float32).reshape(-1)
+        q99 = np.asarray(ns["q99"], dtype=np.float32).reshape(-1)
+        n = min(s.shape[0], q01.shape[0], q99.shape[0])
+        s = s[:n]
+        q01 = q01[:n]
+        q99 = q99[:n]
+        norm = (s - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        return np.clip(norm, -1.0, 1.0)
+
     def _quantize_all_fp8(self) -> None:
         """Pre-quantize all large GEMM weights to FP8 E4M3."""
         W = self._ckpt_bf16
@@ -972,21 +1050,102 @@ class Pi05TorchFrontendRtx:
             "RL mode enabled: cfg_beta=%.2f, advantage_positive=%s",
             new_config["cfg_beta"], new_config["advantage_positive"])
 
-    def set_prompt(self, prompt_text: str) -> None:
+    def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.
+
+        When ``state`` is provided, the prompt is tokenised in the Pi0.5
+        ``discrete_state_input`` format
+        (``f"Task: {prompt}, State: {state_str};\\nAction: "`` — see
+        ``openpi/src/openpi/models/pi0_config.py:29-39``). The state
+        vector is first normalised to ``[-1, 1]`` via ``self.norm_stats``
+        (matching openpi's ``Normalize`` transform upstream of
+        ``TokenizePrompt``), then discretised into 256 bins and embedded
+        as text tokens prepended to the prompt.
+
+        Default behaviour rebuilds the pipeline to the actual unpadded
+        token count on every state change, because FlashRT does not yet
+        apply an attention mask to padded positions. Padded-token
+        attention corrupts predictions (chocolate_bars replay
+        cos(FlashRT, teleop) regressed from 0.989 to 0.892 when we
+        zero-padded to ``self.max_prompt_len``). The rebuild costs ~1 s
+        for the ~30% of frames whose discretised state crosses a
+        token-count boundary; on the remaining frames the captured graph
+        is reused and inference completes in ~220 ms (BF16).
+
+        ``FLASHRT_PAD_STATE=1`` opts into the padded mode (stable
+        latency, degraded predictions) for performance experiments. The
+        eventual production fix is to add encoder attention masking so
+        padded positions are -inf masked out of softmax.
+
+        When ``state`` is ``None`` we keep the legacy fast path: the
+        pipeline is rebuilt to exactly the prompt's token length and no
+        padding is processed (matches the pre-Pi0.5-state behaviour for
+        LIBERO and base pi05).
 
         When RL mode is enabled (see :meth:`set_rl_mode`), this also
         builds the unconditioned prompt embeddings and uploads both into
         the CFG-aware pipeline.
         """
         if self._rl_config is not None:
+            if state is not None:
+                logger.warning("set_prompt: RL mode does not yet support "
+                               "Pi0.5 discrete-state-input; ignoring state.")
             self._set_prompt_rl(prompt_text)
             return
 
-        embeds, prompt_len = _embed_prompt(
-            prompt_text, self.embedding_weight, max_len=MAX_PROMPT_LEN_DEFAULT)
+        # State-in-prompt path: by default rebuild to the exact unpadded
+        # token count, because FlashRT does not yet apply an attention
+        # mask to padded positions (openpi does — see
+        # ``openpi/src/openpi/models/pi0.py:155``). When we tried
+        # zero-padding to ``self.max_prompt_len`` so the captured graph
+        # could be reused across per-frame state changes (faster, no
+        # rebuilds), the padded PAD-id-0 tokens corrupted attention and
+        # the chocolate_bars replay regressed from
+        # cos(FlashRT, teleop)=0.989 -> 0.892 (||err||=0.47 -> 1.75 rad).
+        # The per-frame rebuild cost is ~1 s for the ~30% of frames where
+        # the discretised state crosses a token-count boundary (78<->82
+        # for OpenArm). Acceptable for parity testing; not yet acceptable
+        # for real-time robot control at 25 Hz. Set
+        # ``FLASHRT_PAD_STATE=1`` to opt back into padded mode (stable
+        # latency, degraded predictions) for performance experiments.
+        # Eventual fix: add attention masking to the encoder so padded
+        # positions are -inf masked out of softmax, matching openpi.
+        is_state_in_prompt = state is not None
+        pad_state = os.environ.get("FLASHRT_PAD_STATE") == "1"
+        if is_state_in_prompt:
+            # Normalise physical state to [-1, 1] before passing to the
+            # tokenizer (its digitize bins are in [-1, 1]). openpi does
+            # this via the Normalize transform upstream of TokenizePrompt;
+            # FlashRT's adapter passes the raw physical state through, so
+            # we normalise here using self.norm_stats[state] q01/q99.
+            state_norm = self._normalize_state_for_prompt(state)
+            embeds, prompt_len = _embed_prompt(
+                prompt_text, self.embedding_weight,
+                max_len=self.max_prompt_len,
+                state=state_norm, pad_to_max=pad_state)
+            # Warn if max_prompt_len is too small for the expected state-
+            # in-prompt token count. For OpenArm 16-DOF chocolate_bars the
+            # discretised prompt is 78-82 tokens; LIBERO 7-DOF is ~45.
+            # max_prompt_len < 96 is almost certainly silent truncation.
+            if not getattr(self, "_warned_short_max_prompt", False) \
+                    and self.max_prompt_len < 96:
+                logger.warning(
+                    "set_prompt: state-in-prompt mode but "
+                    "max_prompt_len=%d is too small for typical "
+                    "Pi0.5 state prompts (OpenArm 16-DOF: ~80, "
+                    "LIBERO 7-DOF: ~45). The discretised state will "
+                    "be silently truncated and the model will see "
+                    "only a partial state. Re-init the frontend with "
+                    "max_prompt_len>=128.", self.max_prompt_len)
+                self._warned_short_max_prompt = True
+        else:
+            embeds, prompt_len = _embed_prompt(
+                prompt_text, self.embedding_weight,
+                max_len=MAX_PROMPT_LEN_DEFAULT)
 
-        if self.pipeline is None or prompt_len != self.current_prompt_len:
+        will_rebuild = (self.pipeline is None
+                        or prompt_len != self.current_prompt_len)
+        if will_rebuild:
             logger.info("Building Pi05Pipeline for prompt_len=%d...", prompt_len)
             # Rebuild the pipeline with the exact prompt length to avoid
             # wasted compute on padding tokens.
@@ -1015,7 +1174,16 @@ class Pi05TorchFrontendRtx:
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
         self.pipeline.set_language_embeds(embeds_np)
         self._frame_count = 0
-        logger.info("Set prompt: '%s' (%d tokens)", prompt_text, prompt_len)
+        # Per-frame Pi0.5 state-in-prompt calls would flood the log at
+        # 25-30 Hz. Demote the per-call line to DEBUG and emit a single
+        # INFO on rebuild + first-fill.
+        if will_rebuild:
+            logger.info(
+                "Set prompt: '%s' (%d tokens%s)", prompt_text, prompt_len,
+                ", state-in-prompt" if is_state_in_prompt else "")
+        else:
+            logger.debug("Set prompt: '%s' (%d tokens, in-place)",
+                         prompt_text, prompt_len)
 
     def _set_prompt_rl(self, prompt_text: str) -> None:
         """RL-mode set_prompt: build conditioned + unconditioned embeddings.

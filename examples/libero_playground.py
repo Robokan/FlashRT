@@ -319,6 +319,14 @@ def main() -> int:
     parser.add_argument("--task", type=int, default=0, help="Task index within the suite (0..N-1)")
     parser.add_argument("--mode", default="2", choices=list(MODE_FACTORIES),
                         help="Initial chunk execution mode (default 2 = async pipelined no blend)")
+    parser.add_argument("--prompt", default=None,
+                        help=("Initial prompt for the policy. Default = the "
+                              "env's task language string. If you pass a "
+                              "prompt that doesn't match the env's task, "
+                              "the env's reward is still tied to the env's "
+                              "task -- you'll see [env task succeeded] not "
+                              "[goal reached!]. Pair with --suite/--task to "
+                              "load a matching scene."))
     parser.add_argument("--target-hz", type=float, default=20.0,
                         help="Control loop rate (default 20 Hz, the LIBERO sim rate)")
     parser.add_argument("--autotune", type=int, default=3,
@@ -374,12 +382,16 @@ def main() -> int:
     print(f"  scene: {mj_model.nbody} bodies, {mj_model.ngeom} geoms")
 
     # ── instantiate initial mode + set initial prompt ─────────────────
-    current_prompt = task.language
+    current_prompt = args.prompt if args.prompt else task.language
     mode_name, mode_factory = MODE_FACTORIES[args.mode]
     mode: ChunkMode = mode_factory(model)
     mode.set_prompt(current_prompt)
     print(f"\nInitial mode: [{args.mode}] {mode_name}")
     print(f"Initial prompt: {current_prompt!r}")
+    if args.prompt and args.prompt != task.language:
+        print(f"  note: this prompt DIFFERS from the env's task "
+              f"({task.language!r}).")
+        print(f"  the env's reward will fire on its own task, not your prompt.")
 
     # ── open viewer + stdin reader ────────────────────────────────────
     print("\nLaunching MuJoCo viewer ...")

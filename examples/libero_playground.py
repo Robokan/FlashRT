@@ -411,24 +411,28 @@ def main() -> int:
     mode_name, mode_factory = MODE_FACTORIES[args.mode]
     mode: ChunkMode = mode_factory(model)
     mode.set_prompt(current_prompt)
-    print(f"\nInitial mode: [{args.mode}] {mode_name}")
-    print(f"Initial prompt: {current_prompt!r}")
-    if args.prompt and args.prompt != task.language:
-        print(f"  note: this prompt DIFFERS from the env's task "
-              f"({task.language!r}).")
-        print(f"  the env's reward will fire on its own task, not your prompt.")
 
     # ── open viewer + stdin reader ────────────────────────────────────
     print("\nLaunching MuJoCo viewer ...")
     viewer = mv.launch_passive(mj_model, mj_data)
     print(HELP)
+    print("=" * 70)
+    print(f"  Mode:    [{args.mode}] {mode_name}")
+    print(f"  Prompt:  {current_prompt!r}")
+    if args.prompt and args.prompt != task.language:
+        print(f"           (DIFFERS from env's task {task.language!r}; "
+              f"env reward stays tied to env's task)")
+    print()
+    print("  Type any text + Enter to change the prompt on the fly.")
+    print("  Other commands: 1/2/3/4 = mode, r = reset, t N = task,")
+    print("                  s = stats, h = help, q = quit.")
+    print("=" * 70)
     cmd_q: queue.Queue = queue.Queue()
     threading.Thread(target=_stdin_reader, args=(cmd_q,), daemon=True).start()
 
     # ── main loop ─────────────────────────────────────────────────────
     step_counter = 0
     prev_done = False
-    last_stats_print = time.perf_counter()
     try:
         while viewer.is_running():
             tick_start = time.perf_counter()
@@ -562,12 +566,6 @@ def main() -> int:
                           f"pi05_libero -- scene prior dominates language prior)")
                     print(f"   use 't N' to load a scene whose task matches your prompt.")
             prev_done = bool(done)
-
-            # Periodic stats every 10s
-            now = time.perf_counter()
-            if now - last_stats_print > 10.0:
-                print(f"[stats] step={step_counter} done={bool(done)} {mode.stats()}")
-                last_stats_print = now
 
             # Throttle to target_hz
             elapsed = time.perf_counter() - tick_start

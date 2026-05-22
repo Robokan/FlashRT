@@ -43,6 +43,45 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _parse_prompt_len_spec(spec: str) -> list[int]:
+    """Parse ``--prewarm-prompt-lens`` CLI spec into a sorted unique int list.
+
+    Accepts a mix of comma-separated literals and inclusive ranges:
+
+        "70,72,75"        -> [70, 72, 75]
+        "70-85"           -> [70, 71, 72, ..., 85]
+        "70-72,78,80-82"  -> [70, 71, 72, 78, 80, 81, 82]
+        " 70 - 85 "       -> [70, ..., 85]   (whitespace tolerant)
+
+    Out-of-order or duplicate values are deduplicated and sorted.
+    Invalid tokens are skipped with a warning so a typo in one
+    bucket doesn't take down server startup.
+    """
+    out: set[int] = set()
+    for token in spec.split(","):
+        t = token.strip()
+        if not t:
+            continue
+        if "-" in t:
+            parts = [p.strip() for p in t.split("-", 1)]
+            try:
+                lo, hi = int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                logger.warning(
+                    "prewarm-prompt-lens: could not parse range %r, skipping", t)
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            out.update(range(lo, hi + 1))
+        else:
+            try:
+                out.add(int(t))
+            except ValueError:
+                logger.warning(
+                    "prewarm-prompt-lens: could not parse %r as int, skipping", t)
+    return sorted(out)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve FlashRT pi05 over the openpi websocket protocol")
     parser.add_argument("--checkpoint", required=True,
@@ -103,6 +142,20 @@ def main() -> int:
                         help="Websocket port. Default 8002 leaves 8001 free "
                              "for the openpi JAX reference server when "
                              "running both side-by-side for Phase 4 parity.")
+    parser.add_argument(
+        "--prewarm-prompt-lens", default=None,
+        help="Comma- or range-separated list of prompt token lengths to "
+             "pre-build pipeline cache entries for at server startup, "
+             "so per-frame inference never has to pay the ~600 ms "
+             "CUDA-graph rebuild cost when the state-encoded prompt "
+             "drifts in token count during a robot run. Examples: "
+             "'70,72,75,78,80' (explicit list) or '70-85' (inclusive "
+             "range). Each bucket costs ~600 ms at server start, then "
+             "zero rebuild cost at runtime. For OpenArm v4 + "
+             "chocolate_bars task at 50 Hz, '70-85' covers the "
+             "typical state-text spread. Leave unset to keep the "
+             "legacy lazy-cache behaviour (rebuilds on demand during "
+             "the first 10-20 s of operation, then steady).")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--metadata-config", default=None,
                         help="Optional path to a JSON file with extra metadata "
@@ -219,6 +272,32 @@ def main() -> int:
         model.calibrate(obs_list, percentile=99.9)
         logger.info("Calibration complete; first robot frame will replay "
                     "the CUDA graph immediately.")
+
+    # 2b. Optional pipeline-cache pre-warm. Pi0.5 with state-in-prompt
+    # tokenises the joint state as text — as the robot moves the
+    # token count drifts (typically 70-85 for OpenArm v4) and each
+    # unseen length forces a ~600 ms CUDA-graph rebuild on the first
+    # frame at that length. During a control loop this presents as a
+    # 600 ms freeze followed by a discontinuity at chunk swap.
+    # ``prewarm_prompt_buckets`` builds the cache up-front so every
+    # subsequent inference is a pointer-swap, no rebuild. There is no
+    # quality cost — this just pays the rebuild time at startup
+    # rather than during operation. See
+    # ``flash_rt.frontends.torch.pi05_rtx.Pi05TorchFrontendRtx
+    # .prewarm_prompt_buckets`` and docs/spark_status.md G3.
+    if args.prewarm_prompt_lens:
+        prewarm_lens = _parse_prompt_len_spec(args.prewarm_prompt_lens)
+        if prewarm_lens:
+            logger.info(
+                "Pre-warming pipeline cache for %d prompt-len bucket(s): %s "
+                "(~600 ms each; one-time startup cost, eliminates per-frame "
+                "rebuild spikes during operation)",
+                len(prewarm_lens), prewarm_lens)
+            model._pipe.prewarm_prompt_buckets(prewarm_lens)
+        else:
+            logger.warning(
+                "--prewarm-prompt-lens=%r parsed to an empty list; skipping",
+                args.prewarm_prompt_lens)
 
     # 3. Build metadata. Default mirrors the openpi policy metadata
     # shape (the AsyncActionChunkBroker uses `chunk_size` from this).

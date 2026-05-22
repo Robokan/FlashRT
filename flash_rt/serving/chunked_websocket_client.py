@@ -109,14 +109,53 @@ def _resolve_chunk_len(
     return _PI05_FALLBACK_CHUNK_LEN
 
 
+def _latency_aware_start_next_at(
+    horizon: int, target_hz: float, expected_latency_ms: float
+) -> int:
+    """Pick the kick-off action index so the next chunk arrives by exhaustion.
+
+    Mirror of ``motus_rtc_lite._default_start_next_at``: with control
+    rate ``f`` and inference latency ``L``, the chunk consumer needs
+    ``ceil(L * f)`` control ticks of runway. We submit the next chunk
+    at index ``horizon - delay_steps - 1`` so that the result is ready
+    when the last action of the current chunk is served (and we still
+    have one cushion tick for the runner's promote/lock pass).
+
+    Clamped to ``[1, horizon - 1]``:
+      * ``>= 1`` so we always observe one tick of state evolution
+        before re-inferring (avoids re-inferring on the exact same
+        observation the current chunk was conditioned on).
+      * ``<= horizon - 1`` so we never set it past chunk end.
+
+    Returns 1 if the model is slower than the chunk duration — there's
+    no asymmetric scheduling that fixes a fundamental
+    latency-vs-chunk-budget mismatch, but kicking off ASAP is still
+    the best we can do.
+    """
+    delay_steps = max(1, int(np.ceil((expected_latency_ms / 1000.0) * target_hz)))
+    return max(1, min(horizon - 1, horizon - delay_steps - 1))
+
+
 def _build_config_for_mode(
-    mode: int, chunk_len: int, target_hz: float
+    mode: int,
+    chunk_len: int,
+    target_hz: float,
+    *,
+    expected_latency_ms: float,
 ) -> RTCConfig:
     """Translate a blending mode (1..4) into an RTCConfig.
 
     See module docstring for the mode catalogue. The mapping is the
     single source of truth — any future mode (e.g. 5: cross-chunk
     new-chunk-head blend) lands here and nowhere else.
+
+    ``expected_latency_ms`` sizes ``start_next_at`` for the async
+    modes (2/3/4). At ``50 Hz`` with ``chunk_len=10`` and FlashRT's
+    ~165 ms round-trip this gives ``start_next_at=1`` (kick off
+    immediately after first action served), matching what the openpi
+    ``AsyncActionChunkBroker`` achieves with ``inference_delay=9``.
+    The previous mode-2 default (``horizon // 2 = 5``) only gave
+    inference 100 ms of runway — guaranteed deadline miss every chunk.
     """
     if mode == 1:
         # Sync truncate-replan k=5: action_horizon=5 forces a swap every
@@ -130,25 +169,30 @@ def _build_config_for_mode(
             start_next_at=5,
             miss_policy="block",
             blend_steps=0)
+    start_next_at = _latency_aware_start_next_at(
+        chunk_len, target_hz, expected_latency_ms)
     if mode == 2:
-        # Default: async pipelined, hard swap. start_next_at defaults to
-        # horizon // 2 (see RTCConfig._start_next_at), so the next
-        # inference kicks off well before chunk exhaustion.
+        # Default: async pipelined, hard swap. start_next_at is
+        # latency-aware (see helper above) so inference fires early
+        # enough to land before the current chunk exhausts.
         return RTCConfig(
             target_hz=target_hz,
             action_horizon=chunk_len,
+            start_next_at=start_next_at,
             miss_policy="hold_last",
             blend_steps=0)
     if mode == 3:
         return RTCConfig(
             target_hz=target_hz,
             action_horizon=chunk_len,
+            start_next_at=start_next_at,
             miss_policy="hold_last",
             blend_steps=3)
     if mode == 4:
         return RTCConfig(
             target_hz=target_hz,
             action_horizon=chunk_len,
+            start_next_at=start_next_at,
             miss_policy="hold_last",
             blend_steps=5)
     raise ValueError(
@@ -175,6 +219,19 @@ class ChunkedWebsocketClient:
         chunk_len_override: If set, skip server metadata and use this
             value as H. Useful when talking to a server that doesn't
             publish ``chunk_size`` and the default 50 is wrong.
+        expected_latency_ms: Expected per-call round-trip inference
+            latency in ms. Sizes ``start_next_at`` for async modes
+            (2/3/4) so background inference fires early enough to
+            land before chunk exhaustion. The default 200 ms is
+            conservative and works across both FlashRT (~165 ms
+            steady-state on Spark) and openpi-JAX (~175 ms steady).
+            Set higher only if you observe deadline misses; setting
+            it too high just wastes a few actions per chunk to
+            premature swap (harmless, model sees fresh state). Mode 1
+            (sync) ignores this. Has no effect when latency exceeds
+            ``chunk_len / target_hz`` — at that point no asymmetric
+            scheduling can save you and you'll get deadline misses
+            regardless.
         action_output_key: Key in the server response that holds the
             action chunk. Defaults to ``"actions"`` (openpi / FlashRT
             convention).
@@ -187,6 +244,7 @@ class ChunkedWebsocketClient:
         blending_mode: int = 2,
         target_hz: float = 25.0,
         chunk_len_override: Optional[int] = None,
+        expected_latency_ms: float = 200.0,
         action_output_key: str = "actions",
     ) -> None:
         if blending_mode not in VALID_MODES:
@@ -195,18 +253,24 @@ class ChunkedWebsocketClient:
         self._policy = policy
         self._action_output_key = action_output_key
         self._target_hz = float(target_hz)
+        self._expected_latency_ms = float(expected_latency_ms)
         self._chunk_len = _resolve_chunk_len(policy, chunk_len_override, logger)
         self._blending_mode = int(blending_mode)
         self._adapter = CallablePolicyAdapter(
             fn=policy.infer, output_key=action_output_key)
         self._runner = self._build_runner(self._blending_mode)
+        cfg = self._runner.config
         logger.info(
-            "ChunkedWebsocketClient ready: mode=%d (%s), chunk_len=%d, target_hz=%.1f",
+            "ChunkedWebsocketClient ready: mode=%d (%s), chunk_len=%d, "
+            "target_hz=%.1f, expected_latency_ms=%.0f, start_next_at=%s",
             self._blending_mode, MODE_DESCRIPTIONS[self._blending_mode],
-            self._chunk_len, self._target_hz)
+            self._chunk_len, self._target_hz, self._expected_latency_ms,
+            cfg.start_next_at)
 
     def _build_runner(self, mode: int) -> AsyncChunkRunner:
-        cfg = _build_config_for_mode(mode, self._chunk_len, self._target_hz)
+        cfg = _build_config_for_mode(
+            mode, self._chunk_len, self._target_hz,
+            expected_latency_ms=self._expected_latency_ms)
         return AsyncChunkRunner(self._adapter, cfg)
 
     @property
@@ -271,9 +335,31 @@ class ChunkedWebsocketClient:
         """Re-initialize the runner with a fresh chunk for ``obs``.
 
         Use when the prompt or task changes and the cached chunk
-        should not be served any further. Blocks on one inference.
+        should not be served any further AND you have a fresh
+        observation to seed the next chunk with. Blocks on one
+        inference.
         """
         self._runner.reset(obs)
+
+    def clear(self) -> None:
+        """Discard the current chunk + cancel any in-flight inference,
+        without firing a new one.
+
+        The next ``next_action`` call will synchronously block on a
+        fresh inference using the obs it's called with. Use when you
+        need to invalidate cached chunks (e.g. prompt changed) but
+        don't have a current observation handy at the clear-point.
+
+        Implemented as a runner tear-down + rebuild (same code path as
+        ``set_blending_mode``); cheaper than ``reset`` because it
+        skips the immediate inference.
+        """
+        old_runner = self._runner
+        try:
+            old_runner.close(wait=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("clear: failed to close old runner cleanly: %r", e)
+        self._runner = self._build_runner(self._blending_mode)
 
     def close(self) -> None:
         """Shut down the background executor. Idempotent.

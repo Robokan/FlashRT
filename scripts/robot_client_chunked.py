@@ -177,12 +177,11 @@ def _run_mode(
 ) -> dict:
     """Run a single mode against the given obs iterable, return stats.
 
-    The loop paces calls at ``target_hz`` to give the AsyncChunkRunner's
-    background inference time to complete between consumer ticks. Without
-    pacing the consumer races past every chunk boundary before the new
-    chunk is ready and the runner falls back to ``miss_policy="hold_last"``
-    on every step — which exercises the deadline path but doesn't
-    represent real robot behaviour.
+    The loop paces calls at ``target_hz`` so the harness simulates a real
+    controller loop. Without pacing the consumer would race ahead of
+    realtime; the runner would still produce correct stats, but the
+    inference latency budget characterisation (and the deadline-miss
+    counts) would not represent on-robot behaviour.
     """
     from flash_rt.serving.chunked_websocket_client import (
         ChunkedWebsocketClient, MODE_DESCRIPTIONS)
@@ -262,8 +261,9 @@ def main() -> int:
         "--server-url", default="ws://localhost:8002",
         help="Websocket URL of the policy server (default: ws://localhost:8002)")
     parser.add_argument(
-        "--blending-mode", type=int, default=2, choices=(1, 2, 3, 4),
-        help="Blending mode 1..4 (default 2 = async pipelined, no blend)")
+        "--blending-mode", type=int, default=3, choices=(1, 2, 3, 4),
+        help="Blending mode 1..4 (default 3 = async fire-ASAP, "
+             "splice at d, seam blend = 3)")
     parser.add_argument(
         "--target-hz", type=float, default=25.0,
         help="Controller rate (default 25 Hz)")

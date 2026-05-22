@@ -1461,14 +1461,37 @@ by which broker each side wraps the policy in.
 `BasePolicy` (typically `openpi_client.WebsocketClientPolicy`) with
 `flash_rt.runtime.AsyncChunkRunner`. Selects the chunk-consumption
 strategy via a single `blending_mode` int (1..4) that matches the
-convention used by `examples/libero_playground.py` keys 1..4:
+convention used by `examples/libero_playground.py` keys 1..4.
+
+**Updated 2026-05 (RTC-paper semantics).** Modes 2-4 now implement
+the scheme from "Real-Time Execution of Action Chunking Flow
+Policies" (Black et al. 2025, arXiv:2506.07339): fire the next
+inference as soon as the previous one completes (`start_next_at=0`),
+splice each freshly-arrived chunk at index `d = ceil(ema_latency *
+target_hz)` (skipping the prefix that corresponds to ticks already
+served from the previous chunk), and seam-blend the first
+`blend_steps` actions of the new chunk toward `last_served_action`
+to absorb the swap discontinuity.
+
+Mode 1 is unchanged (sync truncate-replan k=5, the canonical LIBERO
+eval baseline; kept for A/B comparison against the async path).
 
 | mode | RTCConfig | semantics |
 |---|---|---|
-| 1 | `action_horizon=5, start_next_at=5, miss_policy="block", blend_steps=0` | sync truncate-replan k=5 — robot blocks per chunk; chunks of 5 |
-| 2 (default) | `action_horizon=H, blend_steps=0` | async pipelined, hard chunk swap |
-| 3 | `action_horizon=H, blend_steps=3` | async + 3-step tail damping |
-| 4 | `action_horizon=H, blend_steps=5` | async + 5-step tail damping |
+| 1 | `action_horizon=5, start_next_at=5, miss_policy="block", blend_steps=0` | sync truncate-replan k=5 — robot blocks per chunk; baseline |
+| 2 | `start_next_at=0, auto_inference_delay=True, blend_steps=0` | async fire-ASAP, splice at `d`, no seam blend (raw) |
+| 3 (default) | `start_next_at=0, auto_inference_delay=True, blend_steps=3` | async fire-ASAP, splice at `d`, seam blend = 3 |
+| 4 | `start_next_at=0, auto_inference_delay=True, blend_steps=5` | async fire-ASAP, splice at `d`, seam blend = 5 |
+
+Default changed from mode 2 to mode 3 — production-safe seam
+smoothing should be on by default. Existing callers that need the
+old hard-step behavior should set `blending_mode=2` explicitly.
+
+The Phase 6 dry-run table below was collected against the OLD
+semantics (start_next_at=H/2, no splice-at-d, no seam blend). It
+still characterizes the latency budget correctly but the per-mode
+behavior numbers no longer apply; rerun after the SparkJAX
+integration to capture the new numbers.
 
 `H` is auto-resolved from the server's metadata (`chunk_size` field
 that both the FlashRT and the chunk_size-patched openpi-JAX servers
@@ -1996,21 +2019,32 @@ absorbed Pi0.5's 50–100 ms inference under the 20 Hz control budget.
 Modes available (toggle with `1`/`2`/`3`/`4`):
 
 1. **sync truncate-replan, k=5** — the canonical LIBERO eval pattern.
-   Robot visibly hitches every 5 steps while inference runs.
-2. **async pipelined, no blend** — `AsyncChunkRunner` with
-   `blend_steps=0`, `miss_policy="hold_last"`. Hard swap at chunk
-   seams, but never stalls. **Default.**
-3. **async + tail blend = 3** — same as 2 but linearly blends the last
-   3 actions of an exhausted chunk with the previous served action.
-   Only fires on deadline miss; on the Spark we're fast enough that
-   misses are rare.
-4. **async + tail blend = 5** — same with a 5-step blend window.
+   Robot visibly hitches every 5 steps while inference runs. Kept
+   as a baseline for comparison against the async path.
+2. **async fire-ASAP, splice@d, no seam blend** — `AsyncChunkRunner`
+   with `start_next_at=0`, `auto_inference_delay=True`,
+   `blend_steps=0`. Background inference fires the instant the
+   previous one completes; freshly-arrived chunks are spliced at
+   `d = ceil(ema_latency * target_hz)` (skipping the prefix that
+   corresponds to ticks already served from the previous chunk).
+   Hard step at each seam — useful for debugging raw policy behavior.
+3. **async fire-ASAP, splice@d, seam blend = 3** — same as 2 plus a
+   3-step linear ramp at the start of each new chunk from
+   `last_served_action` toward the raw new-chunk action. **Default.**
+4. **async fire-ASAP, splice@d, seam blend = 5** — same with a 5-step
+   ramp. Smoother but delays full convergence to the new chunk by
+   ~250 ms at 20 Hz.
 
-Tail-blend (`blend_steps>0` in `AsyncChunkRunner`) is end-of-chunk
-smoothing for the deadline-miss case, not cross-chunk seam smoothing.
-A future mode 5 (cross-chunk seam blend on the new-chunk side) would
-get us closer to what `openpi/AsyncActionChunkBroker` does without
-needing the server-side RTC inpainting plumbing.
+Seam blend is what the RTC paper §3.2 calls the "client-side seam
+absorption" baseline. A future **mode 5** would replace it with the
+paper's server-side prefix-attention guidance ("ΠGDM"): the server
+receives the unexecuted suffix of the previous chunk and conditions
+the new chunk's first `d` actions to match what was actually
+executed. That removes the seam by construction. Requires server-side
+RTC plumbing which is not yet shipped (the
+`async_action_chunk_broker.py` we wrote in our openpi fork is the
+client-side counterpart, but the server-side `models_pytorch/rtc.py`
+inpainting is not currently wired into our FlashRT Pi05 pipeline).
 
 LIBERO sim install (incremental on top of the Phase 1 venv):
 

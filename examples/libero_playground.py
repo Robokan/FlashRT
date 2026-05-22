@@ -8,18 +8,26 @@ execution modes on the fly to compare smoothness:
 
   1 — sync truncate-replan       (the canonical LIBERO eval pattern: predict
                                    10, execute 5, discard the rest, replan.
-                                   Robot pauses for each inference.)
-  2 — async pipelined, no blend   (AsyncChunkRunner. Background inference
-                                   overlaps with execution. Hard swap at
-                                   chunk seams. Robot never stalls.)
-  3 — async + tail blend = 3      (Same as 2, but linearly blend the last 3
-                                   actions of each chunk with the previous
-                                   served action when inference deadline
-                                   misses. Smoother on stalls.)
-  4 — async + tail blend = 5      (Same with a 5-step blend window.)
+                                   Robot pauses for each inference. Kept
+                                   as a baseline for A/B comparison.)
+  2 — async fire-ASAP, splice@d   (RTC-paper semantics: background inference
+      no seam blend                fires the instant the previous one
+                                   completes, splice index `d` tracks the
+                                   EMA of measured latency, hard step at
+                                   each chunk seam. Useful for debugging
+                                   raw policy behavior.)
+  3 — async fire-ASAP, splice@d   (DEFAULT. Same as 2 + a 3-step linear
+      seam blend = 3               ramp at the start of each new chunk
+                                   from the last served action toward the
+                                   raw new-chunk action. Smooths the seam
+                                   without hiding the policy's intent.)
+  4 — async fire-ASAP, splice@d   (Same with a 5-step ramp. Smoother but
+      seam blend = 5               delays full convergence to the new
+                                   chunk by 250 ms at 20 Hz.)
 
-The async modes use `flash_rt/runtime/rtc.py::AsyncChunkRunner`, which is
-upstream FlashRT code. The truncate-replan mode mirrors what
+The async modes use `flash_rt/runtime/rtc.py::AsyncChunkRunner` with the
+RTC-paper-faithful scheduling described in
+`docs/rtc_lite_design.md`. The truncate-replan mode mirrors what
 `examples/thor/eval_libero.py::run_episode` does, so visual comparison is
 honest.
 
@@ -221,12 +229,20 @@ class TruncateReplanMode:
 
 
 class AsyncBlendMode:
-    """Async pipelined via flash_rt.runtime.rtc.AsyncChunkRunner."""
+    """Async pipelined via flash_rt.runtime.rtc.AsyncChunkRunner.
+
+    RTC-paper semantics (Black et al. 2025): fire the next inference
+    as soon as the previous one completes, splice each new chunk at
+    ``d = ceil(ema_latency * target_hz)`` (skipping the actions that
+    correspond to ticks that already elapsed during inference), and
+    seam-blend the first ``blend_steps`` actions of the new chunk
+    toward the last served action.
+    """
 
     def __init__(self, model: Any, blend_steps: int = 0) -> None:
         from flash_rt.runtime.rtc import AsyncChunkRunner, CallablePolicyAdapter, RTCConfig
 
-        self.name = f"async pipelined (blend={blend_steps})"
+        self.name = f"async fire-ASAP, splice@d, seam blend={blend_steps}"
         self._model = model
         self._prompt = ""
         self._blend_steps = blend_steps
@@ -239,11 +255,16 @@ class AsyncBlendMode:
             )
 
         adapter = CallablePolicyAdapter(fn=_infer, output_key=None)
+        # Pi0.5 LIBERO runs at 20 Hz with H=10 chunks. With ~100 ms
+        # JAX inference that's d ≈ ceil(0.1 * 20) = 2; auto tracking
+        # adjusts on the fly once the first inference completes.
         cfg = RTCConfig(
             target_hz=20.0,
             action_horizon=CHUNK_SIZE,
-            start_next_at=CHUNK_SIZE // 2,
+            start_next_at=0,
             miss_policy="hold_last",
+            inference_delay_steps=2,
+            auto_inference_delay=True,
             blend_steps=blend_steps,
         )
         self._runner = AsyncChunkRunner(adapter, cfg)
@@ -277,10 +298,14 @@ class AsyncBlendMode:
 
 
 MODE_FACTORIES = {
-    "1": ("sync truncate-replan (k=5)", lambda m: TruncateReplanMode(m, replan_steps=5)),
-    "2": ("async pipelined, no blend",  lambda m: AsyncBlendMode(m, blend_steps=0)),
-    "3": ("async + tail blend = 3",     lambda m: AsyncBlendMode(m, blend_steps=3)),
-    "4": ("async + tail blend = 5",     lambda m: AsyncBlendMode(m, blend_steps=5)),
+    "1": ("sync truncate-replan (k=5, baseline)",
+          lambda m: TruncateReplanMode(m, replan_steps=5)),
+    "2": ("async fire-ASAP, splice@d, no seam blend",
+          lambda m: AsyncBlendMode(m, blend_steps=0)),
+    "3": ("async fire-ASAP, splice@d, seam blend = 3",
+          lambda m: AsyncBlendMode(m, blend_steps=3)),
+    "4": ("async fire-ASAP, splice@d, seam blend = 5",
+          lambda m: AsyncBlendMode(m, blend_steps=5)),
 }
 
 

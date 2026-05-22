@@ -426,6 +426,20 @@ Keep `blend_steps=0` by default. Blending is an execution-layer action
 edit; it should be enabled only after evaluating jerk / task success in
 the target controller.
 
+> NOTE (2026-05): `blend_steps` semantics changed in
+> `flash_rt.runtime.rtc.AsyncChunkRunner`. It now does *seam blending*
+> at the start of each freshly-promoted chunk (linear ramp from
+> `last_served_action` toward the new chunk's raw action), not tail
+> damping at chunk-end. The old tail-damping behavior is preserved as
+> `tail_blend_steps` for the deadline-miss path. The `blend_steps=0`
+> default is unaffected. The sweep table above (rows
+> `blend_steps in {0,1,2}`) showed identical 0-miss/0-held results
+> because the supply-layer probe never hit a deadline miss; under the
+> new semantics those same configs would seam-blend on each chunk
+> swap (`blend_steps=2` would ramp the first 2 actions of every new
+> chunk). Re-sweep before relying on those numbers for jerk-sensitive
+> tuning.
+
 ### What RTC-lite proves and does not prove
 
 RTC-lite proves that the Motus Stage3 chunk output can supply a 50 Hz

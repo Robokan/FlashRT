@@ -9,21 +9,47 @@ and FlashRT (port 8002) — the blending is on the *consumer* side,
 so a Phase 6 backend comparison can swap the server URL without
 changing any blending characteristics.
 
-Modes (1..4 mirror ``libero_playground.py``)::
+Modes
+-----
+Mode 1 is a sync baseline for A/B comparison. Modes 2–4 implement the
+RTC-paper-faithful async path (Black et al. 2025, arXiv:2506.07339):
+fire the next inference as soon as the previous one completes, splice
+the freshly-arrived chunk at index ``d`` (= measured inference latency
+in control ticks), and serve seam-blend on the first ``blend_steps``
+actions of each new chunk to absorb the discontinuity at the swap.
+
+::
 
     1: sync truncate-replan k=5  - block per chunk, replan every 5 actions.
-                                    Chunk length effectively becomes 5.
                                     Robot visibly hitches at each replan.
-    2: async pipelined, no blend - background inference, hard chunk swap
-                                    at horizon/2. DEFAULT.
-    3: async + tail blend = 3    - same as 2 + 3-step end-of-chunk damping
-                                    (linearly pulls last 3 actions of each
-                                    chunk toward the last served action).
-    4: async + tail blend = 5    - same with 5-step damping window.
+                                    Useful as an A/B baseline; NOT
+                                    production.
+    2: async, fire ASAP, splice at d, no seam blend (raw)
+                                  - background inference; freshest plan
+                                    always served. Hard step at each
+                                    seam. Default for debugging.
+    3: async, fire ASAP, splice at d, seam blend = 3        DEFAULT.
+                                  - linearly ramps the first 3 actions
+                                    of each new chunk from
+                                    ``last_served_action`` toward the
+                                    raw new-chunk action. Smooth seam,
+                                    minimal latency cost.
+    4: async, fire ASAP, splice at d, seam blend = 5
+                                  - 5-step seam ramp. Smoother but
+                                    delays convergence to the new
+                                    chunk by ~100 ms at 50 Hz.
+    5 (future): async + server-side RTC inpainting.
+                                  - the new chunk's first ``d`` actions
+                                    are inpainted server-side to match
+                                    the executed prefix; no client-side
+                                    blending needed.
 
-Tail blend is end-of-chunk smoothing per ``flash_rt.runtime.rtc``'s
-docstring, not cross-chunk seam smoothing. See ``docs/spark_status.md``
-G6 for the full rationale.
+``d`` is auto-tracked from the EMA of measured inference latency
+(``AsyncChunkRunner.stats.ema_latency_s``). At 50 Hz with FlashRT's
+~165 ms steady-state on Spark this resolves to ``d = 9``; at 25 Hz
+it's ``d = 5``. The initial value before any inference completes is
+0, which is corrected on the first promotion (which always happens
+before any actions of the second chunk are served, so no jerk).
 
 The chunk length ``H`` is auto-detected from the server's metadata
 (``chunk_size`` field) on first call; override via constructor for
@@ -36,7 +62,7 @@ Usage::
     from flash_rt.serving.chunked_websocket_client import ChunkedWebsocketClient
 
     policy = WebsocketClientPolicy(host="localhost", port=8002)
-    client = ChunkedWebsocketClient(policy, blending_mode=2, target_hz=25.0)
+    client = ChunkedWebsocketClient(policy, blending_mode=3, target_hz=50.0)
 
     for step in range(N):
         obs = build_obs_from_robot()       # dict with state, images, prompt
@@ -44,7 +70,7 @@ Usage::
         send_to_robot(action)
 
     # Runtime mode change (e.g. from a ROS service):
-    client.set_blending_mode(3)
+    client.set_blending_mode(4)
 """
 
 from __future__ import annotations
@@ -69,11 +95,13 @@ _PI05_FALLBACK_CHUNK_LEN = 50
 
 VALID_MODES = (1, 2, 3, 4)
 
+DEFAULT_MODE = 3
+
 MODE_DESCRIPTIONS = {
-    1: "sync truncate-replan k=5",
-    2: "async pipelined, no blend (default)",
-    3: "async + tail blend = 3",
-    4: "async + tail blend = 5",
+    1: "sync truncate-replan k=5 (baseline)",
+    2: "async fire-ASAP, splice at d, no seam blend",
+    3: "async fire-ASAP, splice at d, seam blend = 3 (default)",
+    4: "async fire-ASAP, splice at d, seam blend = 5",
 }
 
 
@@ -109,31 +137,21 @@ def _resolve_chunk_len(
     return _PI05_FALLBACK_CHUNK_LEN
 
 
-def _latency_aware_start_next_at(
-    horizon: int, target_hz: float, expected_latency_ms: float
+def _initial_inference_delay_steps(
+    target_hz: float, expected_latency_ms: float
 ) -> int:
-    """Pick the kick-off action index so the next chunk arrives by exhaustion.
+    """Convert an a-priori latency estimate to control ticks.
 
-    Mirror of ``motus_rtc_lite._default_start_next_at``: with control
-    rate ``f`` and inference latency ``L``, the chunk consumer needs
-    ``ceil(L * f)`` control ticks of runway. We submit the next chunk
-    at index ``horizon - delay_steps - 1`` so that the result is ready
-    when the last action of the current chunk is served (and we still
-    have one cushion tick for the runner's promote/lock pass).
+    Used to seed the ``inference_delay_steps`` config field before any
+    real latency has been observed. Once the runner records its first
+    completed inference, ``auto_inference_delay=True`` takes over and
+    the EMA dictates ``d`` from then on; this estimate matters only for
+    the FIRST swap.
 
-    Clamped to ``[1, horizon - 1]``:
-      * ``>= 1`` so we always observe one tick of state evolution
-        before re-inferring (avoids re-inferring on the exact same
-        observation the current chunk was conditioned on).
-      * ``<= horizon - 1`` so we never set it past chunk end.
-
-    Returns 1 if the model is slower than the chunk duration — there's
-    no asymmetric scheduling that fixes a fundamental
-    latency-vs-chunk-budget mismatch, but kicking off ASAP is still
-    the best we can do.
+    With Spark's ~165 ms FlashRT round-trip and 50 Hz control this
+    gives ``d=9``. At 25 Hz it's ``d=5``.
     """
-    delay_steps = max(1, int(np.ceil((expected_latency_ms / 1000.0) * target_hz)))
-    return max(1, min(horizon - 1, horizon - delay_steps - 1))
+    return max(0, int(np.ceil((expected_latency_ms / 1000.0) * target_hz)))
 
 
 def _build_config_for_mode(
@@ -146,55 +164,48 @@ def _build_config_for_mode(
     """Translate a blending mode (1..4) into an RTCConfig.
 
     See module docstring for the mode catalogue. The mapping is the
-    single source of truth — any future mode (e.g. 5: cross-chunk
-    new-chunk-head blend) lands here and nowhere else.
+    single source of truth — mode 5 (server-side RTC inpainting) lands
+    here when its server protocol is implemented.
 
-    ``expected_latency_ms`` sizes ``start_next_at`` for the async
-    modes (2/3/4). At ``50 Hz`` with ``chunk_len=10`` and FlashRT's
-    ~165 ms round-trip this gives ``start_next_at=1`` (kick off
-    immediately after first action served), matching what the openpi
-    ``AsyncActionChunkBroker`` achieves with ``inference_delay=9``.
-    The previous mode-2 default (``horizon // 2 = 5``) only gave
-    inference 100 ms of runway — guaranteed deadline miss every chunk.
+    Async modes (2/3/4) use:
+      * ``start_next_at=0`` — fire the next inference as soon as the
+        previous one completes (the RTC paper's intent).
+      * ``auto_inference_delay=True`` — splice index ``d`` tracks the
+        EMA of measured inference latency, so the first ``d`` actions
+        of each freshly-arrived chunk (which correspond to control
+        ticks that already elapsed serving the OLD chunk) are skipped.
+      * ``inference_delay_steps`` is seeded from ``expected_latency_ms``
+        so the very first swap (before EMA is populated) uses a
+        reasonable estimate.
     """
     if mode == 1:
         # Sync truncate-replan k=5: action_horizon=5 forces a swap every
         # 5 steps; start_next_at=5 means "submit the next chunk request
-        # at chunk exhaustion" — combined with max_workers=1 (RTCConfig
-        # enforces) this is effectively synchronous. The consumer blocks
-        # on _handle_exhausted_locked while inference runs.
+        # at chunk exhaustion" — combined with miss_policy="block" this
+        # is effectively synchronous. Kept as the A/B baseline for
+        # smoothness comparisons against the async modes; matches the
+        # canonical LIBERO eval pattern in examples/thor/eval_libero.py.
         return RTCConfig(
             target_hz=target_hz,
             action_horizon=5,
             start_next_at=5,
             miss_policy="block",
             blend_steps=0)
-    start_next_at = _latency_aware_start_next_at(
-        chunk_len, target_hz, expected_latency_ms)
+    d_seed = _initial_inference_delay_steps(target_hz, expected_latency_ms)
+    common = dict(
+        target_hz=target_hz,
+        action_horizon=chunk_len,
+        start_next_at=0,
+        miss_policy="hold_last",
+        inference_delay_steps=d_seed,
+        auto_inference_delay=True,
+    )
     if mode == 2:
-        # Default: async pipelined, hard swap. start_next_at is
-        # latency-aware (see helper above) so inference fires early
-        # enough to land before the current chunk exhausts.
-        return RTCConfig(
-            target_hz=target_hz,
-            action_horizon=chunk_len,
-            start_next_at=start_next_at,
-            miss_policy="hold_last",
-            blend_steps=0)
+        return RTCConfig(**common, blend_steps=0)
     if mode == 3:
-        return RTCConfig(
-            target_hz=target_hz,
-            action_horizon=chunk_len,
-            start_next_at=start_next_at,
-            miss_policy="hold_last",
-            blend_steps=3)
+        return RTCConfig(**common, blend_steps=3)
     if mode == 4:
-        return RTCConfig(
-            target_hz=target_hz,
-            action_horizon=chunk_len,
-            start_next_at=start_next_at,
-            miss_policy="hold_last",
-            blend_steps=5)
+        return RTCConfig(**common, blend_steps=5)
     raise ValueError(
         f"blending_mode must be in {VALID_MODES}, got {mode}")
 
@@ -212,26 +223,23 @@ class ChunkedWebsocketClient:
             ``(H, action_dim)``. Typically a
             ``openpi_client.WebsocketClientPolicy``.
         blending_mode: One of {1, 2, 3, 4}; see module docstring.
-            Default 2 (async pipelined, no blend). Production-safe.
+            Default ``3`` (async fire-ASAP, splice at ``d``, seam blend = 3).
+            Production-safe.
         target_hz: Controller rate the robot loop runs at. Used by
-            ``AsyncChunkRunner`` only for stats / period bookkeeping;
-            the consumer drives actual timing.
+            ``AsyncChunkRunner`` to convert measured latency seconds
+            to splice ticks ``d`` for the async modes. The consumer
+            drives actual timing.
         chunk_len_override: If set, skip server metadata and use this
             value as H. Useful when talking to a server that doesn't
             publish ``chunk_size`` and the default 50 is wrong.
         expected_latency_ms: Expected per-call round-trip inference
-            latency in ms. Sizes ``start_next_at`` for async modes
-            (2/3/4) so background inference fires early enough to
-            land before chunk exhaustion. The default 200 ms is
-            conservative and works across both FlashRT (~165 ms
-            steady-state on Spark) and openpi-JAX (~175 ms steady).
-            Set higher only if you observe deadline misses; setting
-            it too high just wastes a few actions per chunk to
-            premature swap (harmless, model sees fresh state). Mode 1
-            (sync) ignores this. Has no effect when latency exceeds
-            ``chunk_len / target_hz`` — at that point no asymmetric
-            scheduling can save you and you'll get deadline misses
-            regardless.
+            latency in ms. Used only to seed ``inference_delay_steps``
+            for the FIRST swap (before the runner's latency EMA has
+            any samples). After the first completed inference, the
+            EMA takes over via ``auto_inference_delay=True``. The
+            default 200 ms is conservative and works across both
+            FlashRT (~165 ms steady-state on Spark) and openpi-JAX
+            (~175 ms steady). Mode 1 (sync) ignores this entirely.
         action_output_key: Key in the server response that holds the
             action chunk. Defaults to ``"actions"`` (openpi / FlashRT
             convention).
@@ -241,7 +249,7 @@ class ChunkedWebsocketClient:
         self,
         policy: Any,
         *,
-        blending_mode: int = 2,
+        blending_mode: int = DEFAULT_MODE,
         target_hz: float = 25.0,
         chunk_len_override: Optional[int] = None,
         expected_latency_ms: float = 200.0,
@@ -262,10 +270,11 @@ class ChunkedWebsocketClient:
         cfg = self._runner.config
         logger.info(
             "ChunkedWebsocketClient ready: mode=%d (%s), chunk_len=%d, "
-            "target_hz=%.1f, expected_latency_ms=%.0f, start_next_at=%s",
+            "target_hz=%.1f, expected_latency_ms=%.0f, "
+            "start_next_at=%s, splice_d_seed=%s, blend_steps=%d",
             self._blending_mode, MODE_DESCRIPTIONS[self._blending_mode],
             self._chunk_len, self._target_hz, self._expected_latency_ms,
-            cfg.start_next_at)
+            cfg.start_next_at, cfg.inference_delay_steps, cfg.blend_steps)
 
     def _build_runner(self, mode: int) -> AsyncChunkRunner:
         cfg = _build_config_for_mode(

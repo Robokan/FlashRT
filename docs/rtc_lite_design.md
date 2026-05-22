@@ -64,23 +64,93 @@ background worker:
 The foreground loop owns timing. RTC-lite does not sleep, run robot IO, or
 change the frontend's CUDA stream policy.
 
-## Policies
+## Scheduling Knobs
 
-`miss_policy="hold_last"`
+RTC-lite exposes the small set of scheduling knobs that the
+"Real-Time Execution of Action Chunking Flow Policies" paper
+(Black et al. 2025, arXiv:2506.07339) calls out, plus a couple of
+deployment-engineering knobs.
 
-If the next chunk is not ready when the current chunk is exhausted, repeat the
-last action and count a deadline miss. This is conservative and keeps the
-controller loop non-blocking.
+`start_next_at = 0` (recommended for production)
 
-`miss_policy="block"`
+Fire the next background inference as soon as the previous one
+completes. Capped naturally by the single-worker executor: only one
+inference in flight at a time, so the actual rate equals
+`1 / inference_latency`. This gives the freshest possible plan at
+every chunk swap. The legacy default
+(`max(1, horizon // 2)`) is preserved by leaving `start_next_at = None`.
 
-Block until the model returns the next chunk. This is useful for offline
-diagnostics, but it reintroduces pauses and is not the default deployment mode.
+`inference_delay_steps` (= "splice at d" in the paper)
 
-`blend_steps`
+The number of control ticks the foreground loop consumes during one
+inference. When a fresh chunk lands, the runner skips past
+`new_chunk[:d]` (those actions correspond to time we already lived
+through serving the old chunk) and serves `new_chunk[d]` first. This
+is the paper's "executed prefix" handling. Without it, the first
+action of every new chunk is a lookback by `d` ticks, which the PD
+controller then has to wrench into the present, producing the visible
+seam jerk we are trying to eliminate.
 
-Optional small boundary smoothing. This is deliberately simple; it does not run
-gradient guidance through the policy.
+`auto_inference_delay = True`
+
+EMA-track the measured inference latency
+(`stats.ema_latency_s`) and recompute `d = ceil(ema * target_hz)` on
+every swap. Adapts to drift across the run (warmup, GPU thermal
+throttle, server load). Overrides `inference_delay_steps` once
+populated; the explicit value is used only as the seed for the very
+first swap before the EMA has samples.
+
+`blend_steps` — seam smoothing (NEW SEMANTICS as of 2026-05)
+
+Linear alpha ramp at the START of each freshly-promoted chunk. With
+`N = blend_steps` and `k = blend_step` (0-indexed), the emitted
+action is `alpha * raw + (1 - alpha) * anchor` where
+`alpha = (k + 1) / (N + 1)`. So the first emitted action is mostly
+the previous target (smoothest), the `N`-th is almost the raw new
+target, and from `k = N` onward we serve the raw new chunk. The
+anchor is a snapshot of `last_served_action` at the moment of the
+swap, so multiple promotions during a single blend window do not
+corrupt the ramp.
+
+`tail_blend_steps` — deadline-miss damping (legacy)
+
+The OLD `blend_steps` semantics, kept under a different name for the
+deadline-miss path: when the chunk is about to run out and no
+replacement is ready, the last `tail_blend_steps` actions are pulled
+toward `last_served_action` so the PD controller does not jerk on
+the held-target. Defaults to `0`.
+
+`miss_policy = "hold_last"`
+
+If the next chunk is not ready when the current chunk is exhausted,
+repeat the last action and count a deadline miss. Non-blocking; the
+standard production setting.
+
+`miss_policy = "block"`
+
+Block until the model returns the next chunk. Useful for offline
+diagnostics or the sync-baseline mode in `ChunkedWebsocketClient`
+(`mode = 1`); reintroduces pauses and is not the production default.
+
+## Mode catalogue (ChunkedWebsocketClient)
+
+The `flash_rt.serving.ChunkedWebsocketClient` wrapper exposes the
+above knobs through a single integer mode:
+
+| mode | scheduling | splice | seam blend | use |
+|---|---|---|---|---|
+| 1 | sync, k=5 truncate-replan, block on infer | n/a | n/a | baseline A/B |
+| 2 | async, fire-ASAP, splice at `d` (auto) | yes | 0 | debug raw policy |
+| 3 (default) | async, fire-ASAP, splice at `d` (auto) | yes | 3 | smooth, low blend cost |
+| 4 | async, fire-ASAP, splice at `d` (auto) | yes | 5 | extra-smooth |
+| 5 (future) | async + server-side RTC inpainting | n/a | n/a | smoothness via prefix attention guidance |
+
+Mode 5 will replace client-side seam blending with the paper's
+prefix-attention guidance ("ΠGDM" in the paper): the server receives
+the unexecuted suffix of the previous chunk and inpaints the first
+`d` actions of the new chunk to match what was actually executed.
+That removes the seam by construction (no client-side smoothing
+required). It needs server-side support which is not yet shipped.
 
 ## What This Is Not
 

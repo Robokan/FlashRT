@@ -146,7 +146,7 @@ def _build_padded_attn_lora_a(
     la_q: np.ndarray,         # (NH, D, r_q)
     la_k: np.ndarray,         # (D, r_kv)
     la_v: np.ndarray,         # (D, r_kv)
-    fuse_attn: np.ndarray,    # (D,)
+    fuse_attn: np.ndarray | None,  # (D,) for encoder RMSNorm; None for decoder AdaRMSNorm
 ) -> np.ndarray:
     """Stack Q/K/V LoRA ``lora_a`` matrices into one (D, NH*r_q + 2*r_kv) tensor.
 
@@ -157,9 +157,12 @@ def _build_padded_attn_lora_a(
     output projections so a single ``bf16_nn_res`` accumulates the right
     LoRA delta into the fused QKV output slice in one pass.
 
-    ``fuse_attn`` (= ``1 + pre_attention_norm.scale``) is folded into the
-    input axis of every la-block, mirroring the same fold the base QKV
-    weight already received in ``convert_pi05_orbax``.
+    ``fuse_attn``: pass ``(1 + pre_attention_norm.scale)`` for the
+    encoder, where the static RMSNorm scale can be folded into the LoRA
+    input axis to match the base QKV weight's fold. Pass ``None`` for
+    the decoder, where the norm is AdaRMSNorm (per-step time-conditioned
+    modulation) and the normed activation is computed at runtime — no
+    static fold possible.
     """
     NH, D, r_q = la_q.shape
     D_k, r_kv = la_k.shape
@@ -169,10 +172,8 @@ def _build_padded_attn_lora_a(
     la_q_flat = la_q.transpose(1, 0, 2).reshape(D, NH * r_q)
     # Concatenate K and V columns. KV LoRA already has D as the second axis.
     la_full = np.concatenate([la_q_flat, la_k, la_v], axis=1).astype(np.float32)
-    # Fold the RMSNorm scale into the input axis. The base QKV weights
-    # had the same fold; matching it on la keeps the runtime forward
-    # mathematically equivalent to JAX's "(x * fuse_attn) @ la".
-    la_full = la_full * fuse_attn[:, None]
+    if fuse_attn is not None:
+        la_full = la_full * fuse_attn[:, None]
     return la_full
 
 
@@ -904,6 +905,43 @@ def convert_pi05_orbax(
     dec_attn_mod_w_list, dec_attn_mod_b_list = [], []
     dec_ffn_mod_w_list, dec_ffn_mod_b_list = [], []
 
+    # Decoder runtime-LoRA lookups — same pattern as the encoder block
+    # above but on the ``_1``-suffixed gemma_expert keys. AdaRMSNorm
+    # modulation is time-conditioned and applied per-step at runtime, so
+    # we do NOT fold any norm scale into the LoRA ``la`` tensors here
+    # (encoder folds ``1 + pre_attention_norm.scale`` because that scale
+    # is static).
+    dec_attn_qkv_la_list, dec_attn_qkv_lb_list = [], []
+    dec_attn_o_la_list,   dec_attn_o_lb_list   = [], []
+    dec_ffn_gate_la_list, dec_ffn_gate_lb_list = [], []
+    dec_ffn_up_la_list,   dec_ffn_up_lb_list   = [], []
+    dec_ffn_down_la_list, dec_ffn_down_lb_list = [], []
+    _dec_gating_base = "PaliGemma.llm.layers.mlp_1.gating_einsum"
+    _dec_linear_base = "PaliGemma.llm.layers.mlp_1.linear"
+    _dec_gating_pair = runtime_lora_pairs.get(_dec_gating_base)
+    _dec_linear_pair = runtime_lora_pairs.get(_dec_linear_base)
+    _dec_q_pair      = runtime_lora_pairs.get("PaliGemma.llm.layers.attn.q_einsum_1.w")
+    _dec_kv_pair     = runtime_lora_pairs.get("PaliGemma.llm.layers.attn.kv_einsum_1.w")
+    _dec_o_pair      = runtime_lora_pairs.get("PaliGemma.llm.layers.attn.attn_vec_einsum_1.w")
+    _has_dec_ffn_lora  = (_dec_gating_pair is not None
+                          and _dec_linear_pair is not None)
+    _has_dec_attn_lora = (_dec_q_pair is not None
+                          and _dec_kv_pair is not None
+                          and _dec_o_pair is not None)
+    if (_dec_q_pair is not None) != (_dec_kv_pair is not None) or \
+       (_dec_q_pair is not None) != (_dec_o_pair is not None):
+        raise ValueError(
+            "Runtime LoRA: partial decoder-attention extraction is not "
+            "supported — q/kv/o must all be present or all merged. Got "
+            f"q={_dec_q_pair is not None}, kv={_dec_kv_pair is not None}, "
+            f"o={_dec_o_pair is not None}.")
+    if (_dec_gating_pair is not None) != (_dec_linear_pair is not None):
+        raise ValueError(
+            "Runtime LoRA: partial decoder-FFN extraction is not "
+            "supported — gating + linear must both be present or both "
+            f"merged. Got gating={_dec_gating_pair is not None}, "
+            f"linear={_dec_linear_pair is not None}.")
+
     for i in range(DEC_L):
         # AdaRMSNorm modulation: JAX (1024, 3072) — already (in, out)
         dec_attn_mod_w_list.append(
@@ -950,6 +988,32 @@ def convert_pi05_orbax(
         o_w = raw["PaliGemma.llm.layers.attn.attn_vec_einsum_1.w"][i].astype(np.float32)
         dec_o_list.append(o_w.reshape(-1, o_w.shape[-1]))
 
+        # Runtime LoRA — decoder attention (Q + KV merged via padding; O via N-sum).
+        # No norm fold — AdaRMSNorm modulation is applied per-step at
+        # runtime (see _decoder_layer's ada_rms_norm_style call).
+        if _has_dec_attn_lora:
+            la_q_full, lb_q_full = _dec_q_pair       # (L, NH, D, r), (L, NH, r, HD)
+            la_kv_full, lb_kv_full = _dec_kv_pair    # (L, 2, NKV, D, r), (L, 2, NKV, r, HD)
+            la_o_full, lb_o_full   = _dec_o_pair     # (L, NH, HD, r), (L, NH, r, D)
+
+            la_q  = la_q_full[i]                              # (NH, D, r)
+            lb_q  = lb_q_full[i]                              # (NH, r, HD)
+            la_k  = la_kv_full[i, 0, 0]                       # (D, r)  (NKV=1, squeeze)
+            la_v  = la_kv_full[i, 1, 0]
+            lb_k  = lb_kv_full[i, 0, 0]                       # (r, HD)
+            lb_v  = lb_kv_full[i, 1, 0]
+            la_o  = la_o_full[i]                              # (NH, HD, r)
+            lb_o  = lb_o_full[i]                              # (NH, r, D)
+
+            qkv_la = _build_padded_attn_lora_a(la_q, la_k, la_v, fuse_attn=None)
+            qkv_lb = _build_padded_attn_lora_b(lb_q, lb_k, lb_v)
+            dec_attn_qkv_la_list.append(qkv_la)
+            dec_attn_qkv_lb_list.append(qkv_lb)
+
+            o_la, o_lb = _build_o_lora(la_o, lb_o)
+            dec_attn_o_la_list.append(o_la)
+            dec_attn_o_lb_list.append(o_lb)
+
         # Gate / Up: JAX (2, 1024, 4096) — already (in, out), no fold
         gu_w = raw["PaliGemma.llm.layers.mlp_1.gating_einsum"][i].astype(np.float32)
         dec_gate_list.append(gu_w[0])
@@ -959,11 +1023,41 @@ def convert_pi05_orbax(
         dec_down_list.append(
             raw["PaliGemma.llm.layers.mlp_1.linear"][i].astype(np.float32))
 
+        # Runtime LoRA — decoder FFN gate/up + down. No norm fold —
+        # AdaRMSNorm modulation is applied per-step at runtime.
+        if _has_dec_ffn_lora:
+            la_gu, lb_gu = _dec_gating_pair   # (L, 2, D, r), (L, 2, r, H)
+            la_dn, lb_dn = _dec_linear_pair   # (L, H, r), (L, r, D)
+            dec_ffn_gate_la_list.append(la_gu[i, 0].astype(np.float32))  # (D, r)
+            dec_ffn_up_la_list.append(  la_gu[i, 1].astype(np.float32))
+            dec_ffn_gate_lb_list.append(lb_gu[i, 0].astype(np.float32))  # (r, H)
+            dec_ffn_up_lb_list.append(  lb_gu[i, 1].astype(np.float32))
+            dec_ffn_down_la_list.append(la_dn[i].astype(np.float32))     # (H, r)
+            dec_ffn_down_lb_list.append(lb_dn[i].astype(np.float32))     # (r, D)
+
     ckpt["decoder_attn_qkv_w"] = _to_bf16_cuda(np.stack(dec_qkv_list))
     ckpt["decoder_attn_o_w"] = _to_bf16_cuda(np.stack(dec_o_list))
     ckpt["decoder_ffn_gate_w"] = _to_bf16_cuda(np.stack(dec_gate_list))
     ckpt["decoder_ffn_up_w"] = _to_bf16_cuda(np.stack(dec_up_list))
     ckpt["decoder_ffn_down_w"] = _to_bf16_cuda(np.stack(dec_down_list))
+
+    # Runtime LoRA tensors for the decoder (see pipeline_rtx.py:Phase C
+    # for the apply side). Stacked across all 18 layers; the per-layer
+    # slice is indexed inside ``_decoder_layer``. Same dtype contract
+    # as the base decoder weights (bf16 cuda).
+    if _has_dec_attn_lora:
+        ckpt["decoder_attn_qkv_lora_a"] = _to_bf16_cuda(np.stack(dec_attn_qkv_la_list))
+        ckpt["decoder_attn_qkv_lora_b"] = _to_bf16_cuda(np.stack(dec_attn_qkv_lb_list))
+        ckpt["decoder_attn_o_lora_a"] = _to_bf16_cuda(np.stack(dec_attn_o_la_list))
+        ckpt["decoder_attn_o_lora_b"] = _to_bf16_cuda(np.stack(dec_attn_o_lb_list))
+    if _has_dec_ffn_lora:
+        ckpt["decoder_ffn_gate_lora_a"] = _to_bf16_cuda(np.stack(dec_ffn_gate_la_list))
+        ckpt["decoder_ffn_gate_lora_b"] = _to_bf16_cuda(np.stack(dec_ffn_gate_lb_list))
+        ckpt["decoder_ffn_up_lora_a"]   = _to_bf16_cuda(np.stack(dec_ffn_up_la_list))
+        ckpt["decoder_ffn_up_lora_b"]   = _to_bf16_cuda(np.stack(dec_ffn_up_lb_list))
+        ckpt["decoder_ffn_down_lora_a"] = _to_bf16_cuda(np.stack(dec_ffn_down_la_list))
+        ckpt["decoder_ffn_down_lora_b"] = _to_bf16_cuda(np.stack(dec_ffn_down_lb_list))
+
     ckpt["decoder_pre_attn_norm_mod_w"] = _to_bf16_cuda(np.stack(dec_attn_mod_w_list))
     ckpt["decoder_pre_attn_norm_mod_b"] = _to_bf16_cuda(np.stack(dec_attn_mod_b_list))
     ckpt["decoder_pre_ffn_norm_mod_w"] = _to_bf16_cuda(np.stack(dec_ffn_mod_w_list))

@@ -1551,6 +1551,437 @@ follow-up commit replaces that wrapper with
 and threads a `--blending-mode` parameter through `/jax/start_policy`.
 That belongs in the SparkJAX repo, not here.
 
+### G6 — head-to-head with openpi-JAX on the real OpenArm checkpoint
+
+After integrating `ChunkedWebsocketClient` into SparkJAX and trying
+real-robot rollouts, ran two unplanned diagnostic threads. Both
+produced surprises worth recording.
+
+**Finding 1 — FlashRT's chunks look ~15× "smoother" than openpi-JAX's
+at the seams, but the cause is not a better sampler — it's that
+FlashRT's chunks barely contain any motion.** This is the corrected
+read of an initial probe that misled us; recording both numbers so
+the next agent doesn't re-fall-for-it.
+
+Same calib frame fed back-to-back to each server. *Seam jump* =
+`|chunk_{N+1}[0] - chunk_N[-1]|` per joint; *chunk spread* =
+`max(chunk_N) - min(chunk_N)` per joint inside ONE chunk:
+
+| server | H | med latency | seam jump L0 (med / max) | L0 chunk spread | L7 grip chunk spread |
+|---|---|---|---|---|---|
+| openpi-JAX h50 (port 8000) | 50 | 318 ms | 1.01 / 1.27 rad | **1.52 rad** | **2.35 rad** |
+| FlashRT (port 8002)        | 10 | 145 ms | 0.03 / 0.15 rad | **0.03 rad** | **0.07 rad** |
+
+Per-call jitter (std across 3 same-obs repeats per frame, averaged
+over joints) is actually **larger** on FlashRT (~0.027) than on
+openpi-JAX (~0.008), and `pi05_rtx.py:1937` does call
+`self._noise_buf.normal_()` every predict — so FlashRT IS resampling
+fresh diffusion noise each call. The seam jumps are tiny because the
+*chunks themselves are nearly static*: openpi-JAX predicts a 1.5 rad
+shoulder swing inside one 1-second chunk (the actual "go pick up
+the chocolate bar" motion), FlashRT predicts a 0.03 rad shoulder
+wiggle. If the chunk doesn't go anywhere, `chunk_N[-1] ≈ chunk_N[0]
+≈ state`, and `chunk_{N+1}[0] ≈ state`, so the seam is small *by
+construction*.
+
+In other words, the "FlashRT is smoother" effect is **the same bug
+as Finding 2** (the shoulder bias) — both symptoms of a decoder
+that isn't actually predicting motion. The visible failure mode on
+the real robot is "barely moves and reaches upward," which lines up
+exactly with this.
+
+Implication: do NOT treat the small-seam result as a feature we can
+keep. Once decoder LoRA / `action_out_proj` is fixed and FlashRT
+starts predicting real motion, the per-call noise stochasticity will
+re-introduce chunk-boundary disagreement comparable to openpi-JAX's
+(because the same diffusion math will then express real predicted
+trajectories instead of near-zero ones). At that point the deferred
+mode-5 (cross-chunk seam blend) work re-enters the critical path.
+
+**Finding 2 — FlashRT has a +0.28 rad bias on shoulder joints (L3
+and R3) vs openpi-JAX, on the same checkpoint.** Quantified across
+5 calib frames × 3 same-obs samples per frame (mean ± std):
+
+| joint                 | bias mean (rad) | sign-stable? | matches user report |
+|-----------------------|-----------------|--------------|---------------------|
+| L3 — left shoulder    | **+0.282**      | yes (5/5)    | "arms reach upward" |
+| R3 — right shoulder   | **+0.336**      | yes (5/5)    | same                |
+| L1                    | -0.097          | yes          |                     |
+| R1                    | +0.119          | yes          |                     |
+| R7 — right gripper    | -0.22 → -0.16   | yes          |                     |
+| (others)              | < ±0.05         | mixed        |                     |
+
+For comparison: the openpi JAX→PyTorch port had a documented
+**+0.135 rad** bias on the same joint (see
+`openpi/PYTORCH_PARITY_DEBUG.md`). FlashRT's number is ~2× that.
+
+The shape of the bias is `action ≈ state + constant_offset` on the
+shoulders — i.e. FlashRT's diffusion sampler tracks state correctly
+but adds a fixed positive offset to the output. Constant under
+identical observations, repeatable across frames.
+
+**Ruled out** (with on-server probe data):
+
+| candidate                          | how ruled out                                                                |
+|-----------------------------------|------------------------------------------------------------------------------|
+| FP8 quantization                  | restart with `--no-fp8` (BF16) reproduces bias within ±0.005 rad             |
+| FP8 calibration drift             | BF16 has no FP8 calibration; bias unchanged                                  |
+| Encoder runtime-LoRA precision    | `FLASHRT_RUNTIME_LORA=encoder` (the openpi-PT-style runtime-LoRA path on all 90 encoder modules) shifts other joints by ~0.02 rad but leaves L3 / R3 within 0.005 rad |
+| `norm_stats.json` divergence      | md5-identical between `assets/`, checkpoint dir, and what each container loads (4/4 paths checksum-match) |
+| `delta_action_mask` double-add    | `FlashRTPolicyAdapter` and openpi's `AbsoluteActions` both apply `+state` once on delta dims; same code path |
+
+**Still open** (in priority order):
+
+1. **Decoder runtime LoRA is missing (highest confidence).** This now
+   explains *both* the shoulder bias (Finding 2) AND the near-static
+   chunks (Finding 1) with one mechanism. `flash_rt/models/pi05/pipeline_rtx.py`
+   has runtime-LoRA apply kernels for `encoder_*_lora_{a,b}` (lines
+   1352–1632) but **none for `decoder_*_lora_{a,b}`** despite the
+   conversion side extracting them. So even with
+   `FLASHRT_RUNTIME_LORA=1`/`all`, the decoder LoRA is un-applied
+   (worse than merged). The gemma_expert decoder is what was fine-tuned
+   to actually *produce* robot trajectories on the chocolate_bars
+   task; without its LoRA adapters the gemma_expert falls back to
+   its base-pretrained "action prior" — which, for an action-prediction
+   head trained ~from scratch, naturally predicts something close to
+   the dataset action mean with very little within-chunk dynamics.
+   The openpi-PT fix patched both experts (252 modules); we've only
+   got the encoder half (90). Implementing decoder apply kernels
+   mirroring the encoder ones is the unblocking change.
+2. **`action_out_proj` weight/bias load.** A normalized bias offset
+   of +0.47 on dim 3 would unnormalize to exactly the +0.28 rad we
+   see. Cheap to rule in/out — 30-LoC orbax-only audit (see
+   "memory-safe recipe" below). Worth running *before* the decoder
+   LoRA work because it's a 10-minute check; if the bias is here, it's
+   a much smaller fix than threading 162 new apply kernels through
+   the decoder.
+3. **State-in-prompt tokenization parity.** Pi0.5 OpenArm encodes
+   state into discretised tokens appended to the prompt. If FlashRT's
+   bucket boundaries differ from openpi-JAX's, state would be parsed
+   differently → constant output bias on certain joints. Lower
+   probability given that the bias tracks state (suggests the state
+   IS being read correctly, just biased on output side), but worth
+   verifying — especially if (1) and (2) come back clean.
+
+**Re-reading the openpi PyTorch parity work top-to-bottom**
+(`openpi/PYTORCH_PARITY_DEBUG.md`, `openpi/JAX_TO_PYTORCH_LORA_CONVERSION.md`,
+`openpi/src/openpi/models_pytorch/lora_runtime.py`) shifted my read of
+this entire investigation. Recording the operational lessons that
+weren't obvious from the first pass:
+
+**The single most important finding:** openpi explicitly tested the
+"merge LoRA in fp32 then bf16-cast for inference" path and rejected
+it. From their table:
+
+| Variant | post-unnorm magnitude ratio |
+|---|---|
+| Pre-merge **fp32** (FIXED ckpt) | **0.918** (8% bias — robot drifts up) |
+| Runtime LoRA, bf16 inference    | 0.9928 (0.7% bias) |
+| Runtime LoRA, fp32 inference    | **0.9974** (0.26% — robot works) |
+
+`flash_rt/frontends/jax/pi05_rtx.py:_maybe_merge_lora` (lines 391-414)
+docstring claims fp32 merge is equivalent to JAX's bf16 inference.
+**Openpi proved that's wrong.** The fp32-merge path is the exact
+variant they tested and replaced with runtime LoRA. FlashRT picked
+this rejected variant *and* layered FP8 on top — enough to predict
+2× their bias (which is what we see: +0.282 vs their +0.135 rad on L3).
+
+**This unifies Findings 1 and 2 and the "missing decoder LoRA" candidate
+into one mechanism:** the LoRA contribution that taught the model to
+predict robot motion is being lost in the bf16/FP8 rounding of the
+merged base weight, exactly as openpi documented. Encoder runtime LoRA
+helps but isn't enough (openpi needed all 252 modules in runtime form,
+and even then bf16 left a 0.7% residual that only fp32 closed).
+
+**12 operational lessons from the openpi parity record, applied to FlashRT:**
+
+1. **Cos is not the discriminator. Ratio is.** "cos was 0.996 for both
+   broken and working states." Our probes measure absolute joint
+   values, never magnitudes. Add per-chunk `||FlashRT_action|| /
+   ||JAX_action||` to every probe — that single scalar would have
+   surfaced "FlashRT is 80% of openpi's signal" on day one.
+
+2. **The 10-minute decisive test is "LoRA-off / LoRA-on."** openpi's
+   `diag_no_lora.py` pattern: run FlashRT with
+   `FLASHRT_LORA_SCALING=0` (zeros the LoRA contribution per
+   `_maybe_merge_lora` line 463: `raw[base_key] = w + 0 * delta = w`)
+   AND run openpi with `lora_a`/`lora_b` zeroed. Compare. Their result:
+   with LoRA = +0.135 rad / ratio 0.918; without LoRA = +0.003 rad /
+   ratio 0.999. **This isolates "LoRA path bug" from "base model bug"
+   in one run.** Should be the first thing tomorrow before any
+   decoder-LoRA kernel work. If FlashRT-no-LoRA matches openpi-no-LoRA
+   but the with-LoRA paths diverge by 8-20%, the bug is definitively
+   in LoRA handling.
+
+3. **`action_out_proj` is upstream-clean per openpi. Skip that audit.**
+   "The bias is already present in `suffix_out` BEFORE this projection
+   (cos=0.9946, ratio=0.9924)." Bias accumulates ~0.3% per layer
+   through the 18-layer gemma_expert (PT V at final paligemma layer
+   was +5.0% larger than JAX V). The right audit is **per-layer
+   gemma_expert hidden-state diff**, not `action_out_proj` weight diff.
+   (Memory-safe orbax recipe below stays — useful for sanity-checking
+   bias values, just not the smoking gun.)
+
+4. **RoPE `inv_freq` precision is a separate bug class.** openpi found
+   this *before* the LoRA bug: bf16-truncated `inv_freq` made PT cos at
+   pos 968 dim 1 +0.129 vs JAX's -0.665 (completely wrong rotation).
+   pi05_openarm's suffix tokens sit at positions ~968-1017. **FlashRT
+   has its own CUDA RoPE — we have not verified `inv_freq` is fp32
+   there.** Check `flash_rt/models/pi05/pipeline_rtx.py` for the RoPE
+   table dtype before declaring LoRA the only bug.
+
+5. **AdaRMS dense modulation MUST stay fp32.** openpi keeps it via
+   `params_to_keep_float32`. FlashRT line 908 documents shape only;
+   the dtype path is unverified. Casting to bf16 was a per-step ~1e-3
+   error that compounds.
+
+6. **`time_emb` (posemb_sincos) MUST stay fp32 too.** Same mechanism.
+
+7. **Tiny dense heads in FlashRT are already bf16, not FP8 (good).**
+   `_to_bf16_cuda` at lines 982-985, 1015-1020 covers `time_mlp_*`,
+   `action_in_proj`, `action_out_proj`. But openpi kept them at
+   whatever-safetensors-had (typically fp32 for the converter path).
+   Bumping these from bf16 to fp32 in the FlashRT pipeline is cheap
+   and matches the openpi production config.
+
+8. **FP8 + runtime LoRA needs the `LoraLinear nn.Module` wrapper
+   pattern, not monkey-patch.** openpi's modelopt + monkey-patch
+   experiment gave cos=0.85 / post-unnorm cos=0.53 catastrophe.
+   `JAX_TO_PYTORCH_LORA_CONVERSION.md §7` lays out the wrapper-based
+   refactor as the path forward. FlashRT's docstring at
+   `pi05_rtx.py:408-413` correctly identifies "separate FP8 calibration
+   for the LoRA neck" as the cost — but openpi's recipe is **don't
+   quantize the LoRA neck at all** (keep it bf16/fp32 alongside the FP8
+   base), which composes cleanly and costs 0.25% bias for 1.04× speed.
+
+9. **Calibration distribution matters as much as bit-width.** openpi
+   torchao `nvfp4` (≈ FlashRT NVFP4 W4A16) without calibration loses
+   6.4% magnitude. With calibrated scales on real openarm samples it
+   matches fp32. We already calibrate on real samples — the issue is
+   that we calibrate against LoRA-MERGED activations (which contain
+   the 850× outliers at `encoder_ffn_down_w_16`). Calibrating against
+   no-LoRA activations + applying LoRA at runtime in bf16 would change
+   the calibration distribution and likely fix the outlier cluster.
+
+10. **State + embed_prefix were clean in openpi.** "lang token cos =
+    1.0 at embed_prefix" after the tying fix; "state values identical
+    between JAX and PT through the entire input pipeline." Cheap to
+    validate on FlashRT: capture the prompt string + state tokens at
+    both servers, md5-compare. If they match (likely), state-in-prompt
+    candidate drops out and the whole investigation focuses on the
+    transformer forward.
+
+11. **JAX-fp32 reference is unreachable.** "flax linen nn.scan
+    parameters aren't reachable via nnx.iter_graph, so naive
+    `astype(fp32)` only catches a fraction of the params." Don't waste
+    a day trying to build a JAX-fp32 reference; the only fp32 reference
+    that worked for openpi was their PT fp32 path.
+
+12. **CUDA graph capture can hide debug-vs-production divergence.**
+    openpi's analog: torch.compile flipped cos from -0.96 (eager) to
+    0.85 on pi05_libero. FlashRT uses CUDA graphs in
+    `_graph_torch_stream` (`pi05_rtx.py:1934`). Verify probes hit the
+    same path the real server uses — a "debug only, no graph" knob
+    might show different numbers than what the robot sees.
+
+**Re-prioritised next-session running order:**
+
+1. **Stop all servers.** `docker stop flashrt_spark openpi`.
+2. **Add magnitude ratio to `probe_joint_bias.py`.** Two lines: print
+   `np.linalg.norm(flashrt_action[0]) / np.linalg.norm(jax_action[0])`
+   per frame, alongside the per-joint bias. ~5 minutes. This gives
+   us the discriminator openpi proved is decisive.
+3. **Run the "LoRA-off vs LoRA-on" diagnostic.** Start FlashRT with
+   `FLASHRT_LORA_SCALING=0`, openpi with manually-zeroed
+   `lora_a`/`lora_b` (one-line monkey-patch in serve_policy.py). Probe
+   both. Expected if openpi's analysis transfers: with-LoRA gap is
+   ~8-20% in magnitude ratio, no-LoRA gap is <1%. **This decisively
+   localises the bug to LoRA pathway in <15 minutes.** Will also tell
+   us whether the bias is from "LoRA contribution lost in merge"
+   (most likely) vs some base-model wiring issue (less likely).
+4. **Check RoPE `inv_freq` and AdaRMS Dense dtypes** in
+   `pipeline_rtx.py`. Both should be fp32. If either is bf16/FP8, fix
+   and re-probe. ~30 minutes including rebuild. This is independent
+   of the LoRA fix and can be done in parallel.
+5. **Only if (3) shows the LoRA pathway is the bug:** redesign FlashRT
+   LoRA application following openpi's `LoraLinear nn.Module` wrapper
+   pattern (`JAX_TO_PYTORCH_LORA_CONVERSION.md §7`). This is the real
+   work — touches `pipeline_rtx.py` LoRA apply kernels for both encoder
+   (already present) and decoder (currently missing). The kernels need
+   to accept `lora_a`/`lora_b` as separate buffers and add their
+   contribution to the FP8 base GEMM output in bf16. Days of work, but
+   we now know exactly what we're building toward.
+6. **Only then** re-evaluate seam blending. Once FlashRT predicts real
+   motion, its seam jumps will look more like openpi-JAX's and mode-5
+   cross-chunk blend re-enters the critical path.
+
+**The `action_out_proj` audit candidate is demoted from #2 to optional.**
+openpi already verified per-tensor weight cos=1.0 between JAX and PT,
+and the bias originates upstream in the expert forward. The
+memory-safe orbax recipe below is still useful for sanity-checking
+that the converter isn't doing something weird with the dim-3 bias
+value specifically, but it's not the smoking gun.
+
+**Resolution (2026-05-21 evening) — the bias was a 1-line bug in
+`unnormalize_actions`, NOT a LoRA application bug.**
+
+The diagnostic chain that produced the fix:
+
+1. Implemented decoder runtime LoRA (Phases 1-3 of the
+   `decoder_*_lora_{a,b}` extraction + apply work above). Verified at
+   pipeline init: `Pi05Pipeline: runtime LoRA enabled for decoder
+   (ffn_gateup=True, ffn_down=True, attn=True, rank=32)`. **Bias
+   unchanged: still +0.2783 rad on L3/R3 with zero within-chunk spread.**
+   This ruled out the "missing decoder LoRA" hypothesis above. The
+   decoder LoRA changes are still kept (they're the correct openpi-PT
+   parity path and improve overall magnitude ratio) but they were not
+   the bug.
+
+2. Spun up `openpi_jax_server_h10` on port 8001 (docker, same
+   `openpi_server_ngc` image as h50 but with `--port 8001` and
+   `action_horizon=10` patched in to match the
+   `chocolate_bars_pi05_h10/29999` ckpt that FlashRT serves). Did
+   head-to-head with `/tmp/probe_h10_compare.py`:
+   - L3 a0-state: JAX +0.019, FlashRT +0.278 (diff +0.259)
+   - L3 chunk spread: JAX 0.119, FlashRT **0.000**
+   - R3 same pattern
+   - ‖a0‖ ratio FlashRT/JAX: **1.092** (the same 9% magnitude
+     inflation openpi-PT had before the runtime-LoRA fix)
+
+   This proved the bug was FlashRT-specific (JAX-h10 produces sensible
+   motion on the same ckpt), and the EXACT value `+0.2783 rad =
+   actions.q01[3]` made it likely to be in the un-normalize path.
+
+3. Env-gated diagnostic in `flash_rt/core/utils/actions.py:unnormalize_actions`
+   (`FLASHRT_DEBUG_UNNORM=1`) printed the raw model output BEFORE
+   the existing `np.clip(actions, -1.0, 1.0)`. Result for frame 0:
+
+   ```
+   per-joint min over chunk = [...,  L3 = -1.21, ..., R3 = -1.30, ...]
+   per-joint #raw<-1        = [0,0,0,10, 0,0,0,0, 0,0,0,10, 0,0,0,0]
+   ```
+
+   Only L3 and R3 went below -1.0, and they did so at every one of the
+   10 chunk indices. So the model was correctly producing slight
+   extrapolation past the training quantile range (-1.2 to -1.3 in
+   normalized space), and FlashRT's clip was floor-ing all 10 to -1.0,
+   which un-normalized to `q01[3] = q01[11] = 0.2783` — the exact
+   constant bias.
+
+4. Cross-checked `openpi/src/openpi/transforms.py::Unnormalize.
+   _unnormalize_quantile`:
+
+   ```python
+   return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+   ```
+
+   **No clip.** OpenPI allows the un-normalize to extrapolate past
+   `[q01, q99]` when the model output exceeds `[-1, 1]`. FlashRT's
+   `unnormalize_actions` had an extra `np.clip(actions, -1.0, 1.0)`
+   that openpi never had. That was the bug.
+
+5. Removed the clip from `unnormalize_actions`. Re-ran the head-to-head
+   probe:
+
+   | metric                   | before clip-fix | after clip-fix | JAX-h10 ref |
+   |--------------------------|-----------------|----------------|-------------|
+   | L3 a0-state bias         | +0.278 rad      | +0.021 rad     | +0.022 rad  |
+   | R3 a0-state bias         | +0.278 rad      | -0.059 rad     | -0.050 rad  |
+   | L3 within-chunk spread   | 0.000 rad       | 0.093 rad      | 0.068 rad   |
+   | R3 within-chunk spread   | 0.000 rad       | 0.015 rad      | 0.017 rad   |
+   | ‖a0‖ ratio FlashRT/JAX   | 1.092 (+9%)     | 1.011 (+1%)    | 1.000       |
+   | max per-joint bias diff  | +0.336 rad      | ±0.05 rad      | n/a         |
+
+   All 16 joints now within ±0.05 rad of JAX-h10 on `chocolate_bars_pi05_h10`.
+
+**Lessons for the next agent:**
+
+- "It's the LoRA" was the wrong hypothesis. Spent ~Phases 1-3 on a
+  conversion + apply path that was correct-to-add for openpi-PT
+  parity but did not move the shoulder bias at all. The actual bug
+  was a 1-line transform downstream of all model math. The lesson
+  re-confirms the "compare to JAX on the same checkpoint at the
+  earliest possible point" rule: an hour spent spinning up the JAX-h10
+  server saved days of LoRA-instrumentation that turned out to be
+  orthogonal to the bug.
+
+- The `actions.q01` = +0.2783 number was a real clue, not noise. It
+  appeared in the data and it was the exact magnitude of the bias.
+  When a measurement matches a constant from your norm-stats file
+  to 4 decimal places, the bug is in the transform between the model
+  and that constant.
+
+- FlashRT had been clipping for a long time. The `np.clip` likely
+  came in as a "defensive against out-of-distribution model output"
+  guard, but openpi's design is to LET the model extrapolate past
+  the quantile range — that's where the LoRA-fine-tuned shoulder
+  range is. Trim defensive guards that diverge from upstream
+  numerical behaviour, not the other way around.
+
+**Probe + audit scripts (do not delete):**
+
+- `/tmp/probe_joint_bias.py` — compares `action[0]` between two
+  servers across N calib frames, prints per-joint bias summary with
+  sign-stability flags. Pure client-side (uses `openpi_client`); no
+  FlashRT import; <500 MB RAM.
+- `/tmp/probe_h10_compare.py` — JAX-h10 (port 8001) vs FlashRT-h10
+  (port 8002) head-to-head on the SAME `chocolate_bars_pi05_h10/29999`
+  ckpt at H=10. Prints per-joint a0-bias, chunk spread, magnitude
+  ratio. **This is the canonical regression test** for the clip fix;
+  L3/R3 bias delta should stay under ±0.05 rad and ‖a0‖ ratio within
+  ±5 % of 1.0.
+- `/tmp/probe_flashrt_only.py` — FlashRT-alone smoke probe (no JAX
+  reference). Reads chunks and reports `a0-state` per joint + chunk
+  spread. Useful when JAX server is down.
+- `/tmp/probe_both_servers.py` — head-to-head latency + seam-jump
+  measurement; produced the G6 Finding 1 table above.
+- `/tmp/audit_action_out_proj.py` — **MEMORY-UNSAFE.** Imports
+  `flash_rt.frontends.jax.pi05_rtx.convert_pi05_orbax`, which loads
+  the full ~13 GB orbax checkpoint AND allocates CUDA buffers. Running
+  this while a FlashRT server is already up will OOM the workstation
+  (this happened once on 2026-05-21 and took down the Cursor IDE).
+  Rewrite before re-running: use **`orbax.checkpoint.PyTreeCheckpointer`
+  directly**, extract only `action_out_proj.kernel` and
+  `action_out_proj.bias` from the restored tree, do not import any
+  `flash_rt.*` module. Stays under 2 GB peak.
+
+**Memory-safe recipe for next-session weight audits on Spark:**
+
+```python
+# Read action_out_proj from orbax WITHOUT triggering FlashRT init.
+# Run with NO FlashRT server up. Stays under 2 GB peak.
+import orbax.checkpoint as ocp
+import numpy as np
+from pathlib import Path
+
+CKPT = Path("/home/evaughan/sparkpack/openpi/checkpoints/"
+            "pi05_openarm_ngc_lora_v4/chocolate_bars_pi05/29999/params")
+raw = ocp.PyTreeCheckpointer().restore(CKPT)
+
+def find(d, needle, prefix=""):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            yield from find(v, needle, f"{prefix}/{k}" if prefix else k)
+    elif needle in prefix:
+        yield prefix, d
+
+for path, arr in find(raw, "action_out_proj"):
+    a = np.asarray(arr)
+    print(f"{path}: shape={a.shape}, dtype={a.dtype}")
+    if "bias" in path:
+        print(f"  bias[3]:  {float(a[3]):.6f}")
+        print(f"  bias[11]: {float(a[11]):.6f}")
+```
+
+**SparkJAX-side hot-stop reminder for the next agent.** The
+`ros2 service call /jax/start_policy` client is just the requester
+— **killing it with Ctrl-C does NOT stop the policy thread inside
+`openpi_runner_node`**. The user had to power-cycle the robot once
+to recover from a runaway session. The only safe shutdowns are
+`ros2 service call /jax/stop_policy ...` or the SparkJAX web UI
+stop button. Communicate this to the user when any hardware-touching
+test is being set up.
+
 ## Playground — interactive LIBERO sim with hot-swappable blending
 
 `examples/libero_playground.py` opens a live MuJoCo viewer window, takes

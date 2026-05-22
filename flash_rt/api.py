@@ -230,7 +230,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                cache_frames=None,
                use_fp8=True,
                robot_action_dim=None,
-               max_prompt_len=None):
+               max_prompt_len=None,
+               chunk_size=None):
     """Load a FlashRT model.
 
     Args:
@@ -456,6 +457,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         # ~80-token state-in-prompt sequences (default is 48 = state-blind).
         if max_prompt_len is not None and "max_prompt_len" in sig.parameters:
             kwargs["max_prompt_len"] = max_prompt_len
+        # Override the default chunk_size (action horizon per inference)
+        # — used to serve a checkpoint that was trained at a different
+        # horizon than FlashRT's default of 10. e.g. the h50 OpenArm
+        # ``pi05_openarm_ngc_lora_v4/chocolate_bars_pi05/29999`` ckpt
+        # needs ``chunk_size=50`` to match its training-time horizon.
+        if chunk_size is not None and "chunk_size" in sig.parameters:
+            kwargs["chunk_size"] = chunk_size
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

@@ -271,10 +271,36 @@ class Pi05Pipeline:
             and "encoder_attn_o_lora_a" in weights
             and "encoder_attn_o_lora_b" in weights
         )
+        # Decoder runtime LoRA — same shape contract as the encoder side
+        # but on the gemma_300m expert. Built by the JAX converter's
+        # decoder loop when ``FLASHRT_RUNTIME_LORA`` is set to a mode
+        # that includes the ``_1``-suffixed action-expert keys
+        # (``1``/``all`` cover decoder; ``encoder_ffn``/``encoder`` do
+        # not). Without these keys present, the decoder LoRA is assumed
+        # to have been merged into the base weights at conversion time.
+        self._has_dec_ffn_gateup_lora = (
+            "decoder_ffn_gate_lora_a" in weights
+            and "decoder_ffn_gate_lora_b" in weights
+            and "decoder_ffn_up_lora_a" in weights
+            and "decoder_ffn_up_lora_b" in weights
+        )
+        self._has_dec_ffn_down_lora = (
+            "decoder_ffn_down_lora_a" in weights
+            and "decoder_ffn_down_lora_b" in weights
+        )
+        self._has_dec_attn_lora = (
+            "decoder_attn_qkv_lora_a" in weights
+            and "decoder_attn_qkv_lora_b" in weights
+            and "decoder_attn_o_lora_a" in weights
+            and "decoder_attn_o_lora_b" in weights
+        )
         self._lora_scaling = float(weights.get("runtime_lora_scaling", 1.0))
         _any_enc_lora = (self._has_enc_ffn_gateup_lora
                          or self._has_enc_ffn_down_lora
                          or self._has_enc_attn_lora)
+        _any_dec_lora = (self._has_dec_ffn_gateup_lora
+                         or self._has_dec_ffn_down_lora
+                         or self._has_dec_attn_lora)
         if _any_enc_lora:
             # All Pi0.5 encoder LoRA in the OpenArm checkpoint uses r=16.
             # Read the actual rank off whichever standard 2D tensor is
@@ -322,10 +348,51 @@ class Pi05Pipeline:
                 self._lora_rank, self._lora_scaling,
                 self._enc_lora_neck_max,
             )
+
+        if _any_dec_lora:
+            # Pi0.5 gemma_300m expert LoRA uses r=32 in the OpenArm
+            # checkpoint (vs r=16 for paligemma encoder). Read off the
+            # actual rank from whichever standard 2D tensor is present.
+            # decoder_attn_qkv_lora_a is padded (NH*r + 2*r_kv) — don't
+            # read rank off it.
+            if self._has_dec_ffn_gateup_lora:
+                self._dec_lora_rank = int(
+                    weights["decoder_ffn_gate_lora_a"].shape[-1])
+            elif self._has_dec_ffn_down_lora:
+                self._dec_lora_rank = int(
+                    weights["decoder_ffn_down_lora_a"].shape[-1])
+            else:
+                self._dec_lora_rank = int(
+                    weights["decoder_attn_o_lora_a"].shape[-1])
+            # Decoder runs at ``ds = chunk_size`` rows (typically 10);
+            # much smaller than the encoder seq. Neck buffer width is
+            # the max of the rank (standard 2D sites) and the padded
+            # QKV neck width (NH*r + 2*r_kv).
+            dr = self._dec_lora_rank
+            dec_max_neck = dr
+            if self._has_dec_attn_lora:
+                dec_max_neck = max(
+                    dec_max_neck,
+                    int(weights["decoder_attn_qkv_lora_a"].shape[-1]))
+            self._dec_lora_neck_max = dec_max_neck
+            self._dec_lora_neck = CudaBuffer.device_empty(
+                self.chunk_size * dec_max_neck, BF16)
+            logger.info(
+                "Pi05Pipeline: runtime LoRA enabled for decoder "
+                "(ffn_gateup=%s, ffn_down=%s, attn=%s, rank=%d, "
+                "scaling=%.4f, max_neck=%d)",
+                self._has_dec_ffn_gateup_lora,
+                self._has_dec_ffn_down_lora,
+                self._has_dec_attn_lora,
+                self._dec_lora_rank, self._lora_scaling,
+                self._dec_lora_neck_max,
+            )
+
+        if _any_enc_lora or _any_dec_lora:
             if self._lora_scaling != 1.0:
                 # TODO: non-unit scaling needs either a scaled residual_add
                 # kernel or pre-multiplying scaling into lb at conversion.
-                # Pi0.5 OpenArm uses alpha=rank=16 so this is unit.
+                # Pi0.5 OpenArm uses alpha=rank for both experts so this is unit.
                 raise NotImplementedError(
                     "runtime LoRA with scaling != 1.0 not yet wired "
                     f"(got scaling={self._lora_scaling}); pre-multiply "
@@ -852,6 +919,49 @@ class Pi05Pipeline:
         # Step 2: out += neck @ lb — fused residual GEMM.
         self.gemm.bf16_nn_res(
             self._enc_lora_neck.ptr.value, lb_ptr,
+            out_bf16_ptr,
+            seq, out_dim, neck_dim, stream=stream)
+
+    def _apply_dec_lora(
+        self,
+        in_bf16_ptr: int,
+        la_ptr: int,        # device pointer to (in_dim, neck_dim) bf16 cuda
+        lb_ptr: int,        # device pointer to (neck_dim, out_dim) bf16 cuda
+        out_bf16_ptr: int,
+        seq: int,           # ``ds`` = chunk_size for the decoder
+        in_dim: int,
+        out_dim: int,
+        neck_dim: int,
+        stream: int,
+    ) -> None:
+        """Add a runtime LoRA contribution to a decoder GEMM output.
+
+        Same math as ``_apply_enc_lora`` (two bf16 matmuls through a
+        rank-r intermediate, accumulating into the base GEMM's bf16
+        output via ``bf16_nn_res``) — the only difference is which
+        scratch neck buffer is used.
+
+        The decoder neck buffer is sized for ``ds * max(rank,
+        NH*r + 2*r_kv)`` and reused sequentially across every decoder
+        LoRA site within a layer. ``in_bf16_ptr`` is the SAME activation
+        the base GEMM consumed (typically ``x_normed_buf`` after
+        AdaRMSNorm-with-style modulation, or the attention output after
+        FMHA). ``out_bf16_ptr`` must already hold the base GEMM result
+        before this helper is called.
+
+        Caller is responsible for the matching base-side path having
+        produced ``out_bf16_ptr`` in bf16. For FP8 base GEMMs, the bf16
+        dequant happens inside ``_fp8_gemm``'s epilogue so the same
+        bf16-on-bf16 ``bf16_nn_res`` adds the LoRA delta cleanly.
+        """
+        # Step 1: x @ la → neck (seq, neck_dim).
+        self.gemm.bf16_nn(
+            in_bf16_ptr, la_ptr,
+            self._dec_lora_neck.ptr.value,
+            seq, neck_dim, in_dim, stream=stream)
+        # Step 2: out += neck @ lb — fused residual GEMM.
+        self.gemm.bf16_nn_res(
+            self._dec_lora_neck.ptr.value, lb_ptr,
             out_bf16_ptr,
             seq, out_dim, neck_dim, stream=stream)
 
@@ -1748,6 +1858,28 @@ class Pi05Pipeline:
                     B["x_normed_buf"].ptr.value, W["decoder_attn_qkv_w"][i],
                     B["decoder_QKV"].ptr.value,
                     ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D, stream=stream)
+                # Runtime LoRA decoder QKV — padded form mirroring the
+                # encoder pattern (see _build_padded_attn_lora_{a,b} in
+                # the JAX converter). Single bf16_nn + bf16_nn_res adds
+                # the LoRA delta into all three [Q | K | V] slices of
+                # decoder_QKV in one pass. Must run BEFORE qkv_split_rope
+                # so the LoRA contribution gets the same RoPE / cache
+                # treatment as the base QKV. No norm fold because the
+                # decoder uses AdaRMSNorm (per-step time-conditioned);
+                # the activation in x_normed_buf already encodes the
+                # full per-step style modulation.
+                if self._has_dec_attn_lora:
+                    la_qkv = W["decoder_attn_qkv_lora_a"][i]
+                    lb_qkv = W["decoder_attn_qkv_lora_b"][i]
+                    self._apply_dec_lora(
+                        B["x_normed_buf"].ptr.value,
+                        la_qkv.data_ptr(), lb_qkv.data_ptr(),
+                        B["decoder_QKV"].ptr.value,
+                        ds,
+                        DEC_D,
+                        (DEC_NH + 2 * DEC_NKV) * DEC_HD,
+                        int(la_qkv.shape[-1]),
+                        stream)
 
         # C2: QKV split + RoPE. Decoder K/V write into enc cache at offset enc_seq.
         k_ptr, v_ptr = self._enc_kv_layer_ptrs(i, offset_tokens=enc_seq)
@@ -1785,6 +1917,19 @@ class Pi05Pipeline:
                 dec_o_ptr, W["decoder_attn_o_w"][i],
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_NH * DEC_HD, stream=stream)
+            # Runtime LoRA decoder attention O — standard 2D LoRA after
+            # N-summing lb in fp32 at conversion time. Input is the
+            # attention output (dec_o_ptr) in bf16, same activation the
+            # base GEMM consumed; output goes into x_normed_buf added
+            # in-place via bf16_nn_res.
+            if self._has_dec_attn_lora:
+                self._apply_dec_lora(
+                    dec_o_ptr,
+                    W["decoder_attn_o_lora_a"][i].data_ptr(),
+                    W["decoder_attn_o_lora_b"][i].data_ptr(),
+                    B["x_normed_buf"].ptr.value,
+                    ds, DEC_NH * DEC_HD, DEC_D,
+                    self._dec_lora_rank, stream)
 
         # C4→C5: gate*residual + AdaRMSNorm + FFN gate_up (fused SiLU-gated for INT8)
         gu_name   = f"decoder_ffn_gate_up_w_{i}"    # FP8/BF16 merged name (legacy)
@@ -1854,6 +1999,24 @@ class Pi05Pipeline:
                     B["x_normed_buf"].ptr.value, W["decoder_ffn_up_w"][i],
                     B["decoder_hidden"].ptr.value,
                     ds, DEC_H, DEC_D, stream=stream)
+                # Runtime LoRA decoder gate/up — two standard 2D LoRA
+                # adds on the same x_normed activation (post-AdaRMSNorm).
+                # No norm fold; the per-step modulation is already baked
+                # into x_normed_buf at runtime.
+                if self._has_dec_ffn_gateup_lora:
+                    dr = self._dec_lora_rank
+                    self._apply_dec_lora(
+                        B["x_normed_buf"].ptr.value,
+                        W["decoder_ffn_gate_lora_a"][i].data_ptr(),
+                        W["decoder_ffn_gate_lora_b"][i].data_ptr(),
+                        B["decoder_gate_merged"].ptr.value,
+                        ds, DEC_D, DEC_H, dr, stream)
+                    self._apply_dec_lora(
+                        B["x_normed_buf"].ptr.value,
+                        W["decoder_ffn_up_lora_a"][i].data_ptr(),
+                        W["decoder_ffn_up_lora_b"][i].data_ptr(),
+                        B["decoder_hidden"].ptr.value,
+                        ds, DEC_D, DEC_H, dr, stream)
 
         # C6: SiLU(gate) * up → FFN down
         down_name = f"decoder_ffn_down_w_{i}"
@@ -1895,6 +2058,17 @@ class Pi05Pipeline:
                 B["decoder_hidden"].ptr.value, W["decoder_ffn_down_w"][i],
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_H, stream=stream)
+            # Runtime LoRA decoder down — input is post-geglu
+            # decoder_hidden (silu(gate) * up), NOT the pre-geglu
+            # gate_merged. Matches JAX's two-matmul forward:
+            # ``(silu(gate)*up) @ (W_down + la_down @ lb_down)``.
+            if self._has_dec_ffn_down_lora:
+                self._apply_dec_lora(
+                    B["decoder_hidden"].ptr.value,
+                    W["decoder_ffn_down_lora_a"][i].data_ptr(),
+                    W["decoder_ffn_down_lora_b"][i].data_ptr(),
+                    B["x_normed_buf"].ptr.value,
+                    ds, DEC_H, DEC_D, self._dec_lora_rank, stream)
 
         # C7→C1_next: gate*residual + next layer's AdaRMSNorm → FP8 (fused)
         if fused and i < DEC_L - 1:

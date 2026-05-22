@@ -90,6 +90,15 @@ def main() -> int:
                              "frontend only pads to this larger value when "
                              "the adapter passes a state field, so LIBERO "
                              "stays on the fast path.")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="Override the per-inference action horizon. "
+                             "Default (None) uses FlashRT's built-in 10. "
+                             "Set to 50 to serve a Pi0.5 checkpoint trained "
+                             "at action_horizon=50 (e.g. the original "
+                             "OpenArm chocolate_bars_pi05/29999 ckpt). Must "
+                             "match the checkpoint's training-time horizon; "
+                             "serving a chunk_size that doesn't match the "
+                             "trained horizon produces degenerate motion.")
     parser.add_argument("--port", type=int, default=8002,
                         help="Websocket port. Default 8002 leaves 8001 free "
                              "for the openpi JAX reference server when "
@@ -118,9 +127,9 @@ def main() -> int:
 
     use_fp8 = not args.no_fp8
     logger.info("Loading FlashRT model from %s (framework=%s, robot_action_dim=%s, "
-                "use_fp8=%s, max_prompt_len=%d)",
+                "use_fp8=%s, max_prompt_len=%d, chunk_size=%s)",
                 args.checkpoint, args.framework, args.robot_action_dim,
-                use_fp8, args.max_prompt_len)
+                use_fp8, args.max_prompt_len, args.chunk_size)
     model = flash_rt.load_model(
         checkpoint=args.checkpoint,
         framework=args.framework,
@@ -129,6 +138,7 @@ def main() -> int:
         robot_action_dim=args.robot_action_dim,
         use_fp8=use_fp8,
         max_prompt_len=args.max_prompt_len,
+        chunk_size=args.chunk_size,
     )
 
     if args.calib_data and not use_fp8:

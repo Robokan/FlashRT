@@ -38,18 +38,37 @@ actions of each new chunk to absorb the discontinuity at the swap.
                                   - 5-step seam ramp. Smoother but
                                     delays convergence to the new
                                     chunk by ~100 ms at 50 Hz.
-    5 (future): async + server-side RTC inpainting.
-                                  - the new chunk's first ``d`` actions
-                                    are inpainted server-side to match
-                                    the executed prefix; no client-side
-                                    blending needed.
+    5: async fire-ASAP, splice at d, server-side RTC prefix-freeze
+                                  - the model's diffusion decoder is
+                                    constrained to keep the new chunk's
+                                    first ``d`` model-space actions equal
+                                    to the inflight prefix (Black et al.
+                                    2025 §3.2 "hard inpainting"). The
+                                    remaining suffix is denoised under
+                                    that constraint, so it stays
+                                    continuous with the prefix instead
+                                    of being a plan-from-scratch.
+                                    Client-side seam blend is therefore
+                                    set to 0 (the server already does
+                                    the smoothing). REQUIRES a backend
+                                    that honours ``_rtc_prev_chunk`` +
+                                    ``_rtc_inference_delay`` in the obs
+                                    dict — FlashRT Pi0.5 RTX does;
+                                    older openpi-JAX and FlashRT Thor
+                                    silently fall back to mode-2
+                                    behaviour.
 
-``d`` is auto-tracked from the EMA of measured inference latency
-(``AsyncChunkRunner.stats.ema_latency_s``). At 50 Hz with FlashRT's
-~165 ms steady-state on Spark this resolves to ``d = 9``; at 25 Hz
-it's ``d = 5``. The initial value before any inference completes is
-0, which is corrected on the first promotion (which always happens
-before any actions of the second chunk are served, so no jerk).
+``d`` is computed PER PROMOTION from the latency of the inference
+just completed: ``d = ceil(this_call_latency_s * target_hz)``. Per-
+call (not EMA-smoothed) because variable latency — pipeline
+rebuilds on FlashRT Pi0.5 + state-in-prompt, network jitter,
+contention — makes an EMA underestimate a fresh long outlier and
+lag a fresh short recovery, both of which produce a time-skip jump
+at the splice. At 50 Hz with FlashRT's ~140 ms steady-state on
+Spark this resolves to ``d = 7``; at 25 Hz it's ``d = 4``. The
+``expected_latency_ms`` constructor arg only seeds the very first
+promotion before any latency has been measured; from the second
+promotion onward, per-call wins.
 
 The chunk length ``H`` is auto-detected from the server's metadata
 (``chunk_size`` field) on first call; override via constructor for
@@ -93,7 +112,7 @@ logger = logging.getLogger(__name__)
 
 _PI05_FALLBACK_CHUNK_LEN = 50
 
-VALID_MODES = (1, 2, 3, 4)
+VALID_MODES = (1, 2, 3, 4, 5)
 
 DEFAULT_MODE = 3
 
@@ -102,6 +121,7 @@ MODE_DESCRIPTIONS = {
     2: "async fire-ASAP, splice at d, no seam blend",
     3: "async fire-ASAP, splice at d, seam blend = 3 (default)",
     4: "async fire-ASAP, splice at d, seam blend = 5",
+    5: "async fire-ASAP, splice at d, server-side prefix-freeze",
 }
 
 
@@ -142,14 +162,14 @@ def _initial_inference_delay_steps(
 ) -> int:
     """Convert an a-priori latency estimate to control ticks.
 
-    Used to seed the ``inference_delay_steps`` config field before any
-    real latency has been observed. Once the runner records its first
-    completed inference, ``auto_inference_delay=True`` takes over and
-    the EMA dictates ``d`` from then on; this estimate matters only for
-    the FIRST swap.
+    Used to seed the ``inference_delay_steps`` config field as a
+    one-shot fallback for the very first promotion, before any real
+    latency has been observed. From the second promotion onward,
+    ``auto_inference_delay=True`` causes the runner to use the
+    per-call measured latency for ``d``; this seed never fires again.
 
-    With Spark's ~165 ms FlashRT round-trip and 50 Hz control this
-    gives ``d=9``. At 25 Hz it's ``d=5``.
+    With Spark's ~140 ms FlashRT round-trip and 50 Hz control this
+    gives ``d=7``. At 25 Hz it's ``d=4``.
     """
     return max(0, int(np.ceil((expected_latency_ms / 1000.0) * target_hz)))
 
@@ -170,13 +190,15 @@ def _build_config_for_mode(
     Async modes (2/3/4) use:
       * ``start_next_at=0`` — fire the next inference as soon as the
         previous one completes (the RTC paper's intent).
-      * ``auto_inference_delay=True`` — splice index ``d`` tracks the
-        EMA of measured inference latency, so the first ``d`` actions
-        of each freshly-arrived chunk (which correspond to control
-        ticks that already elapsed serving the OLD chunk) are skipped.
+      * ``auto_inference_delay=True`` — splice index ``d`` is recomputed
+        per promotion from the latency of THAT specific inference, so
+        the first ``d`` actions of each freshly-arrived chunk (which
+        correspond to control ticks that already elapsed serving the
+        OLD chunk) are skipped. Per-call (not EMA) so a single long
+        outlier (FlashRT pipeline rebuild, network jitter) is spliced
+        at the right d for that one chunk, not at a stale EMA value.
       * ``inference_delay_steps`` is seeded from ``expected_latency_ms``
-        so the very first swap (before EMA is populated) uses a
-        reasonable estimate.
+        as a one-shot fallback for the very first promotion only.
     """
     if mode == 1:
         # Sync truncate-replan k=5: action_horizon=5 forces a swap every
@@ -206,6 +228,15 @@ def _build_config_for_mode(
         return RTCConfig(**common, blend_steps=3)
     if mode == 4:
         return RTCConfig(**common, blend_steps=5)
+    if mode == 5:
+        # Server-side prefix-freeze handles the smoothness contract.
+        # blend_steps=0 because client-side blending now hides the
+        # very feature we'd otherwise observe in motion smoothness
+        # numbers (the prefix-freeze is the smoothing).
+        return RTCConfig(
+            **common,
+            blend_steps=0,
+            enable_prefix_freeze=True)
     raise ValueError(
         f"blending_mode must be in {VALID_MODES}, got {mode}")
 
@@ -264,8 +295,16 @@ class ChunkedWebsocketClient:
         self._expected_latency_ms = float(expected_latency_ms)
         self._chunk_len = _resolve_chunk_len(policy, chunk_len_override, logger)
         self._blending_mode = int(blending_mode)
+        # ``meta_keys`` lifts the server's ``_rtc_chunk_model_space``
+        # (the true normalised model-space chunk) into ChunkResult so
+        # that mode 5 / ``enable_prefix_freeze`` can feed it back via
+        # ``_rtc_prev_chunk`` on the next inference. Cheap to ask for
+        # in all modes — if the server doesn't supply it, the lift is
+        # a no-op and the field stays None.
         self._adapter = CallablePolicyAdapter(
-            fn=policy.infer, output_key=action_output_key)
+            fn=policy.infer,
+            output_key=action_output_key,
+            meta_keys=("_rtc_chunk_model_space",))
         self._runner = self._build_runner(self._blending_mode)
         cfg = self._runner.config
         logger.info(

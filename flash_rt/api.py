@@ -54,7 +54,8 @@ class VLAModel:
         )
         self._needs_real_data_calibration = self._has_real_data_calibration
 
-    def predict(self, images, prompt=None, state=None):
+    def predict(self, images, prompt=None, state=None,
+                *, extra_obs=None, return_dict=False):
         """Run inference.
 
         Args:
@@ -76,9 +77,19 @@ class VLAModel:
                       pipeline rebuild that a token-count change would
                       otherwise trigger).
                     - Pi0-FAST — discretises to text.
+            extra_obs: optional dict of additional fields to merge into
+                    the observation passed to the backend pipeline. Used
+                    today by the RTC prefix-freeze path
+                    (``_rtc_prev_chunk`` + ``_rtc_inference_delay``);
+                    unknown keys are forwarded verbatim and ignored by
+                    backends that don't consume them.
+            return_dict: if True, return the full result dict from the
+                    pipeline ``infer`` call (lets callers see auxiliary
+                    fields such as ``_rtc_chunk_model_space``). Default
+                    False preserves the legacy ndarray return.
 
         Returns:
-            np.ndarray: actions
+            np.ndarray: actions  (or dict if ``return_dict=True``)
         """
         if hasattr(self._pipe, 'set_prompt'):
             import inspect
@@ -141,7 +152,12 @@ class VLAModel:
             self._pipe.calibrate_with_real_data([obs])
             self._needs_real_data_calibration = False
 
+        if extra_obs:
+            obs = {**obs, **extra_obs}
+
         result = self._pipe.infer(obs)
+        if return_dict:
+            return result
         return result['actions']
 
     def calibrate(

@@ -85,8 +85,22 @@ def test_async_modes_use_rtc_paper_scheduling(mode, expected_blend):
 
 def test_build_config_rejects_unknown_mode():
     with pytest.raises(ValueError, match="blending_mode"):
-        _build_config_for_mode(5, chunk_len=10, target_hz=50.0,
+        _build_config_for_mode(6, chunk_len=10, target_hz=50.0,
                                expected_latency_ms=200.0)
+
+
+def test_build_config_mode_5_enables_prefix_freeze():
+    """Mode 5 must turn on server-side prefix-freeze and disable the
+    client-side seam ramp. See module docstring for the rationale.
+    """
+    cfg = _build_config_for_mode(5, chunk_len=10, target_hz=50.0,
+                                 expected_latency_ms=200.0)
+    assert cfg.start_next_at == 0
+    assert cfg.auto_inference_delay is True
+    assert cfg.enable_prefix_freeze is True
+    assert cfg.blend_steps == 0, (
+        "mode 5 leaves smoothing to the server; client-side blend "
+        "would mask the prefix-freeze trajectory continuity")
 
 
 def test_chunked_client_default_construction_uses_mode_3():

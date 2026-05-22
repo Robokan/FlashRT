@@ -293,9 +293,27 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
         if state_raw is not None:
             state_for_model = np.asarray(state_raw, dtype=np.float32).reshape(-1)
 
-        actions = self._model.predict(
-            images=images, prompt=str(prompt), state=state_for_model)
-        actions_np = np.asarray(actions)
+        # RTC prefix-freeze passthrough: when the client (or
+        # AsyncChunkRunner) attaches ``_rtc_prev_chunk`` +
+        # ``_rtc_inference_delay`` to the observation, forward them to
+        # the pipeline so the diffusion decoder freezes its first ``d``
+        # output positions to the inflight prefix.
+        # See ``Pi05Pipeline.transformer_decoder`` for the math and
+        # ``Pi05TorchFrontendRtx._stage_rtc_inputs`` for the upload.
+        extra_obs: Optional[dict[str, Any]] = None
+        rtc_prev = obs.get("_rtc_prev_chunk")
+        rtc_d = obs.get("_rtc_inference_delay")
+        if rtc_prev is not None and rtc_d is not None:
+            extra_obs = {
+                "_rtc_prev_chunk": np.asarray(rtc_prev),
+                "_rtc_inference_delay": int(rtc_d),
+            }
+
+        result = self._model.predict(
+            images=images, prompt=str(prompt), state=state_for_model,
+            extra_obs=extra_obs, return_dict=True)
+        actions_np = np.asarray(result["actions"])
+        chunk_model_space = result.get("_rtc_chunk_model_space")
 
         if self._delta_action_mask is not None:
             if state_for_model is None:
@@ -317,20 +335,22 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
 
         elapsed = time.monotonic() - t0
 
-        # RTC pass-through: the client (AsyncActionChunkBroker) reads
-        # _rtc_chunk_model_space from the response to feed prev_chunk on
-        # the next call. FlashRT's pipeline returns post-unnorm actions
-        # directly; we don't have the pre-unnorm chunk available here.
-        # Sending the post-unnorm chunk back as _rtc_chunk_model_space
-        # is a degradation vs the openpi server (which sends the raw
-        # model-space chunk) -- it means RTC guidance still works but is
-        # numerically slightly different. Acceptable for the initial
-        # FlashRT-on-Spark milestone; revisit when RTC parity is needed.
+        # RTC pass-through: ``_rtc_chunk_model_space`` is the true
+        # normalized model-space chunk (32 dims, ``[-1, 1]``) returned
+        # by ``Pi05TorchFrontendRtx.infer``. Clients should cache this
+        # and feed it back as ``_rtc_prev_chunk`` on the next inference
+        # to activate the server-side prefix-freeze. If the underlying
+        # frontend does not return that field (older Pi0/Thor paths
+        # that haven't been updated), fall back to the post-unnorm
+        # chunk — RTC guidance still works but is numerically less
+        # faithful (mirrors the openpi-server behaviour).
         self._infer_count += 1
+        if chunk_model_space is None:
+            chunk_model_space = actions_np
         return {
             "actions": actions_np,
             "policy_timing": {"infer_ms": elapsed * 1000.0},
-            "_rtc_chunk_model_space": actions_np,
+            "_rtc_chunk_model_space": np.asarray(chunk_model_space),
         }
 
     def reset(self) -> None:

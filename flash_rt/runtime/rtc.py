@@ -38,14 +38,15 @@ References
   (https://arxiv.org/abs/2504.16054), §IV-E for the 50 Hz control rate.
 * "Real-Time Execution of Action Chunking Flow Policies" — Black et al.
   2025 (https://arxiv.org/abs/2506.07339), the formal treatment of
-  splice-at-d and seam blending. Server-side inpainting (mode 5 in the
-  ChunkedWebsocketClient mode catalogue) is deferred.
+  splice-at-d, seam blending, and the §3.2 "hard inpainting" prefix-
+  freeze that mode 5 of the ChunkedWebsocketClient surfaces here.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+import logging
 import math
 import threading
 import time
@@ -54,8 +55,19 @@ from typing import Any, Callable, Mapping, Protocol
 import numpy as np
 
 
+_logger = logging.getLogger(__name__)
+
+
 class ActionChunkAdapter(Protocol):
-    """Minimal adapter contract for a chunked action model."""
+    """Minimal adapter contract for a chunked action model.
+
+    Backends that participate in RTC prefix-freeze should also expose an
+    ``infer_actions_with_meta`` method returning ``(actions, metadata)``;
+    when present, ``AsyncChunkRunner`` will use that path and store the
+    metadata on :class:`ChunkResult` so the next submission can pull the
+    cached model-space chunk back out. Backends that only implement
+    ``infer_actions`` keep working — they just can't drive prefix-freeze.
+    """
 
     def infer_actions(self, observation: Any) -> np.ndarray:
         """Return an action chunk shaped ``[horizon, action_dim]``."""
@@ -68,25 +80,42 @@ class CallablePolicyAdapter:
     ``output_key`` covers frontends that return ``{"actions": array}``.
     ``tuple_index`` covers frontends that return tuples such as
     ``(frames, actions)``.
+
+    ``meta_keys`` names extra dict entries to lift out of the callable's
+    response into the per-chunk metadata. Used by the RTC prefix-freeze
+    path to pull ``_rtc_chunk_model_space`` back out of an openpi-style
+    response. Has no effect when the callable returns a non-dict.
     """
 
     fn: Callable[[Any], Any]
     output_key: str | None = "actions"
     tuple_index: int | None = None
+    meta_keys: tuple[str, ...] = ()
 
     def infer_actions(self, observation: Any) -> np.ndarray:
+        actions, _ = self.infer_actions_with_meta(observation)
+        return actions
+
+    def infer_actions_with_meta(
+            self, observation: Any) -> tuple[np.ndarray, dict[str, Any]]:
         out = self.fn(observation)
+        meta: dict[str, Any] = {}
         if self.tuple_index is not None:
-            out = out[self.tuple_index]
+            actions_raw = out[self.tuple_index]
         elif self.output_key is not None and isinstance(out, Mapping):
-            out = out[self.output_key]
-        actions = np.asarray(out)
+            actions_raw = out[self.output_key]
+            for key in self.meta_keys:
+                if key in out:
+                    meta[key] = out[key]
+        else:
+            actions_raw = out
+        actions = np.asarray(actions_raw)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
         if actions.ndim != 2:
             raise ValueError(
                 f"expected action chunk [horizon, action_dim], got {actions.shape}")
-        return actions
+        return actions, meta
 
 
 @dataclass(frozen=True)
@@ -118,15 +147,24 @@ class RTCConfig:
         skip past ``new_chunk[:d]`` (those actions correspond to time we
         already lived through serving the old chunk) and start serving from
         ``new_chunk[d]``. ``None`` (default) means keep the legacy "splice
-        at 0" behavior. Set to a positive int, or set ``auto_inference_delay``
-        below, to enable RTC-paper splicing.
+        at 0" behavior. With ``auto_inference_delay=True`` this field
+        degrades to a one-time seed for the very first promotion (before
+        any latency has been measured); every subsequent promotion uses
+        the per-call measured latency for ``d``.
     ``auto_inference_delay``
-        If True, track the EMA of measured inference latency and compute
-        ``d = ceil(ema_latency_s * target_hz)`` on every swap. Overrides
-        ``inference_delay_steps``.
+        If True (RTC-paper-correct), compute ``d`` from MEASURED inference
+        latency at promotion time: ``d = ceil(this_call_latency_s * target_hz)``.
+        Per-call (not EMA) because variable latency (e.g. FlashRT pipeline
+        rebuilds, network jitter) makes the EMA underestimate fresh long
+        outliers and lag fresh short recoveries, both of which produce
+        time-skip jumps at the splice. EMA is used only as a fallback
+        when no per-call measurement is available (i.e. inside
+        :meth:`reset`).
     ``latency_ema_alpha``
-        EMA smoothing factor for ``auto_inference_delay`` (closer to 1 =
-        more responsive to recent latency, closer to 0 = more stable).
+        EMA smoothing factor (closer to 1 = more responsive to recent
+        latency, closer to 0 = more stable). Used only on the EMA
+        fallback path inside :meth:`reset`; steady-state ``d`` is
+        per-call, not EMA-smoothed.
 
     Seam smoothing
     ~~~~~~~~~~~~~~
@@ -152,6 +190,46 @@ class RTCConfig:
         runs another inference (turns the runner into a sync broker; useful
         for the mode-1 baseline).
 
+    Server-side prefix-freeze inpainting (RTC paper §3.2 "soft / hard
+    inpainting")
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ``enable_prefix_freeze``
+        If True, the runner attaches ``_rtc_prev_chunk`` and
+        ``_rtc_inference_delay`` to every observation submitted to a
+        background inference. The model server is expected to force the
+        first ``d`` positions of the new chunk to match those values
+        during diffusion denoising (hard-freeze inpainting). The runner
+        also caches the **model-space** chunk returned by the policy
+        (``_rtc_chunk_model_space`` field in the result dict) so the
+        prefix it sends back is in the same coordinate frame the model
+        was trained on (post-norm, pre-unnorm). This is the smoothness
+        guarantee RTC was designed for: chunk boundaries become
+        continuous trajectories instead of two independent plans
+        crudely stitched together by client-side seam blending. Has no
+        effect on backends that ignore the ``_rtc_*`` keys.
+
+        ``d_predicted`` for the prefix is computed from the EMA
+        latency (``stats.ema_latency_s * target_hz``) plus the safety
+        margin in ``prefix_freeze_margin_steps``. The actual splice
+        ``d_measured`` (used to skip into the returned chunk) still
+        comes from the per-call latency on promotion. If
+        ``d_predicted >= d_measured`` the splice always lands in the
+        frozen prefix region → continuous. If
+        ``d_predicted < d_measured`` it lands in the free region and
+        we fall back to whatever the model plans (i.e. degraded to
+        ordinary RTC-lite). The default margin biases toward the
+        first case.
+    ``prefix_freeze_margin_steps``
+        Extra ticks added to the EMA-predicted ``d`` for the freeze
+        prefix length. Bigger margin = more positions frozen = more
+        likely the splice lands in the frozen region (smoother) but
+        more positions where the model has no freedom. Default 2.
+    ``prefix_freeze_max_steps``
+        Hard cap on the freeze prefix length, regardless of latency.
+        Defaults to half the chunk horizon — freezing more than half
+        of a chunk leaves the model with too little freedom to plan
+        anything new.
+
     Internal
     ~~~~~~~~
     ``max_workers``
@@ -169,6 +247,9 @@ class RTCConfig:
     auto_inference_delay: bool = False
     latency_ema_alpha: float = 0.3
     tail_blend_steps: int = 0
+    enable_prefix_freeze: bool = False
+    prefix_freeze_margin_steps: int = 2
+    prefix_freeze_max_steps: int | None = None
     max_workers: int = 1
 
     def __post_init__(self) -> None:
@@ -191,6 +272,15 @@ class RTCConfig:
             raise ValueError("inference_delay_steps must be non-negative")
         if not 0.0 < self.latency_ema_alpha <= 1.0:
             raise ValueError("latency_ema_alpha must lie in (0, 1]")
+        if self.prefix_freeze_margin_steps < 0:
+            raise ValueError(
+                "prefix_freeze_margin_steps must be non-negative")
+        if (
+            self.prefix_freeze_max_steps is not None
+            and self.prefix_freeze_max_steps < 0
+        ):
+            raise ValueError(
+                "prefix_freeze_max_steps must be non-negative")
         if self.max_workers != 1:
             raise ValueError("RTC-lite supports exactly one model worker")
 
@@ -206,6 +296,11 @@ class ChunkResult:
     observation_time_s: float
     ready_time_s: float
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Normalised model-space action chunk (e.g. Pi0.5 32-dim, [-1, 1])
+    # cached so the next inference can pass it back via
+    # ``_rtc_prev_chunk`` for server-side hard-freeze inpainting. None
+    # when the adapter does not expose one (older backends).
+    chunk_model_space: np.ndarray | None = None
 
 
 @dataclass
@@ -334,20 +429,74 @@ class AsyncChunkRunner:
 
     def _run_inference(self, observation: Any) -> ChunkResult:
         t0 = time.perf_counter()
-        actions = self.adapter.infer_actions(observation)
+        if hasattr(self.adapter, "infer_actions_with_meta"):
+            actions, meta = self.adapter.infer_actions_with_meta(observation)
+        else:
+            actions = self.adapter.infer_actions(observation)
+            meta = {}
         t1 = time.perf_counter()
+        chunk_ms = meta.pop("_rtc_chunk_model_space", None)
         return ChunkResult(
             actions=np.asarray(actions),
             latency_s=t1 - t0,
             observation_time_s=t0,
             ready_time_s=t1,
+            metadata=meta,
+            chunk_model_space=(
+                np.asarray(chunk_ms) if chunk_ms is not None else None),
         )
 
     def _submit_locked(self, observation: Any) -> None:
         if self._pending is not None:
             return
+        submit_obs = self._maybe_augment_with_prefix_locked(observation)
         self.stats.chunks_started += 1
-        self._pending = self._executor.submit(self._run_inference, observation)
+        self._pending = self._executor.submit(self._run_inference, submit_obs)
+
+    def _maybe_augment_with_prefix_locked(self, observation: Any) -> Any:
+        """Attach ``_rtc_prev_chunk`` + ``_rtc_inference_delay`` to a dict obs.
+
+        No-op if ``enable_prefix_freeze`` is False, if there is no current
+        chunk to take a prefix from, if the current chunk has no cached
+        model-space form, or if ``observation`` is not dict-like (we never
+        mutate non-dict observations because the backend's idea of what
+        ``observation`` should look like is opaque to us).
+        """
+        cfg = self.config
+        if not cfg.enable_prefix_freeze:
+            return observation
+        if not isinstance(observation, Mapping):
+            return observation
+        current = self._current
+        if current is None or current.chunk_model_space is None:
+            return observation
+        horizon_actions = current.actions.shape[0]
+        horizon = self._configured_horizon(current.actions)
+        idx_at_submit = self._idx
+        remaining = max(0, horizon - idx_at_submit)
+        if remaining <= 0:
+            return observation
+
+        ema_ticks = max(0.0, self.stats.ema_latency_s * cfg.target_hz)
+        d_pred = int(math.ceil(ema_ticks)) + int(cfg.prefix_freeze_margin_steps)
+        cap = cfg.prefix_freeze_max_steps
+        if cap is None:
+            cap = max(1, horizon_actions // 2)
+        d_pred = max(0, min(d_pred, cap, remaining))
+        if d_pred <= 0:
+            return observation
+
+        cm = current.chunk_model_space
+        if cm.shape[0] < idx_at_submit + d_pred:
+            d_pred = max(0, cm.shape[0] - idx_at_submit)
+            if d_pred <= 0:
+                return observation
+        prev_prefix = np.asarray(
+            cm[idx_at_submit:idx_at_submit + d_pred]).copy()
+        augmented = dict(observation)
+        augmented["_rtc_prev_chunk"] = prev_prefix
+        augmented["_rtc_inference_delay"] = int(d_pred)
+        return augmented
 
     def _promote_ready_locked(self) -> None:
         if self._pending is None or not self._pending.done():
@@ -356,7 +505,12 @@ class AsyncChunkRunner:
         self._pending = None
         self._record_latency_locked(result.latency_s)
         horizon = self._configured_horizon(result.actions)
-        d = self._effective_splice_d_locked(horizon)
+        # Use the latency of THIS specific inference for d. With variable
+        # inference time (pipeline rebuilds, network jitter), the EMA
+        # underestimates fresh long outliers and lags fresh short
+        # recoveries — both produce time-skip jumps at the splice.
+        d = self._effective_splice_d_locked(
+            horizon, measured_latency_s=result.latency_s)
         self._current = result
         # Snapshot the seam anchor BEFORE overwriting _idx. If
         # blend_steps>0, the next emitted action will linearly interpolate
@@ -370,6 +524,17 @@ class AsyncChunkRunner:
         self.stats.chunks_completed += 1
         self.stats.swaps += 1
         self.stats.last_splice_d = d
+        # Promoted from DEBUG to INFO in the FlashRT G7 hotfix follow-up
+        # (2026-05): SparkJAX's ROS2 nodes default the Python logger to
+        # INFO, so DEBUG telemetry never reaches their log file. This is
+        # bounded at the chunk-swap rate (~5-10 Hz worst case at 50 Hz
+        # control + 50-step chunks), so the log volume is fine, and it
+        # gives us the only direct evidence that auto-d is tracking
+        # real latency vs. regressing to a stale seed. Move back to
+        # DEBUG only if the line shows up as a measurable hot-path cost.
+        _logger.info(
+            "swap: latency=%.1f ms -> d=%d (horizon=%d, seam_blend=%d)",
+            result.latency_s * 1000.0, d, horizon, self.config.blend_steps)
 
     def _handle_exhausted_locked(self, observation: Any) -> None:
         self._promote_ready_locked()
@@ -385,7 +550,8 @@ class AsyncChunkRunner:
             self._pending = None
             self._record_latency_locked(result.latency_s)
             horizon = self._configured_horizon(result.actions)
-            d = self._effective_splice_d_locked(horizon)
+            d = self._effective_splice_d_locked(
+                horizon, measured_latency_s=result.latency_s)
             self._current = result
             if self._last_action is not None:
                 self._seam_anchor = np.asarray(self._last_action).copy()
@@ -471,19 +637,58 @@ class AsyncChunkRunner:
             a = self.config.latency_ema_alpha
             self.stats.ema_latency_s = a * latency_s + (1.0 - a) * ema
 
-    def _effective_splice_d_locked(self, horizon: int) -> int:
+    def _effective_splice_d_locked(
+        self, horizon: int, *, measured_latency_s: float | None = None
+    ) -> int:
         """Compute the splice index ``d`` for the chunk about to be promoted.
 
-        Resolution order: explicit ``inference_delay_steps`` > auto-tracked
-        EMA latency > 0 (legacy "splice at start"). Always clipped to
-        ``[0, horizon - 1]`` so we serve at least one action from the new
-        chunk before the runner can swap again.
+        Resolution order (highest priority first):
+          1. ``auto_inference_delay`` + a per-call ``measured_latency_s``
+             from the just-completed inference. This is the RTC-paper-
+             correct quantity: "how many control ticks elapsed while
+             this specific inference was in flight". Required for any
+             scenario where inference latency varies between calls
+             (e.g. FlashRT Pi05 pipeline rebuilds, network jitter).
+          2. ``auto_inference_delay`` + EMA of measured latencies. Used
+             when no per-call measurement is available (e.g. during
+             ``reset``). Equivalent to per-call once steady state.
+          3. Explicit ``inference_delay_steps`` (fixed value). Used
+             only when ``auto_inference_delay`` is False, OR as a
+             one-time seed before any latency has been measured.
+          4. ``0`` ("splice at start" — the legacy non-RTC behavior).
+
+        Always clipped to ``[0, horizon - 1]`` so we serve at least one
+        action from the new chunk before the runner can swap again.
+
+        IMPORTANT precedence change (FlashRT G7 hotfix, 2026-05): the
+        previous resolution order had ``inference_delay_steps`` winning
+        over ``auto_inference_delay``, contradicting the docstring on
+        ``RTCConfig.auto_inference_delay``. That made ``d`` a constant
+        equal to the a-priori seed regardless of real latency, which on
+        the OpenArm + FlashRT runtime (~140 ms inference, 50 Hz, d_seed
+        based on 200 ms expected_latency_ms = 10) translated to a
+        per-swap forward-time-jump of ~3 ticks ≈ 60 ms × 6-7 swaps/s ≈
+        visibly jerky motion. Now ``auto_inference_delay`` wins and
+        ``inference_delay_steps`` is demoted to a seed-only role.
         """
-        if self.config.inference_delay_steps is not None:
-            d = int(self.config.inference_delay_steps)
-        elif self.config.auto_inference_delay:
-            ema = self.stats.ema_latency_s
-            d = int(math.ceil(ema * self.config.target_hz)) if ema > 0 else 0
+        cfg = self.config
+        if cfg.auto_inference_delay:
+            if measured_latency_s is not None and measured_latency_s > 0:
+                lat = float(measured_latency_s)
+            elif self.stats.ema_latency_s > 0:
+                lat = float(self.stats.ema_latency_s)
+            elif cfg.inference_delay_steps is not None:
+                # Fall back to the a-priori seed for the very first
+                # promotion, before any latency has been measured.
+                d_seed = int(cfg.inference_delay_steps)
+                if horizon > 0 and d_seed > horizon - 1:
+                    d_seed = horizon - 1
+                return max(0, d_seed)
+            else:
+                return 0
+            d = int(math.ceil(lat * cfg.target_hz))
+        elif cfg.inference_delay_steps is not None:
+            d = int(cfg.inference_delay_steps)
         else:
             d = 0
         if d < 0:

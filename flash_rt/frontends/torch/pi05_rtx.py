@@ -750,6 +750,22 @@ class Pi05TorchFrontendRtx:
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
+        # ── RTC hard-freeze inpainting staging tensors ──
+        # The captured pipeline always runs the inpainting ops; these
+        # staging tensors get uploaded into the pipeline's RTC slots on
+        # every :meth:`infer` call. Default contents are zero, which
+        # makes the captured ops a numerical no-op for non-RTC traffic.
+        # See ``Pi05Pipeline.transformer_decoder`` for the math.
+        self._rtc_neg_mask_buf = torch.zeros(
+            self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
+        self._rtc_prev_chunk_masked_buf = torch.zeros(
+            self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
+        # Tracks whether the last upload was non-zero, so a non-RTC
+        # call right after an RTC call can re-zero in one upload
+        # instead of skipping it (which would leave a stale prefix on
+        # the GPU and cause the next chunk to freeze to last frame's
+        # prefix even though the client didn't ask for it).
+        self._rtc_last_call_active = False
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 
@@ -1937,6 +1953,7 @@ class Pi05TorchFrontendRtx:
             self._noise_buf.normal_()
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
+            self._stage_rtc_inputs(observation, stream_int)
 
             if use_full:
                 self._fill_img_buf(observation)
@@ -1967,7 +1984,14 @@ class Pi05TorchFrontendRtx:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        # ``_rtc_chunk_model_space`` returns the **normalized** action
+        # chunk (32 dims, ``[-1, 1]``) so RTC clients can feed it back
+        # as ``_rtc_prev_chunk`` on the next call. The unnormalized
+        # robot-space slice in ``actions`` is what the controller uses.
+        return {
+            "actions": robot_actions,
+            "_rtc_chunk_model_space": raw_actions,
+        }
 
     def _infer_cfg_batched(self, observation: dict,
                            debug: bool = False) -> dict:
@@ -2290,3 +2314,70 @@ class Pi05TorchFrontendRtx:
             f"size mismatch: src {nbytes} vs dst {dst_buf.nbytes}"
         self._cudart.cudaMemcpyAsync(
             dst_buf.ptr, ctypes.c_void_p(src.data_ptr()), nbytes, 3, stream_int)
+
+    def _stage_rtc_inputs(self, observation: dict, stream_int: int) -> None:
+        """Fill the pipeline's RTC buffers from ``observation``.
+
+        Recognised observation keys (both must be present to activate
+        the prefix-freeze; either missing → buffers are zeroed and the
+        captured inpainting ops degrade to a no-op):
+
+        ``_rtc_prev_chunk``
+            ``np.ndarray`` of shape ``(d, 32)`` (model-space, normalized
+            to ``[-1, 1]``) holding the previous chunk's actions starting
+            at the position the new chunk will splice to. Effectively the
+            **inflight prefix** that the new chunk must continue.
+
+        ``_rtc_inference_delay``
+            Integer ``d`` ∈ ``[0, chunk_size)``. The number of leading
+            new-chunk positions to freeze to ``_rtc_prev_chunk``. Must
+            equal ``_rtc_prev_chunk.shape[0]``.
+
+        For non-RTC traffic the caller passes neither, and this routine
+        re-zeros the pipeline RTC buffers iff the previous call had
+        them set (cheap, ~6 KB upload).
+        """
+        d_raw = observation.get("_rtc_inference_delay", 0)
+        prev = observation.get("_rtc_prev_chunk", None)
+        try:
+            d = int(d_raw)
+        except (TypeError, ValueError):
+            d = 0
+        active = (
+            prev is not None
+            and d > 0
+            and d <= self.chunk_size
+            and getattr(prev, "shape", None) is not None
+            and prev.shape == (d, ACTION_DIM))
+
+        if not active:
+            if not self._rtc_last_call_active:
+                return
+            self._rtc_neg_mask_buf.zero_()
+            self._rtc_prev_chunk_masked_buf.zero_()
+            self._copy_tensor_to_pipeline_buf_stream(
+                self._rtc_neg_mask_buf,
+                self.pipeline.rtc_neg_mask_buf, stream_int)
+            self._copy_tensor_to_pipeline_buf_stream(
+                self._rtc_prev_chunk_masked_buf,
+                self.pipeline.rtc_prev_chunk_masked_buf, stream_int)
+            self._rtc_last_call_active = False
+            return
+
+        prev_np = np.ascontiguousarray(prev, dtype=np.float32)
+        neg_mask_np = np.zeros((self.chunk_size, ACTION_DIM), dtype=np.float32)
+        neg_mask_np[:d, :] = -1.0
+        pcm_np = np.zeros((self.chunk_size, ACTION_DIM), dtype=np.float32)
+        pcm_np[:d, :] = prev_np
+
+        neg_mask_t = torch.from_numpy(neg_mask_np).to(bf16)
+        pcm_t = torch.from_numpy(pcm_np).to(bf16)
+        self._rtc_neg_mask_buf.copy_(neg_mask_t, non_blocking=True)
+        self._rtc_prev_chunk_masked_buf.copy_(pcm_t, non_blocking=True)
+        self._copy_tensor_to_pipeline_buf_stream(
+            self._rtc_neg_mask_buf,
+            self.pipeline.rtc_neg_mask_buf, stream_int)
+        self._copy_tensor_to_pipeline_buf_stream(
+            self._rtc_prev_chunk_masked_buf,
+            self.pipeline.rtc_prev_chunk_masked_buf, stream_int)
+        self._rtc_last_call_active = True

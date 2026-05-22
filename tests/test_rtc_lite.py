@@ -247,6 +247,59 @@ def test_async_runner_auto_inference_delay_tracks_latency():
         runner.close()
 
 
+def test_async_runner_auto_d_ignores_fixed_seed_after_first_swap():
+    """Regression test for the FlashRT G7 hotfix (2026-05).
+
+    Bug: ``_effective_splice_d_locked`` previously returned the fixed
+    ``inference_delay_steps`` value whenever it was set, even when
+    ``auto_inference_delay=True`` was also requested. That contradicted
+    the documented "auto overrides fixed" precedence and caused
+    ``d`` to be locked at the a-priori seed for the entire run.
+
+    On Spark (chunk_size=50, 50 Hz, ~140 ms actual inference vs 200 ms
+    seed) this translated to splicing at ``d=10`` instead of ``d=7``
+    every swap — a 3-tick (60 ms) forward time-jump per swap, visibly
+    jerky on the robot.
+
+    With the hotfix, when ``auto_inference_delay=True`` AND a per-call
+    measured latency is available, the per-call latency wins. The
+    ``inference_delay_steps`` field degrades to a one-shot seed for the
+    very first promotion only.
+    """
+    def policy(obs):
+        time.sleep(0.005)  # 5 ms inference, 5 ticks at 1000 Hz
+        return np.arange(20, dtype=np.float32)[:, None]
+
+    # Seed claims 20 ticks (= 20 ms latency). Auto should override with
+    # the actual ~5 ticks (= 5 ms latency).
+    runner = AsyncChunkRunner(
+        CallablePolicyAdapter(policy),
+        RTCConfig(
+            target_hz=1000.0,
+            action_horizon=20,
+            start_next_at=0,
+            inference_delay_steps=20,   # WAY larger than actual
+            auto_inference_delay=True,
+        ),
+    )
+    try:
+        runner.reset({"step": 0})
+        # Burn enough ticks to get >=2 swaps so we know we're past the
+        # initial seed-only promotion.
+        for tick in range(30):
+            runner.next_action({"step": tick})
+            time.sleep(0.001)
+        assert runner.stats.swaps >= 2, (
+            f"need >=2 swaps to verify auto-d, got swaps={runner.stats.swaps}")
+        # Per-call latency was ~5 ms => d ~ 5 (not the seed's 20).
+        assert 3 <= runner.stats.last_splice_d <= 8, (
+            f"auto-d should follow real ~5 ms latency, got d="
+            f"{runner.stats.last_splice_d} (likely regressed to seed=20 "
+            f"or stuck at 0)")
+    finally:
+        runner.close()
+
+
 def test_async_runner_splice_d_clipped_to_horizon():
     """If d >= horizon (inference slower than chunk duration), the runner
     must clip d to horizon-1 so we still make forward progress.
@@ -283,3 +336,188 @@ def test_rtc_config_rejects_out_of_range_ema_alpha():
         RTCConfig(target_hz=10.0, latency_ema_alpha=0.0)
     with pytest.raises(ValueError, match="latency_ema_alpha"):
         RTCConfig(target_hz=10.0, latency_ema_alpha=1.5)
+
+
+def test_callable_policy_adapter_lifts_meta_keys():
+    """Adapter should pull ``meta_keys`` out of dict responses so the
+    runner can stash auxiliary fields (e.g. ``_rtc_chunk_model_space``)
+    on :class:`ChunkResult`. Backends that don't return the key get
+    a silently-missing entry; never a KeyError.
+    """
+    response = {
+        "actions": np.ones((4, 3), dtype=np.float32),
+        "_rtc_chunk_model_space": np.full((4, 3), 0.5, dtype=np.float32),
+    }
+    adapter = CallablePolicyAdapter(
+        lambda obs: response,
+        meta_keys=("_rtc_chunk_model_space", "missing_key"),
+    )
+    actions, meta = adapter.infer_actions_with_meta({"step": 0})
+
+    assert actions.shape == (4, 3)
+    assert np.array_equal(meta["_rtc_chunk_model_space"],
+                          response["_rtc_chunk_model_space"])
+    assert "missing_key" not in meta
+
+
+def test_async_runner_caches_model_space_chunk_from_adapter():
+    """When the policy returns ``_rtc_chunk_model_space``, AsyncChunkRunner
+    must lift it onto ``ChunkResult.chunk_model_space``. Without that,
+    the prefix-freeze submission path has nothing to send back as
+    ``_rtc_prev_chunk``.
+    """
+    def policy(obs):
+        return {
+            "actions": np.arange(8, dtype=np.float32)[:, None] + 100.0,
+            "_rtc_chunk_model_space": np.arange(8, dtype=np.float32)[:, None],
+        }
+
+    runner = AsyncChunkRunner(
+        CallablePolicyAdapter(
+            policy, meta_keys=("_rtc_chunk_model_space",)),
+        RTCConfig(target_hz=1000.0, action_horizon=8, start_next_at=2),
+    )
+    try:
+        runner.reset({"step": 0})
+        assert runner._current is not None
+        cms = runner._current.chunk_model_space
+        assert cms is not None
+        assert cms.shape == (8, 1)
+        # Actions are the offset version (+100); model-space is raw.
+        np.testing.assert_array_equal(
+            cms[:, 0], np.arange(8, dtype=np.float32))
+    finally:
+        runner.close()
+
+
+def test_async_runner_attaches_prefix_when_freeze_enabled():
+    """With ``enable_prefix_freeze=True``, every async submission should
+    carry ``_rtc_prev_chunk`` (sliced from the cached model-space chunk
+    starting at the current consume index) and ``_rtc_inference_delay``
+    (the EMA-predicted d). Without freeze enabled, neither key appears.
+    """
+    submitted_obs: list[dict] = []
+
+    def policy(obs):
+        submitted_obs.append(dict(obs))
+        return {
+            "actions": np.arange(10, dtype=np.float32)[:, None],
+            "_rtc_chunk_model_space": np.arange(
+                10, dtype=np.float32)[:, None] * 0.1,
+        }
+
+    runner = AsyncChunkRunner(
+        CallablePolicyAdapter(
+            policy, meta_keys=("_rtc_chunk_model_space",)),
+        RTCConfig(
+            target_hz=1000.0,
+            action_horizon=10,
+            start_next_at=0,
+            auto_inference_delay=True,
+            enable_prefix_freeze=True,
+            prefix_freeze_margin_steps=1,
+        ),
+    )
+    try:
+        runner.reset({"step": "init"})
+        for tick in range(20):
+            runner.next_action({"step": tick})
+            time.sleep(0.001)
+        # The very first submission is the reset() call which has no
+        # cached prefix; subsequent submissions should carry it.
+        assert len(submitted_obs) >= 2
+        later = submitted_obs[-1]
+        assert "_rtc_prev_chunk" in later, (
+            "expected _rtc_prev_chunk on later submissions when "
+            "enable_prefix_freeze=True")
+        assert "_rtc_inference_delay" in later
+        d = later["_rtc_inference_delay"]
+        prev = later["_rtc_prev_chunk"]
+        assert isinstance(d, int) and d >= 1
+        assert prev.shape == (d, 1)
+        assert prev.dtype == np.float32
+    finally:
+        runner.close()
+
+
+def test_async_runner_skips_prefix_when_freeze_disabled():
+    """Without ``enable_prefix_freeze``, even backends that return
+    ``_rtc_chunk_model_space`` should not see ``_rtc_*`` keys on the
+    submitted observation. Guards the default (legacy) path.
+    """
+    submitted_obs: list[dict] = []
+
+    def policy(obs):
+        submitted_obs.append(dict(obs))
+        return {
+            "actions": np.arange(10, dtype=np.float32)[:, None],
+            "_rtc_chunk_model_space": np.arange(
+                10, dtype=np.float32)[:, None],
+        }
+
+    runner = AsyncChunkRunner(
+        CallablePolicyAdapter(
+            policy, meta_keys=("_rtc_chunk_model_space",)),
+        RTCConfig(
+            target_hz=1000.0,
+            action_horizon=10,
+            start_next_at=0,
+            auto_inference_delay=True,
+        ),
+    )
+    try:
+        runner.reset({"step": "init"})
+        for tick in range(20):
+            runner.next_action({"step": tick})
+            time.sleep(0.001)
+        assert len(submitted_obs) >= 2
+        for obs in submitted_obs:
+            assert "_rtc_prev_chunk" not in obs
+            assert "_rtc_inference_delay" not in obs
+    finally:
+        runner.close()
+
+
+def test_async_runner_prefix_freeze_caps_at_max_steps():
+    """``prefix_freeze_max_steps`` must clip the freeze prefix length
+    even when EMA latency would predict longer. Prevents the model from
+    being asked to freeze more than half of the chunk by default.
+    """
+    submitted_obs: list[dict] = []
+
+    def slow_policy(obs):
+        submitted_obs.append(dict(obs))
+        time.sleep(0.030)  # 30 ms => 30 ticks at 1000 Hz
+        return {
+            "actions": np.arange(10, dtype=np.float32)[:, None],
+            "_rtc_chunk_model_space": np.arange(
+                10, dtype=np.float32)[:, None],
+        }
+
+    runner = AsyncChunkRunner(
+        CallablePolicyAdapter(
+            slow_policy, meta_keys=("_rtc_chunk_model_space",)),
+        RTCConfig(
+            target_hz=1000.0,
+            action_horizon=10,
+            start_next_at=0,
+            auto_inference_delay=True,
+            enable_prefix_freeze=True,
+            prefix_freeze_margin_steps=0,
+            prefix_freeze_max_steps=3,
+        ),
+    )
+    try:
+        runner.reset({"step": "init"})
+        for tick in range(20):
+            runner.next_action({"step": tick})
+            time.sleep(0.001)
+        assert any(
+            "_rtc_prev_chunk" in obs for obs in submitted_obs), (
+            "no submission carried a freeze prefix")
+        for obs in submitted_obs:
+            if "_rtc_inference_delay" in obs:
+                assert obs["_rtc_inference_delay"] <= 3
+                assert obs["_rtc_prev_chunk"].shape[0] <= 3
+    finally:
+        runner.close()

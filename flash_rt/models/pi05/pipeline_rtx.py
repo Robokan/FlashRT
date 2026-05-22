@@ -493,6 +493,26 @@ class Pi05Pipeline:
         # Decoder scratch for ada_rms_norm output + gate
         B["x_normed_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
         B["gate_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
+        # ── RTC hard-freeze inpainting (Black et al. 2025, arXiv:2506.07339) ──
+        # Two buffers consumed by the prefix-freeze ops inside
+        # ``transformer_decoder``. Allocated as zeros so that until the
+        # frontend uploads non-zero data, every captured inpainting op is
+        # a numerical no-op (``noise *= 1`` and ``noise += 0``). This
+        # means the same captured graph handles RTC and non-RTC calls;
+        # the cost for non-RTC is ~3 element-wise ops × (1 init + 10 Euler
+        # steps) = trivially small. See ``transformer_decoder`` for the
+        # math; ``Pi05TorchFrontendRtx.infer`` for the upload contract.
+        #
+        # ``rtc_neg_mask`` holds ``-mask`` broadcast to (ds, ACTION_DIM):
+        #   mask[i] = 1 if chunk position i is in the inflight prefix
+        #            (will be frozen to ``rtc_prev_chunk_masked[i,:]``),
+        #            0 otherwise.
+        # ``rtc_prev_chunk_masked`` holds ``mask * prev_chunk`` element-
+        # wise — zeros at the non-prefix positions, the previous chunk's
+        # model-space values at the prefix positions.
+        B["rtc_neg_mask"] = CudaBuffer.device_zeros(ds * ACTION_DIM, BF16)
+        B["rtc_prev_chunk_masked"] = CudaBuffer.device_zeros(
+            ds * ACTION_DIM, BF16)
         # Scratch for vision patch im2col output (BF16 (nv*256, 588))
         B["vision_patches"] = CudaBuffer.device_empty(vs * VIS_PATCH_FLAT, BF16)
 
@@ -1754,7 +1774,15 @@ class Pi05Pipeline:
     # ══════════════════════════════════════════════════════════════════
 
     def transformer_decoder(self, stream: int = 0) -> None:
-        """Run 10-step diffusion denoise on ``bufs['diffusion_noise']``."""
+        """Run 10-step diffusion denoise on ``bufs['diffusion_noise']``.
+
+        Includes RTC (Black et al. 2025) hard-freeze inpainting around
+        the Euler loop. The prefix-freeze ops always execute and degrade
+        to a no-op when the frontend uploads zero ``rtc_neg_mask`` and
+        ``rtc_prev_chunk_masked`` buffers (the default for non-RTC
+        inferences). See the ``rtc_*`` buffer comments in
+        :meth:`_allocate_buffers` for the inpainting math.
+        """
         fvk = self.fvk
         gemm = self.gemm
         W = self.weights
@@ -1762,6 +1790,30 @@ class Pi05Pipeline:
         enc_seq = self.encoder_seq_len
         ds = self.chunk_size
         fused = self.use_fp8_decoder and self.fp8_calibrated
+        n_noise = ds * ACTION_DIM
+
+        # ── RTC inpainting init (BEFORE the Euler loop) ──
+        # Overwrite the prefix positions of ``diffusion_noise`` with the
+        # previous-chunk values, leaving the non-prefix positions at the
+        # caller-supplied random noise:
+        #     noise[i] = (1 - mask[i]) * noise[i] + mask[i] * prev[i]
+        # Implemented in two ops that reduce to no-ops when mask == 0:
+        #   1) noise *= (1 + neg_mask)   ==  noise *= (1 - mask)
+        #   2) noise += prev_chunk_masked  ==  noise += mask * prev
+        # The model then "sees" the inflight prefix from step 0 onward
+        # and steers the rest of the trajectory to remain continuous
+        # with it (this is what distinguishes RTC from post-hoc
+        # clobbering, which only fixes the prefix indices but leaves
+        # the suffix as a plan from a different starting point).
+        fvk.gate_mul_residual(
+            B["diffusion_noise"].ptr.value,
+            B["diffusion_noise"].ptr.value,
+            B["rtc_neg_mask"].ptr.value,
+            n_noise, stream=stream)
+        fvk.residual_add(
+            B["diffusion_noise"].ptr.value,
+            B["rtc_prev_chunk_masked"].ptr.value,
+            n_noise, stream=stream)
 
         for step in range(self.num_steps):
             # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
@@ -1794,11 +1846,22 @@ class Pi05Pipeline:
                 B["decoder_action_buf"].ptr.value,
                 W["decoder_action_out_proj_b"],
                 ds, ACTION_DIM, stream)
+            # ── RTC inpainting: freeze prefix velocity ──
+            # Scale ``action_buf`` by ``(1 - mask)`` so that the prefix
+            # positions receive zero update from this Euler step. Implemented
+            # as ``action_buf *= (1 + neg_mask)`` (in-place is safe — see
+            # ``gate_mul_res_kernel``, each thread reads its own indices first).
+            # For non-RTC calls ``rtc_neg_mask`` is zeros → multiplies by 1.
+            fvk.gate_mul_residual(
+                B["decoder_action_buf"].ptr.value,
+                B["decoder_action_buf"].ptr.value,
+                B["rtc_neg_mask"].ptr.value,
+                n_noise, stream=stream)
             # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
             fvk.residual_add(
                 B["diffusion_noise"].ptr.value,
                 B["decoder_action_buf"].ptr.value,
-                ds * ACTION_DIM, stream=stream)
+                n_noise, stream=stream)
 
     def _decoder_layer(self, i: int, step: int, enc_seq: int, ds: int,
                        skip_c1: bool, stream: int) -> None:
@@ -2330,6 +2393,32 @@ class Pi05Pipeline:
     def input_encoder_x_buf(self) -> CudaBuffer:
         """Pipeline input: encoder_x, with language embeds at [vs:vs+len]."""
         return self.bufs["encoder_x"]
+
+    @property
+    def rtc_neg_mask_buf(self) -> CudaBuffer:
+        """Pipeline input: RTC inpainting mask, shape ``(chunk_size * 32,)`` bf16.
+
+        Contains ``-mask`` (negated) repeated across the action dim, so
+        ``mask[i] = 1`` ⇒ ``rtc_neg_mask[i*32 : (i+1)*32] = -1`` (chunk
+        position ``i`` is in the inflight prefix and will be frozen),
+        ``mask[i] = 0`` ⇒ that slice is zero (position evolves normally).
+
+        Default contents are zero (no-op); the frontend overwrites this
+        on each :meth:`forward` when RTC prefix-freeze is active.
+        """
+        return self.bufs["rtc_neg_mask"]
+
+    @property
+    def rtc_prev_chunk_masked_buf(self) -> CudaBuffer:
+        """Pipeline input: ``mask * prev_chunk`` element-wise, bf16.
+
+        Shape ``(chunk_size, 32)`` flattened. Holds the previous chunk's
+        **model-space** action values at the prefix positions (where the
+        new chunk is forced to match the inflight prefix) and zeros at
+        all other positions. The frontend pre-multiplies by the per-
+        position mask so the captured pipeline can stay branchless.
+        """
+        return self.bufs["rtc_prev_chunk_masked"]
 
     def set_language_embeds(self, lang_embeds_np) -> None:
         """Store language embeddings for this prompt.

@@ -20,10 +20,20 @@ actions of each new chunk to absorb the discontinuity at the swap.
 
 ::
 
-    1: sync truncate-replan k=5  - block per chunk, replan every 5 actions.
-                                    Robot visibly hitches at each replan.
-                                    Useful as an A/B baseline; NOT
-                                    production.
+    1: sync full-chunk + freeze  - block per chunk, play ALL ``chunk_len``
+                                    actions before re-inferring. With
+                                    ``prefix_freeze=True`` (default) the
+                                    server constrains the new chunk's
+                                    first ``d`` positions to match the
+                                    last ``d`` actions played from the
+                                    previous chunk → inter-chunk boundary
+                                    is continuous by construction. Robot
+                                    pauses briefly at each boundary while
+                                    inference runs (~150 ms) but in-chunk
+                                    and cross-chunk motion are both
+                                    smooth. Set ``prefix_freeze=False`` to
+                                    A/B compare against the unfreezed
+                                    baseline.
     2: async, fire ASAP, splice at d, no seam blend (raw)
                                   - background inference; freshest plan
                                     always served. Hard step at each
@@ -117,7 +127,7 @@ VALID_MODES = (1, 2, 3, 4, 5)
 DEFAULT_MODE = 3
 
 MODE_DESCRIPTIONS = {
-    1: "sync truncate-replan k=5 (baseline)",
+    1: "sync full-chunk + server-side prefix-freeze (default freeze=on)",
     2: "async fire-ASAP, splice at d, no seam blend",
     3: "async fire-ASAP, splice at d, seam blend = 3 (default)",
     4: "async fire-ASAP, splice at d, seam blend = 5",
@@ -180,6 +190,7 @@ def _build_config_for_mode(
     target_hz: float,
     *,
     expected_latency_ms: float,
+    prefix_freeze: bool = True,
 ) -> RTCConfig:
     """Translate a blending mode (1..4) into an RTCConfig.
 
@@ -201,18 +212,42 @@ def _build_config_for_mode(
         as a one-shot fallback for the very first promotion only.
     """
     if mode == 1:
-        # Sync truncate-replan k=5: action_horizon=5 forces a swap every
-        # 5 steps; start_next_at=5 means "submit the next chunk request
-        # at chunk exhaustion" — combined with miss_policy="block" this
-        # is effectively synchronous. Kept as the A/B baseline for
-        # smoothness comparisons against the async modes; matches the
-        # canonical LIBERO eval pattern in examples/thor/eval_libero.py.
+        # Sync full-chunk: play all ``chunk_len`` actions of the freshly
+        # received chunk, then synchronously block on the next chunk.
+        # This is the "original" synchronous baseline (openpi
+        # AsyncActionChunkBroker-equivalent) — robot pauses briefly at
+        # each chunk boundary while inference runs, but plans within a
+        # chunk are temporally coherent and the model never produces
+        # half-chunks that conflict with the next half.
+        #
+        # ``prefix_freeze`` (default True) additionally instructs the
+        # server to constrain the new chunk's first d positions to
+        # match the LAST d actions we just played from the previous
+        # chunk. ``d`` is derived from measured inference latency
+        # (~8 ticks at 50 Hz / 150 ms). Closes the inter-chunk
+        # boundary discontinuity caused by stale observations (the obs
+        # captured at exhaustion reflects mid-tracking pose; without
+        # the freeze the next chunk's first action plans from that
+        # stale pose and the controller must reverse-track once the
+        # robot caught up during the 150 ms block). With the freeze,
+        # the new chunk's first d actions are forced equal to the
+        # last d of the previous chunk → no jump at the boundary.
+        # After block, ``_idx`` is set to ``d`` so we skip those
+        # constrained positions and serve the model's free
+        # continuation from chunk_B[d] onward.
+        #
+        # An earlier revision of this mode set action_horizon=5 to give
+        # a "replan every 5 actions" baseline. That turned out to be
+        # catastrophic on real robots (see git history); the fix was
+        # to use the negotiated chunk_len as the horizon.
         return RTCConfig(
             target_hz=target_hz,
-            action_horizon=5,
-            start_next_at=5,
+            action_horizon=chunk_len,
+            start_next_at=chunk_len,
             miss_policy="block",
-            blend_steps=0)
+            blend_steps=0,
+            auto_inference_delay=prefix_freeze,
+            enable_prefix_freeze=prefix_freeze)
     d_seed = _initial_inference_delay_steps(target_hz, expected_latency_ms)
     common = dict(
         target_hz=target_hz,
@@ -274,6 +309,15 @@ class ChunkedWebsocketClient:
         action_output_key: Key in the server response that holds the
             action chunk. Defaults to ``"actions"`` (openpi / FlashRT
             convention).
+        prefix_freeze: Enable server-side RTC prefix-freeze inpainting
+            on mode 1 (sync full-chunk). Default True. When enabled
+            the runner sends the last ``d`` actions of the just-
+            completed chunk as ``_rtc_prev_chunk`` and the server
+            constrains the new chunk's first ``d`` positions to match,
+            closing the inter-chunk boundary discontinuity. Set to
+            False to A/B compare against the baseline behaviour.
+            Mode 5 always enables prefix-freeze (it's the defining
+            feature of that mode); modes 2/3/4 ignore this flag.
     """
 
     def __init__(
@@ -285,6 +329,7 @@ class ChunkedWebsocketClient:
         chunk_len_override: Optional[int] = None,
         expected_latency_ms: float = 200.0,
         action_output_key: str = "actions",
+        prefix_freeze: bool = True,
     ) -> None:
         if blending_mode not in VALID_MODES:
             raise ValueError(
@@ -293,6 +338,7 @@ class ChunkedWebsocketClient:
         self._action_output_key = action_output_key
         self._target_hz = float(target_hz)
         self._expected_latency_ms = float(expected_latency_ms)
+        self._prefix_freeze = bool(prefix_freeze)
         self._chunk_len = _resolve_chunk_len(policy, chunk_len_override, logger)
         self._blending_mode = int(blending_mode)
         # ``meta_keys`` lifts the server's ``_rtc_chunk_model_space``
@@ -310,15 +356,18 @@ class ChunkedWebsocketClient:
         logger.info(
             "ChunkedWebsocketClient ready: mode=%d (%s), chunk_len=%d, "
             "target_hz=%.1f, expected_latency_ms=%.0f, "
-            "start_next_at=%s, splice_d_seed=%s, blend_steps=%d",
+            "start_next_at=%s, splice_d_seed=%s, blend_steps=%d, "
+            "prefix_freeze=%s (effective=%s)",
             self._blending_mode, MODE_DESCRIPTIONS[self._blending_mode],
             self._chunk_len, self._target_hz, self._expected_latency_ms,
-            cfg.start_next_at, cfg.inference_delay_steps, cfg.blend_steps)
+            cfg.start_next_at, cfg.inference_delay_steps, cfg.blend_steps,
+            self._prefix_freeze, cfg.enable_prefix_freeze)
 
     def _build_runner(self, mode: int) -> AsyncChunkRunner:
         cfg = _build_config_for_mode(
             mode, self._chunk_len, self._target_hz,
-            expected_latency_ms=self._expected_latency_ms)
+            expected_latency_ms=self._expected_latency_ms,
+            prefix_freeze=self._prefix_freeze)
         return AsyncChunkRunner(self._adapter, cfg)
 
     @property

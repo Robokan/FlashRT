@@ -54,14 +54,61 @@ def test_default_mode_is_three():
     assert "default" in MODE_DESCRIPTIONS[DEFAULT_MODE].lower()
 
 
-def test_mode_1_is_sync_baseline():
+def test_mode_1_is_sync_full_chunk_with_freeze_by_default():
+    """Mode 1 must play the entire chunk and enable prefix-freeze by default.
+
+    Regression coverage for two consecutive bugs the safety guard
+    helped surface on the chocolate_bars OpenArm setup (2026-05):
+
+      1. Truncate-replan-k=5: an earlier revision pinned mode-1
+         ``action_horizon=5`` regardless of the server's chunk_size,
+         which discarded 45/50 of every chunk and made successive
+         plans disagree sharply on first-action commands. Fix:
+         honour the negotiated ``chunk_len``.
+
+      2. Inter-chunk boundary discontinuity: even with the full chunk
+         played, the obs captured at exhaustion reflects the robot's
+         *mid-tracking* pose; during the 150 ms inference block the
+         C++ controller catches up to the last setpoint, so by the
+         time the next chunk arrives the robot is at a pose the
+         server's planner did not see. ``chunk_B[0]`` plans from the
+         stale obs and the controller must reverse-track. Fix:
+         enable ``enable_prefix_freeze`` + ``auto_inference_delay`` so
+         the runner sends the last ``d`` actions of chunk A as
+         ``_rtc_prev_chunk`` and the server constrains
+         ``chunk_B[0..d-1]`` to match them.
+    """
     cfg = _build_config_for_mode(1, chunk_len=50, target_hz=50.0,
                                  expected_latency_ms=200.0)
     assert cfg.miss_policy == "block"
-    assert cfg.action_horizon == 5
-    assert cfg.start_next_at == 5
+    assert cfg.action_horizon == 50, (
+        "mode 1 must use the negotiated chunk_len as action_horizon; "
+        f"got {cfg.action_horizon}")
+    assert cfg.start_next_at == 50, (
+        "mode 1 must defer the next inference to chunk exhaustion; "
+        f"got start_next_at={cfg.start_next_at}")
     assert cfg.blend_steps == 0
-    assert cfg.inference_delay_steps is None
+    assert cfg.enable_prefix_freeze is True, (
+        "mode 1 must enable prefix_freeze by default")
+    assert cfg.auto_inference_delay is True, (
+        "mode 1 + prefix_freeze must use measured latency to size the "
+        "freeze window; auto_inference_delay=True is required")
+
+
+def test_mode_1_freeze_can_be_disabled():
+    """``prefix_freeze=False`` must produce the freeze-off baseline.
+
+    Used for A/B comparison to attribute smoothness changes to the
+    freeze and nothing else.
+    """
+    cfg = _build_config_for_mode(1, chunk_len=50, target_hz=50.0,
+                                 expected_latency_ms=200.0,
+                                 prefix_freeze=False)
+    assert cfg.miss_policy == "block"
+    assert cfg.action_horizon == 50
+    assert cfg.start_next_at == 50
+    assert cfg.blend_steps == 0
+    assert cfg.enable_prefix_freeze is False
     assert cfg.auto_inference_delay is False
 
 

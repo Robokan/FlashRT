@@ -521,3 +521,159 @@ def test_async_runner_prefix_freeze_caps_at_max_steps():
                 assert obs["_rtc_prev_chunk"].shape[0] <= 3
     finally:
         runner.close()
+
+
+def test_sync_block_runner_prefix_from_chunk_tail():
+    """Sync block mode (mode 1 + prefix_freeze) must take the prefix from
+    the END of the just-completed chunk, not project forward from idx.
+
+    At exhaustion ``self._idx == horizon``, so there are no future
+    actions of the current chunk to project as the prefix. The
+    correct behaviour is to send the last ``d`` actions of the
+    cached ``chunk_model_space`` so the server can constrain the
+    new chunk's first ``d`` positions to match what the controller
+    is currently tracking → continuous inter-chunk boundary.
+
+    Regression test for the sync-exhaustion case added alongside the
+    chocolate_bars mode-1 boundary fix on 2026-05.
+    """
+    submitted_obs: list[dict] = []
+    # Two distinct chunks so we can tell which one the prefix was sliced
+    # from: chunk0 is values 0..9, chunk1 is values 100..109. The prefix
+    # attached to the SECOND submission must come from chunk0's tail.
+    chunks_returned = [
+        np.arange(10, dtype=np.float32)[:, None],
+        (np.arange(10, dtype=np.float32) + 100.0)[:, None],
+    ]
+    call_idx = [0]
+
+    def sync_policy(obs):
+        submitted_obs.append(dict(obs))
+        idx = min(call_idx[0], len(chunks_returned) - 1)
+        call_idx[0] += 1
+        time.sleep(0.005)  # ~5 ticks of "inference" at 1000 Hz
+        actions = chunks_returned[idx]
+        return {
+            "actions": actions,
+            "_rtc_chunk_model_space": actions * 0.5,  # arbitrary mapping
+        }
+
+    runner = AsyncChunkRunner(
+        CallablePolicyAdapter(
+            sync_policy, meta_keys=("_rtc_chunk_model_space",)),
+        RTCConfig(
+            target_hz=1000.0,
+            action_horizon=10,
+            start_next_at=10,        # don't pre-fire (sync)
+            miss_policy="block",     # block at exhaustion
+            auto_inference_delay=True,
+            enable_prefix_freeze=True,
+            prefix_freeze_margin_steps=0,
+        ),
+    )
+    try:
+        runner.reset({"step": "init"})
+        # Play 11 ticks: 10 to exhaust chunk0, then 1 more which
+        # triggers the block-and-replan boundary.
+        for tick in range(11):
+            runner.next_action({"step": tick})
+        # First submission (from reset) has no prefix; the second
+        # submission fires at exhaustion of chunk0 and MUST carry a
+        # prefix sliced from the TAIL of chunk0's model-space form
+        # (i.e. values * 0.5 of indices [10-d : 10]).
+        assert len(submitted_obs) >= 2, (
+            f"expected 2+ submissions, got {len(submitted_obs)}")
+        boundary = submitted_obs[1]
+        assert "_rtc_prev_chunk" in boundary, (
+            "sync exhaustion submission must carry _rtc_prev_chunk; "
+            "got keys=" + str(list(boundary.keys())))
+        assert "_rtc_inference_delay" in boundary
+        d = boundary["_rtc_inference_delay"]
+        prev = boundary["_rtc_prev_chunk"]
+        assert d >= 1
+        assert prev.shape == (d, 1)
+        # chunk0's model_space is np.arange(10) * 0.5 = [0, 0.5, ..., 4.5]
+        # Tail of length d should be [10-d, 11-d, ..., 9] * 0.5.
+        expected_tail = (np.arange(10 - d, 10, dtype=np.float32) * 0.5
+                         )[:, None]
+        np.testing.assert_array_equal(prev, expected_tail), (
+            f"sync prefix must equal chunk0's last {d} model-space "
+            f"actions; expected {expected_tail.ravel()}, "
+            f"got {prev.ravel()}")
+    finally:
+        runner.close()
+
+
+def test_prefix_freeze_splice_skips_frozen_region():
+    """Regression: when the augmentation sends a frozen prefix of length
+    ``d_pred``, the resulting chunk's splice index must land at the first
+    FREE position (>= d_pred), never inside the frozen region.
+
+    Without the splice-coupling, a small latency-derived ``d`` combined
+    with a larger ``d_pred`` causes ``_idx`` to land inside the frozen
+    region — which in sync block-mode is a backward-time replay of the
+    OLD chunk's tail and produces a visible jump at the boundary
+    (chocolate_bars symptom observed 2026-05).
+    """
+    # Two distinguishable chunks: chunk0 = arange(20), chunk1 = arange(20)+100.
+    # With margin=0, d_pred = 2 in sync mode. The latency-derived d (from
+    # a ~5 ms inference at 1000 Hz) is ceil(0.005 * 1000) = 5, which is
+    # already > d_pred=2 — so this test needs a SLOW first inference to
+    # build EMA, then a FAST second inference whose latency d would
+    # otherwise be smaller than d_pred. Easier: use margin large enough
+    # to force d_pred > observed-latency-d.
+    chunks_returned = [
+        np.arange(20, dtype=np.float32)[:, None],
+        (np.arange(20, dtype=np.float32) + 100.0)[:, None],
+    ]
+    call_idx = [0]
+
+    def policy(obs):
+        idx = min(call_idx[0], len(chunks_returned) - 1)
+        call_idx[0] += 1
+        time.sleep(0.001)  # 1 tick of inference at 1000 Hz; d = 1
+        actions = chunks_returned[idx]
+        return {
+            "actions": actions,
+            "_rtc_chunk_model_space": actions,  # identity for clarity
+        }
+
+    runner = AsyncChunkRunner(
+        CallablePolicyAdapter(
+            policy, meta_keys=("_rtc_chunk_model_space",)),
+        RTCConfig(
+            target_hz=1000.0,
+            action_horizon=20,
+            start_next_at=20,        # sync (block at exhaustion)
+            miss_policy="block",
+            auto_inference_delay=True,
+            enable_prefix_freeze=True,
+            # margin=8 → d_pred = 10 in sync mode, much larger than the
+            # ~1 tick of measured latency. Without the splice-coupling
+            # fix, _idx would land at d=1 (inside the d_pred=10 frozen
+            # region) and we'd serve chunk1[1] which equals chunk0[11]
+            # (frozen replay of old chunk). With the fix, _idx lands at
+            # d_pred=10 and we serve chunk1[10] = 110 = first FREE.
+            prefix_freeze_margin_steps=8,
+        ),
+    )
+    try:
+        runner.reset({"step": "init"})
+        for tick in range(20):
+            runner.next_action({"step": tick})
+        # Next tick is the boundary: triggers exhaustion -> block.
+        boundary_action = runner.next_action({"step": 20})
+        # Must serve from chunk1 (>=100). If we wrongly serve from the
+        # frozen region, we'd see a value < 100 (it would be chunk0's
+        # tail values 10..19 replayed via the freeze).
+        assert boundary_action[0] >= 100.0, (
+            f"splice landed inside frozen region: got {boundary_action[0]}, "
+            f"expected >= 100.0 (first free position of chunk1). "
+            f"This is the chocolate_bars backward-jump bug.")
+        # Specifically, with margin=8, d_pred=10, the splice must be at
+        # exactly 10 -> chunk1[10] = 110.
+        assert boundary_action[0] == 110.0, (
+            f"splice should land at d_pred=10 (first free position) -> "
+            f"chunk1[10]=110.0, got {boundary_action[0]}")
+    finally:
+        runner.close()

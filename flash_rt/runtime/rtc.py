@@ -360,6 +360,17 @@ class AsyncChunkRunner:
         # actions have been emitted since that swap (0..blend_steps).
         self._seam_anchor: np.ndarray | None = None
         self._blend_step = 0
+        # Prefix-freeze splice coupling: the augmentation function records
+        # the length of the frozen prefix it just sent to the backend so
+        # that, when the resulting chunk arrives, the promotion code can
+        # set the splice index ``d`` to land at the FIRST FREE position
+        # (i.e. past the frozen region). Without this, a latency-derived
+        # ``d`` smaller than ``d_pred`` causes us to serve actions from
+        # inside the frozen region — which in sync mode are replays of
+        # OLD chunk actions, producing a backward jump at the boundary.
+        # See ``_maybe_augment_with_prefix_locked`` and the promotion
+        # paths for the math; bug surfaced in chocolate_bars on 2026-05.
+        self._last_d_pred: int = 0
         self._closed = False
 
     def close(self, *, wait: bool = False) -> None:
@@ -393,6 +404,7 @@ class AsyncChunkRunner:
             self._last_action = None
             self._seam_anchor = None
             self._blend_step = 0
+            self._last_d_pred = 0
             self._record_latency_locked(result.latency_s)
 
     def next_action(self, observation: Any, *, block_if_empty: bool = True) -> np.ndarray:
@@ -474,28 +486,66 @@ class AsyncChunkRunner:
         horizon = self._configured_horizon(current.actions)
         idx_at_submit = self._idx
         remaining = max(0, horizon - idx_at_submit)
-        if remaining <= 0:
-            return observation
 
-        ema_ticks = max(0.0, self.stats.ema_latency_s * cfg.target_hz)
-        d_pred = int(math.ceil(ema_ticks)) + int(cfg.prefix_freeze_margin_steps)
         cap = cfg.prefix_freeze_max_steps
         if cap is None:
             cap = max(1, horizon_actions // 2)
-        d_pred = max(0, min(d_pred, cap, remaining))
-        if d_pred <= 0:
-            return observation
 
         cm = current.chunk_model_space
-        if cm.shape[0] < idx_at_submit + d_pred:
-            d_pred = max(0, cm.shape[0] - idx_at_submit)
+
+        if remaining <= 0:
+            # Sync block-mode case (e.g. mode 1 + prefix_freeze): submit
+            # fires at chunk exhaustion (self._idx == horizon). There are
+            # no future actions of the current chunk to project the
+            # prefix from — instead, take the LAST d_pred actions we
+            # already played as the prefix. The server constrains the
+            # new chunk's first d_pred positions to MATCH those (the
+            # actions the low-level controller is currently tracking
+            # toward), so the inter-chunk boundary is continuous by
+            # construction. After block, _idx is set to d_pred so we
+            # skip the constrained prefix and serve the model's free
+            # continuation from the new chunk's d_pred-th action.
+            #
+            # IMPORTANT: in sync mode no control ticks elapse during
+            # inference (the control loop is blocked on the result), so
+            # we do NOT need d_pred to predict elapsed-tick count. We
+            # only need enough frozen positions to give the inpainting
+            # kernel a stable boundary condition. Keep d_pred small so
+            # we waste as few of the new chunk's model-free predictions
+            # as possible. EMA-based sizing here over-counts and lands
+            # the splice INSIDE the frozen region (backward jump bug).
+            d_pred = int(cfg.prefix_freeze_margin_steps) + 2
+            prev_end = min(cm.shape[0], idx_at_submit)
+            d_pred = max(1, min(d_pred, cap, prev_end))
             if d_pred <= 0:
                 return observation
-        prev_prefix = np.asarray(
-            cm[idx_at_submit:idx_at_submit + d_pred]).copy()
+            prev_prefix = np.asarray(cm[prev_end - d_pred : prev_end]).copy()
+        else:
+            # Async case (modes 2..5): submit fires while the current
+            # chunk is still being consumed. The prefix is the next
+            # d_pred actions of the current chunk, which we WILL HAVE
+            # played by the time the new chunk arrives.
+            ema_ticks = max(0.0, self.stats.ema_latency_s * cfg.target_hz)
+            d_pred = (int(math.ceil(ema_ticks))
+                      + int(cfg.prefix_freeze_margin_steps))
+            d_pred = max(0, min(d_pred, cap, remaining))
+            if d_pred <= 0:
+                return observation
+            if cm.shape[0] < idx_at_submit + d_pred:
+                d_pred = max(0, cm.shape[0] - idx_at_submit)
+                if d_pred <= 0:
+                    return observation
+            prev_prefix = np.asarray(
+                cm[idx_at_submit:idx_at_submit + d_pred]).copy()
+
         augmented = dict(observation)
         augmented["_rtc_prev_chunk"] = prev_prefix
         augmented["_rtc_inference_delay"] = int(d_pred)
+        # Coupling for the splice path: when the resulting chunk arrives,
+        # _idx must land at d_pred (the first FREE position past the
+        # frozen prefix). Stored here, consumed by _promote_ready_locked
+        # and the block branch of _handle_exhausted_locked.
+        self._last_d_pred = int(d_pred)
         return augmented
 
     def _promote_ready_locked(self) -> None:
@@ -511,6 +561,21 @@ class AsyncChunkRunner:
         # recoveries — both produce time-skip jumps at the splice.
         d = self._effective_splice_d_locked(
             horizon, measured_latency_s=result.latency_s)
+        # If the submission carried a frozen-prefix of length d_pred,
+        # the resulting chunk's first d_pred positions are equal to old-
+        # chunk actions (in model space). Splicing at d < d_pred lands
+        # inside the frozen region and serves replays of OLD actions —
+        # in sync mode this is a backward jump (the visible bug fixed
+        # 2026-05). Always splice at the first FREE position by lifting
+        # d to d_pred when the prefix is wider than the latency-derived
+        # ``d``. ``_last_d_pred`` is consumed (reset to 0) so the next
+        # promotion without a prefix uses the bare latency-derived d.
+        d_pred_used = self._last_d_pred
+        self._last_d_pred = 0
+        if d_pred_used > d:
+            d = d_pred_used
+            if horizon > 0 and d > horizon - 1:
+                d = horizon - 1
         self._current = result
         # Snapshot the seam anchor BEFORE overwriting _idx. If
         # blend_steps>0, the next emitted action will linearly interpolate
@@ -552,6 +617,15 @@ class AsyncChunkRunner:
             horizon = self._configured_horizon(result.actions)
             d = self._effective_splice_d_locked(
                 horizon, measured_latency_s=result.latency_s)
+            # Mirror _promote_ready_locked: when a prefix was sent, the
+            # splice must clear the frozen region. See the comment in
+            # _promote_ready_locked for the math.
+            d_pred_used = self._last_d_pred
+            self._last_d_pred = 0
+            if d_pred_used > d:
+                d = d_pred_used
+                if horizon > 0 and d > horizon - 1:
+                    d = horizon - 1
             self._current = result
             if self._last_action is not None:
                 self._seam_anchor = np.asarray(self._last_action).copy()

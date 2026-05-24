@@ -43,3 +43,14 @@ training/_runs/**
 internal-tests/
 internal-docs/
 notes/
+
+# Ad-hoc parity-probe outputs (compare_servers_live, etc.). Dated
+# JSONs in the repo root that record a single bench run, not part of
+# any committed test fixture.
+phase4_parity_*.json
+phase5_parity_*.json
+
+# Pinned CUTLASS clone — intentionally untracked, vendored by
+# Dockerfile.spark; native builds clone at the AGENTS.md-pinned tag.
+# See AGENTS.md "Working-environment rules" #2.
+third_party/cutlass/

@@ -293,13 +293,27 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
         if state_raw is not None:
             state_for_model = np.asarray(state_raw, dtype=np.float32).reshape(-1)
 
-        # RTC prefix-freeze passthrough: when the client (or
-        # AsyncChunkRunner) attaches ``_rtc_prev_chunk`` +
-        # ``_rtc_inference_delay`` to the observation, forward them to
-        # the pipeline so the diffusion decoder freezes its first ``d``
-        # output positions to the inflight prefix.
-        # See ``Pi05Pipeline.transformer_decoder`` for the math and
-        # ``Pi05TorchFrontendRtx._stage_rtc_inputs`` for the upload.
+        # RTC soft-guidance passthrough (Phase 6 / G11): when the client
+        # (or AsyncChunkRunner) attaches the ``_rtc_*`` fields, forward
+        # them to the pipeline so the diffusion decoder nudges its
+        # velocity field toward continuity with the inflight prefix.
+        # See ``Pi05Pipeline._rtc_apply_guidance`` for the algorithm
+        # and ``Pi05TorchFrontendRtx._stage_rtc_inputs`` for the upload.
+        #
+        # Fields:
+        #   _rtc_prev_chunk         (np.ndarray, (L, action_dim))
+        #       Previous chunk's model-space actions starting at the
+        #       splice position. L should be ≥ d_pred (anchor length)
+        #       and ideally extend to cover the merge window past
+        #       d_pred for soft guidance to apply meaningfully (G11+).
+        #   _rtc_inference_delay    (int, d_pred)
+        #       Number of leading positions hard-anchored to the prefix.
+        #   _rtc_execution_horizon  (int, optional)
+        #       End of merge window (positions [d_pred, end) ramp 1→0).
+        #       Defaults to model frontend's _rtc_execution_horizon.
+        #   _rtc_schedule           (str, optional)
+        #       "linear" / "exp" / "ones" / "zeros". Defaults to model
+        #       frontend's _rtc_schedule.
         extra_obs: Optional[dict[str, Any]] = None
         rtc_prev = obs.get("_rtc_prev_chunk")
         rtc_d = obs.get("_rtc_inference_delay")
@@ -308,21 +322,27 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
                 "_rtc_prev_chunk": np.asarray(rtc_prev),
                 "_rtc_inference_delay": int(rtc_d),
             }
+            # Optional per-call config: pass through only when set so
+            # the frontend's defaults apply otherwise.
+            for opt_key in ("_rtc_execution_horizon", "_rtc_schedule"):
+                if opt_key in obs and obs[opt_key] is not None:
+                    extra_obs[opt_key] = obs[opt_key]
             # Diagnostic log — fires on the first 5 inferences (so we
-            # can confirm the prefix-freeze wiring is alive without
+            # can confirm the soft-guidance wiring is alive without
             # needing a long run that may safety-stop before throttle
             # hits), then once per 50 thereafter. If mode 5 in SparkJAX
             # is producing safety-tripping chunk boundaries, the first
             # thing to check is whether this log is firing at all —
             # silence here means the client is not populating the
-            # fields (server-side freeze is a no-op, mode 5 silently
-            # degrades to mode 2).
+            # fields (server-side guidance is a no-op).
             if self._infer_count < 5 or self._infer_count % 50 == 0:
                 prev_arr = np.asarray(rtc_prev)
+                eh = extra_obs.get("_rtc_execution_horizon", "frontend-default")
+                sch = extra_obs.get("_rtc_schedule", "frontend-default")
                 logger.info(
                     "[RTC] received _rtc_prev_chunk shape=%s d=%d "
-                    "(prev[0,:4]=%s prev[-1,:4]=%s)",
-                    prev_arr.shape, int(rtc_d),
+                    "exec_horizon=%s sched=%s (prev[0,:4]=%s prev[-1,:4]=%s)",
+                    prev_arr.shape, int(rtc_d), eh, sch,
                     np.round(prev_arr[0, :4], 3).tolist(),
                     np.round(prev_arr[-1, :4], 3).tolist())
 

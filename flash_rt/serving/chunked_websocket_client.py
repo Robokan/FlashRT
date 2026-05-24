@@ -53,25 +53,32 @@ actions of each new chunk to absorb the discontinuity at the swap.
                                   - 5-step seam ramp. Smoother but
                                     delays convergence to the new
                                     chunk by ~100 ms at 50 Hz.
-    5: async fire-ASAP, splice at d, server-side RTC prefix-freeze
-                                  - the model's diffusion decoder is
-                                    constrained to keep the new chunk's
-                                    first ``d`` model-space actions equal
-                                    to the inflight prefix (Black et al.
-                                    2025 §3.2 "hard inpainting"). The
-                                    remaining suffix is denoised under
-                                    that constraint, so it stays
-                                    continuous with the prefix instead
-                                    of being a plan-from-scratch.
-                                    Client-side seam blend is therefore
-                                    set to 0 (the server already does
-                                    the smoothing). REQUIRES a backend
-                                    that honours ``_rtc_prev_chunk`` +
+    5: async fire-ASAP, splice at d, server-side RTC soft-guidance
+                                  - the model's diffusion decoder nudges
+                                    its velocity field per Euler step
+                                    toward making the predicted denoised
+                                    endpoint match the inflight prefix,
+                                    weighted by a time-decay schedule
+                                    (Black et al. 2025 §3.3 "soft
+                                    inpainting"; lerobot pi05_base ships
+                                    this as ``RTCProcessor``). The
+                                    constraint is INTEGRATED into the
+                                    trajectory rather than clobbered on
+                                    top of it, so the chunk boundary is
+                                    smooth by construction — no client-
+                                    side seam blend needed. REQUIRES a
+                                    backend that honours
+                                    ``_rtc_prev_chunk`` +
                                     ``_rtc_inference_delay`` in the obs
-                                    dict — FlashRT Pi0.5 RTX does;
+                                    dict — FlashRT Pi0.5 RTX (G11+) does;
                                     older openpi-JAX and FlashRT Thor
                                     silently fall back to mode-2
-                                    behaviour.
+                                    behaviour. Replaced the G10 hard-
+                                    freeze inpainting which clobbered
+                                    the noise tensor at prefix positions
+                                    and zeroed the per-step velocity
+                                    update there (still produced jerky
+                                    splices on outlier-latency chunks).
 
 ``d`` is computed PER PROMOTION from the latency of the inference
 just completed: ``d = ceil(this_call_latency_s * target_hz)``. Per-
@@ -157,34 +164,32 @@ _MODE1_EXECUTE_HORIZON = 25
 # so smaller-chunk servers degrade safely.
 _MODE1_BLEND_STEPS = 5
 
-# Mode 5's seam-blend safety net. Server-side prefix-freeze covers the
-# common case (splice inside frozen region → blend is a no-op), so this
-# is only exercised when the realised latency overshoots the predicted
-# ``d_pred`` — typically a Pi05Pipeline rebuild on Spark. Five ticks
-# matches mode 1's blend window; see ``_build_config_for_mode``'s
-# mode-5 comment for the per-joint magnitude analysis.
-_MODE5_BLEND_STEPS = 5
+# Mode 5 RTC soft-guidance execution horizon (Phase 6 / G11). Number
+# of new-chunk positions across which the server's velocity field is
+# nudged toward continuity with the inflight prefix. lerobot's default
+# is 10. Larger values give the model a longer merge window (smoother
+# transitions) at the cost of constraining more of the trajectory.
+#
+# The shape of the merge: positions [0, d_pred) are weight-1.0 anchor
+# (model is strongly guided to match the inflight prefix exactly),
+# positions [d_pred, execution_horizon) ramp the weight 1→0, positions
+# [execution_horizon, chunk_size) are weight-0 free continuation.
+# Tuning lever: if motion is jerky at chunk swaps, increase to ~15–20.
+# If task performance regresses (model committing too hard to the past
+# plan), decrease toward d_pred + 1.
+_MODE5_EXECUTION_HORIZON = 10
 
-# Mode 5's hard cap on prefix-freeze coverage as a fraction of the
-# chunk. Pi0.5 OpenArm with state-in-prompt produces a different
-# prompt_len for almost every observation (the float-encoded state
-# tokens shift), and each cache miss is an ~800 ms Pi05Pipeline
-# rebuild. With the default cap of ``horizon // 2``, the EMA latency
-# is dragged up by the initial build (~1.3 s) and stays pinned at
-# horizon/2 even in steady state (a 5x latency outlier poisons the
-# 0.3-alpha EMA for many subsequent calls); the new chunk's usable
-# free region then shrinks to ``horizon - cap`` ticks of play time,
-# which at horizon=50 and cap=25 is 500 ms — exactly the SparkJAX
-# default ``miss_policy="hold_last"`` 25-tick abort window, so the
-# next rebuild deadline-misses by definition. Capping at horizon/4
-# instead leaves ~horizon * 3/4 ticks (760 ms at horizon=50 / 50 Hz)
-# of play time per chunk, absorbing typical pipeline rebuilds with
-# margin. The reduced freeze coverage is what the seam blend above
-# exists to backstop: with cap=12, the splice for a ~480 ms outlier
-# inference lands well outside the frozen region, and blend rescales
-# the cliff to under SparkJAX's 0.5 rad/step delta-joint safety
-# limit.
-_MODE5_PREFIX_FREEZE_CAP_DIVISOR = 4
+# Mode 5 RTC soft-guidance schedule (Phase 6 / G11). Controls the ramp
+# shape in the merge window [d_pred, execution_horizon):
+#   - "linear": straight line 1→0 (lerobot default, less aggressive
+#     falloff so the model fights the prefix more in the middle of the
+#     window).
+#   - "exp":    e^x-shaped, sharper falloff so the merge weight drops
+#     fast once past the anchor (the public lerobot docs example).
+# We default to "linear" to match lerobot's RTCConfig and the kinetix
+# canonical evaluation. Switch to "exp" if linear blending visibly
+# steers the trajectory off task in the middle of the merge window.
+_MODE5_SCHEDULE = "linear"
 
 VALID_MODES = (1, 2, 3, 4, 5)
 
@@ -195,7 +200,8 @@ MODE_DESCRIPTIONS = {
     2: "async fire-ASAP, splice at d, no seam blend",
     3: "async fire-ASAP, splice at d, seam blend = 3 (default)",
     4: "async fire-ASAP, splice at d, seam blend = 5",
-    5: "async fire-ASAP, splice at d, server-side prefix-freeze + seam blend = 5, miss=block",
+    5: "async fire-ASAP, splice at d, server-side RTC soft-guidance "
+       "(execution_horizon=10, linear schedule), miss=block",
 }
 
 
@@ -347,81 +353,58 @@ def _build_config_for_mode(
     if mode == 4:
         return RTCConfig(**common, blend_steps=5)
     if mode == 5:
-        # Server-side prefix-freeze is the PRIMARY smoothness mechanism:
-        # see ``_MODE5_BLEND_STEPS`` and ``_MODE5_PREFIX_FREEZE_CAP_DIVISOR``
-        # for the joint analysis of cap + blend.
+        # Mode 5 (Phase 6 / G11): **soft-guidance RTC**. The server's
+        # diffusion decoder nudges the velocity field per Euler step
+        # toward making the predicted denoised endpoint match the
+        # inflight prefix, weighted by a time-decay schedule
+        # (``_MODE5_EXECUTION_HORIZON`` + ``_MODE5_SCHEDULE``). The
+        # model integrates the constraint into a coherent trajectory
+        # rather than fighting fixed positions — so chunk boundaries
+        # come out smooth even when the splice lands past the anchor
+        # region.
         #
-        # Mode 5 overrides ``miss_policy`` from the async default of
-        # ``hold_last`` to ``block``. With ``hold_last``, when the
-        # inflight inference doesn't return before chunk exhaustion
-        # the runner repeats the last-served action; SparkJAX's
-        # ``openpi_runner_node`` then trips its 25-consecutive-holds
-        # safety abort (~500 ms) and the policy halts. With Pi0.5
-        # state-in-prompt on Spark this happens regularly: each new
-        # ``prompt_len`` triggers a ~750 ms lazy graph capture on
-        # first touch (even with --prewarm-prompt-lens, which only
-        # pays the pipeline-build cost, not the capture cost), and
-        # two back-to-back lazy captures cumulatively exceed the
-        # ~880 ms play window between chunk swaps even at the
-        # current cap=12, deadline-missing the SparkJAX safety
-        # threshold.
+        # G11 replaces the G10 hard-freeze inpainting (which clobbered
+        # the noise tensor at prefix positions and zeroed the per-step
+        # velocity update there). Hard-freeze stopped the SparkJAX
+        # safety stops but motion was still jerky at chunk boundaries
+        # because the free continuation past the frozen region had no
+        # continuity guarantee against the anchor — empirically a
+        # 1.4 rad joint jump on outlier-latency chunks. Soft guidance
+        # subsumes the seam blend and the cap workaround we layered
+        # on top of hard-freeze:
         #
-        # ``block`` instead waits on the inflight inference when the
-        # chunk exhausts. The block path is a no-op against the
-        # already-submitted future (``_submit_locked`` early-returns
-        # when ``_pending is not None``), so all it does is call
-        # ``.result()`` on the existing future and splice when it
-        # lands. The visible effect on the robot is a brief pause
-        # instead of a held repeat — closer to "the model is
-        # thinking" than "the model is stuck", and not a per-tick
-        # safety violation. We still keep the seam blend so the
-        # post-pause splice is smooth even when latency overshoots
-        # ``d_pred``.
-        # the diffusion decoder is constrained so the first ``d_pred``
-        # positions of the new chunk equal the inflight prefix in
-        # model space, and the rest of the trajectory is denoised
-        # conditional on that constraint. When the splice lands inside
-        # the frozen region (``d_actual <= d_pred``), the boundary is
-        # continuous by construction and the blend below interpolates
-        # between two near-equal values — i.e. a near-no-op.
+        #   - ``blend_steps=0``: no client-side seam interpolation
+        #     needed. The merge is done IN THE MODEL by the soft-
+        #     guidance kernel, which produces a trajectory that's
+        #     smooth at the splice by construction rather than
+        #     smooth-by-interpolation after the fact.
         #
-        # ``blend_steps=_MODE5_BLEND_STEPS`` (=5) is a SAFETY NET for
-        # the case where the splice lands OUTSIDE the frozen region
-        # (``d_actual > d_pred``). This happens when the realised
-        # latency for the inflight inference exceeds what the EMA
-        # predicted at submission time — the most common cause on
-        # Spark is a Pi05Pipeline rebuild for a never-seen prompt
-        # length (the OpenArm Pi0.5 frontend embeds floating-point
-        # state into the prompt, so token counts shift slightly per
-        # observation and the prompt-len cache misses cost ~800 ms
-        # each, blowing past the typical 200 ms steady-state latency
-        # by 4x). In that regime the first served action from the
-        # new chunk is from the free (unconstrained) region and has
-        # no continuity guarantee with the last action served from
-        # the old chunk — empirically a 1.4 rad jump on a delta
-        # joint at the chocolate-bars task. Splitting that across 5
-        # ticks (= 100 ms at 50 Hz, ~0.28 rad/step on the worst
-        # observation) keeps the seam under SparkJAX's 0.5 rad/step
-        # delta-joint safety limit while still letting the splice
-        # converge fast enough that we're not playing a stale plan.
+        #   - ``prefix_freeze_max_steps=None``: the G10 cap=horizon/4
+        #     was a workaround for hard-freeze's EMA-poisoned d_pred
+        #     pinning under pipeline-rebuild storms. With soft
+        #     guidance, oversizing d_pred is harmless — the merge-
+        #     window weights ramp to 0 past ``execution_horizon`` and
+        #     the unused tail of d_pred is just a wider free region.
+        #     The bottleneck shifts from "splice cliff" to "is there
+        #     a fresh chunk ready" (which ``miss_policy=block``
+        #     handles).
         #
-        # The blend does cost some of mode 5's theoretical purity (we
-        # can no longer claim "raw server-side smoothing only"), but
-        # the alternative — safety-stopping on every Pi05Pipeline
-        # rebuild — is worse. If the prompt-length cache misses are
-        # later eliminated by pre-building or by stripping floats from
-        # the prompt, this can drop back to 0.
-        cap = max(1, chunk_len // _MODE5_PREFIX_FREEZE_CAP_DIVISOR)
-        # Build kwargs explicitly so we can override miss_policy from
-        # the async ``hold_last`` default to ``block`` without
-        # mutating the shared ``common`` dict.
+        # ``miss_policy="block"`` is retained from G10. On Spark with
+        # Pi0.5 state-in-prompt, each new ``prompt_len`` triggers a
+        # ~750 ms lazy graph capture on first touch; if a capture
+        # outlier exceeds the play window between chunks, ``block``
+        # waits for the inflight inference instead of repeating the
+        # last action and tripping SparkJAX's 25-consecutive-holds
+        # safety abort.
         mode5_kwargs = dict(common)
         mode5_kwargs["miss_policy"] = "block"
         return RTCConfig(
             **mode5_kwargs,
-            blend_steps=_MODE5_BLEND_STEPS,
+            blend_steps=0,
             enable_prefix_freeze=True,
-            prefix_freeze_max_steps=cap)
+            prefix_freeze_max_steps=None,
+            execution_horizon=_MODE5_EXECUTION_HORIZON,
+            rtc_schedule=_MODE5_SCHEDULE)
     raise ValueError(
         f"blending_mode must be in {VALID_MODES}, got {mode}")
 

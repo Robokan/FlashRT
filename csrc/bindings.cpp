@@ -695,6 +695,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("residual"), py::arg("v_cond"), py::arg("v_uncond"),
        py::arg("beta"), py::arg("n"), py::arg("stream") = 0);
 
+    // Real-Time Chunking (RTC) soft-guidance correction.
+    // In-place v_t update applied once per Euler step in the action
+    // decoder. ``weights`` is pre-broadcast across action_dim by the
+    // frontend; all-zero weights make this a no-op so the kernel can
+    // stay in the captured graph regardless of whether RTC is active
+    // on a given inference.
+    m.def("rtc_guidance_correction_bf16",
+          [](uintptr_t v, uintptr_t x_t, uintptr_t prev, uintptr_t weights,
+             float time, float guidance_weight, int n, uintptr_t stream) {
+        rtc_guidance_correction_bf16(typed_ptr<__nv_bfloat16>(v),
+                                     typed_ptr<__nv_bfloat16>(x_t),
+                                     typed_ptr<__nv_bfloat16>(prev),
+                                     typed_ptr<__nv_bfloat16>(weights),
+                                     time, guidance_weight, n,
+                                     to_stream(stream));
+    }, py::arg("v"), py::arg("x_t"), py::arg("prev"), py::arg("weights"),
+       py::arg("time"), py::arg("guidance_weight"), py::arg("n"),
+       py::arg("stream") = 0);
+
     // Fusion
     m.def("gate_residual_ada_norm_fp8", [](uintptr_t residual, uintptr_t x,
                                             uintptr_t gate, uintptr_t weight,

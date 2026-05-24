@@ -172,45 +172,52 @@ def test_build_config_rejects_unknown_mode():
                                expected_latency_ms=200.0)
 
 
-def test_build_config_mode_5_enables_prefix_freeze():
-    """Mode 5 must turn on server-side prefix-freeze AND keep a 5-step
-    client-side seam blend as a safety net for the case where the
-    realised inference latency overshoots ``d_pred`` (most common
-    cause on Spark: a Pi05Pipeline rebuild blowing past the EMA
-    latency by 4x). Inside the frozen region the blend is a near
-    no-op; outside it, it caps the per-step joint delta below
-    SparkJAX's 0.5 rad/step arm-joint safety limit. See
-    ``_build_config_for_mode``'s mode-5 comment for the analysis.
+def test_build_config_mode_5_enables_soft_guidance():
+    """Mode 5 (Phase 6 / G11) must turn on server-side RTC + configure
+    the soft-guidance execution_horizon + schedule, AND disable both
+    the client-side seam blend and the prefix-freeze coverage cap.
 
-    Also asserts the ``prefix_freeze_max_steps`` cap is set to
-    ``horizon // 4``. The default ``horizon // 2`` cap pins the
-    freeze coverage to half the chunk under EMA-poisoning from
-    pipeline rebuilds, leaving only 500 ms of play time at
-    horizon=50/50 Hz — exactly the SparkJAX deadline-miss window.
+    Replaces the G10 hard-freeze + cap + blend configuration. With
+    soft guidance the model produces a trajectory that is smooth at
+    the splice by construction (the velocity field is nudged each
+    Euler step toward continuity rather than the noise being clobbered
+    after the fact). Therefore:
+
+      - ``blend_steps == 0``: no client-side seam interpolation. The
+        merge happens IN THE MODEL via the guidance kernel.
+      - ``prefix_freeze_max_steps is None``: no cap. With soft
+        guidance, oversizing d_pred is harmless because the merge-
+        window weights ramp to 0 past ``execution_horizon`` — the
+        unused tail of d_pred is just a wider free region.
+      - ``execution_horizon == 10``: lerobot default merge-window size.
+      - ``rtc_schedule == "linear"``: lerobot default ramp shape.
+      - ``miss_policy == "block"``: retained from G10 — on Spark with
+        Pi0.5 state-in-prompt, lazy graph captures still cause latency
+        outliers, and ``block`` waits for the inflight inference
+        instead of repeating the last action 25 times into SparkJAX's
+        safety abort threshold.
     """
     cfg = _build_config_for_mode(5, chunk_len=50, target_hz=50.0,
                                  expected_latency_ms=200.0)
     assert cfg.start_next_at == 0
     assert cfg.auto_inference_delay is True
     assert cfg.enable_prefix_freeze is True
-    assert cfg.blend_steps == 5, (
-        "mode 5 keeps a 5-step seam blend as a safety net for "
-        "pipeline-rebuild latency spikes that push d_actual past "
-        "d_pred; inside the frozen region the blend is a near no-op")
-    assert cfg.prefix_freeze_max_steps == 12, (
-        "mode 5 caps prefix-freeze coverage at horizon//4 so each "
-        "chunk has ~3/4 horizon of free play time, absorbing typical "
-        "Pi05Pipeline rebuild latencies without deadline-missing")
+    assert cfg.blend_steps == 0, (
+        "mode 5 (G11+) uses server-side soft guidance for smoothness; "
+        "client-side seam blend is disabled (would just re-smooth a "
+        "trajectory the model already smoothed)")
+    assert cfg.prefix_freeze_max_steps is None, (
+        "mode 5 (G11+) removes the cap — soft-guidance weights ramp "
+        "to 0 past execution_horizon, so oversizing d_pred is harmless")
+    assert cfg.execution_horizon == 10, (
+        "mode 5 execution_horizon should default to lerobot's 10")
+    assert cfg.rtc_schedule == "linear", (
+        "mode 5 schedule should default to lerobot's 'linear'")
     assert cfg.miss_policy == "block", (
         "mode 5 must override the async miss_policy to 'block' so "
-        "deadline misses pause the robot briefly instead of "
-        "repeating the last action 25 times into SparkJAX's safety "
-        "abort threshold")
-
-    # Spot-check the floor: tiny chunks must still get at least 1 step.
-    cfg_small = _build_config_for_mode(5, chunk_len=2, target_hz=50.0,
-                                       expected_latency_ms=200.0)
-    assert cfg_small.prefix_freeze_max_steps == 1
+        "deadline misses (lazy-capture outliers) pause the robot "
+        "briefly instead of tripping SparkJAX's 25-consecutive-hold "
+        "safety abort")
 
 
 def test_chunked_client_default_construction_uses_mode_3():

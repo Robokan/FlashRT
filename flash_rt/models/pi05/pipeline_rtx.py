@@ -196,6 +196,12 @@ class Pi05Pipeline:
         self.int8_encoder_static_calibrated = False
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
+        # RTC soft-guidance max guidance weight. LeRobot's RTCConfig
+        # default is 10.0 (configuration_rtc.py:43). Exposed as an
+        # attribute so the frontend / config layer can override BEFORE
+        # graph capture — after capture this is baked into the graph's
+        # per-step scalars and changes require a recapture.
+        self._rtc_max_gw: float = 10.0
         if self.num_steps <= 0:
             raise ValueError(f"num_steps must be positive, got {self.num_steps}")
         if self.vision_pool_factor not in (1, 2, 4):
@@ -493,26 +499,34 @@ class Pi05Pipeline:
         # Decoder scratch for ada_rms_norm output + gate
         B["x_normed_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
         B["gate_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
-        # ── RTC hard-freeze inpainting (Black et al. 2025, arXiv:2506.07339) ──
-        # Two buffers consumed by the prefix-freeze ops inside
-        # ``transformer_decoder``. Allocated as zeros so that until the
-        # frontend uploads non-zero data, every captured inpainting op is
-        # a numerical no-op (``noise *= 1`` and ``noise += 0``). This
-        # means the same captured graph handles RTC and non-RTC calls;
-        # the cost for non-RTC is ~3 element-wise ops × (1 init + 10 Euler
-        # steps) = trivially small. See ``transformer_decoder`` for the
-        # math; ``Pi05TorchFrontendRtx.infer`` for the upload contract.
+        # ── RTC soft-guidance inpainting (Black et al. 2025, arXiv:2506.07339) ──
+        # Two buffers consumed by the per-Euler-step soft-guidance kernel
+        # ``rtc_guidance_correction_bf16`` inside ``transformer_decoder``.
+        # Allocated as zeros so the kernel is a numerical no-op when the
+        # frontend hasn't uploaded RTC inputs (``err = (prev - x1) * 0
+        # = 0`` ⇒ ``v_new = v``). The same captured graph therefore
+        # handles RTC and non-RTC calls. See ``transformer_decoder`` for
+        # the algorithm; ``Pi05TorchFrontendRtx._stage_rtc_inputs`` for
+        # the upload contract; ``docs/spark_phase6_soft_guidance.md`` for
+        # the derivation.
         #
-        # ``rtc_neg_mask`` holds ``-mask`` broadcast to (ds, ACTION_DIM):
-        #   mask[i] = 1 if chunk position i is in the inflight prefix
-        #            (will be frozen to ``rtc_prev_chunk_masked[i,:]``),
-        #            0 otherwise.
-        # ``rtc_prev_chunk_masked`` holds ``mask * prev_chunk`` element-
-        # wise — zeros at the non-prefix positions, the previous chunk's
-        # model-space values at the prefix positions.
-        B["rtc_neg_mask"] = CudaBuffer.device_zeros(ds * ACTION_DIM, BF16)
-        B["rtc_prev_chunk_masked"] = CudaBuffer.device_zeros(
-            ds * ACTION_DIM, BF16)
+        # Replaced the hard-freeze pair (``rtc_neg_mask`` +
+        # ``rtc_prev_chunk_masked``) in Phase 6 (G11). Hard-freeze worked
+        # but produced visible joint jumps at chunk splices because the
+        # free continuation past the frozen region had no continuity
+        # guarantee against the anchor. Soft guidance lets the model
+        # steer the entire trajectory toward continuity.
+        #
+        # ``rtc_prev_chunk`` is zero-padded to ``(ds, ACTION_DIM)`` —
+        # first ``d`` positions hold the previous chunk's model-space
+        # actions, the rest is zero (inert: matching weight is 0).
+        # ``rtc_weights`` is the per-position soft-guidance weight
+        # pre-broadcast across the action dim. Shape ``(ds, ACTION_DIM)``
+        # — first ``d`` positions = 1.0 (full guidance), positions
+        # ``[d, execution_horizon)`` = linear/exp ramp 1 → 0, positions
+        # ``[execution_horizon, ds)`` = 0.0 (free continuation).
+        B["rtc_prev_chunk"] = CudaBuffer.device_zeros(ds * ACTION_DIM, BF16)
+        B["rtc_weights"] = CudaBuffer.device_zeros(ds * ACTION_DIM, BF16)
         # Scratch for vision patch im2col output (BF16 (nv*256, 588))
         B["vision_patches"] = CudaBuffer.device_empty(vs * VIS_PATCH_FLAT, BF16)
 
@@ -1776,12 +1790,15 @@ class Pi05Pipeline:
     def transformer_decoder(self, stream: int = 0) -> None:
         """Run 10-step diffusion denoise on ``bufs['diffusion_noise']``.
 
-        Includes RTC (Black et al. 2025) hard-freeze inpainting around
-        the Euler loop. The prefix-freeze ops always execute and degrade
-        to a no-op when the frontend uploads zero ``rtc_neg_mask`` and
-        ``rtc_prev_chunk_masked`` buffers (the default for non-RTC
-        inferences). See the ``rtc_*`` buffer comments in
-        :meth:`_allocate_buffers` for the inpainting math.
+        Includes RTC soft-guidance (Black et al. 2025, lerobot Phase 6
+        port). Per Euler step, the action velocity is nudged toward
+        making the predicted denoised endpoint ``x1 = x_t - time * v_t``
+        match the inflight prefix ``rtc_prev_chunk``, weighted by
+        ``rtc_weights``. The kernel is in-graph and is a numerical
+        no-op when ``rtc_weights`` is all zeros (the default for non-RTC
+        inferences). See ``_rtc_apply_guidance`` for the scalar
+        derivation and the ``rtc_*`` buffer comments in
+        :meth:`_allocate_buffers` for the upload contract.
         """
         fvk = self.fvk
         gemm = self.gemm
@@ -1792,28 +1809,12 @@ class Pi05Pipeline:
         fused = self.use_fp8_decoder and self.fp8_calibrated
         n_noise = ds * ACTION_DIM
 
-        # ── RTC inpainting init (BEFORE the Euler loop) ──
-        # Overwrite the prefix positions of ``diffusion_noise`` with the
-        # previous-chunk values, leaving the non-prefix positions at the
-        # caller-supplied random noise:
-        #     noise[i] = (1 - mask[i]) * noise[i] + mask[i] * prev[i]
-        # Implemented in two ops that reduce to no-ops when mask == 0:
-        #   1) noise *= (1 + neg_mask)   ==  noise *= (1 - mask)
-        #   2) noise += prev_chunk_masked  ==  noise += mask * prev
-        # The model then "sees" the inflight prefix from step 0 onward
-        # and steers the rest of the trajectory to remain continuous
-        # with it (this is what distinguishes RTC from post-hoc
-        # clobbering, which only fixes the prefix indices but leaves
-        # the suffix as a plan from a different starting point).
-        fvk.gate_mul_residual(
-            B["diffusion_noise"].ptr.value,
-            B["diffusion_noise"].ptr.value,
-            B["rtc_neg_mask"].ptr.value,
-            n_noise, stream=stream)
-        fvk.residual_add(
-            B["diffusion_noise"].ptr.value,
-            B["rtc_prev_chunk_masked"].ptr.value,
-            n_noise, stream=stream)
+        # NB: no pre-Euler init for RTC. Soft guidance steers the
+        # velocity field during integration rather than starting from
+        # a pre-clobbered noise — the noise tensor stays as the
+        # caller-supplied random sample. (The hard-freeze pre-init
+        # ``noise = (1-mask)*noise + mask*prev`` we used to do here is
+        # gone — see G11 / Phase 6.)
 
         for step in range(self.num_steps):
             # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
@@ -1846,17 +1847,11 @@ class Pi05Pipeline:
                 B["decoder_action_buf"].ptr.value,
                 W["decoder_action_out_proj_b"],
                 ds, ACTION_DIM, stream)
-            # ── RTC inpainting: freeze prefix velocity ──
-            # Scale ``action_buf`` by ``(1 - mask)`` so that the prefix
-            # positions receive zero update from this Euler step. Implemented
-            # as ``action_buf *= (1 + neg_mask)`` (in-place is safe — see
-            # ``gate_mul_res_kernel``, each thread reads its own indices first).
-            # For non-RTC calls ``rtc_neg_mask`` is zeros → multiplies by 1.
-            fvk.gate_mul_residual(
-                B["decoder_action_buf"].ptr.value,
-                B["decoder_action_buf"].ptr.value,
-                B["rtc_neg_mask"].ptr.value,
-                n_noise, stream=stream)
+            # ── RTC soft-guidance correction ──
+            # Nudge ``decoder_action_buf`` (scaled velocity ``dt * v_t``)
+            # toward making the predicted endpoint match the inflight
+            # prefix. No-op when ``rtc_weights`` is zeros (non-RTC call).
+            self._rtc_apply_guidance(step, n_noise, stream)
             # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
             fvk.residual_add(
                 B["diffusion_noise"].ptr.value,
@@ -2395,30 +2390,112 @@ class Pi05Pipeline:
         return self.bufs["encoder_x"]
 
     @property
-    def rtc_neg_mask_buf(self) -> CudaBuffer:
-        """Pipeline input: RTC inpainting mask, shape ``(chunk_size * 32,)`` bf16.
+    def rtc_prev_chunk_buf(self) -> CudaBuffer:
+        """Pipeline input: previous chunk (model space), shape ``(ds, 32)`` bf16.
 
-        Contains ``-mask`` (negated) repeated across the action dim, so
-        ``mask[i] = 1`` ⇒ ``rtc_neg_mask[i*32 : (i+1)*32] = -1`` (chunk
-        position ``i`` is in the inflight prefix and will be frozen),
-        ``mask[i] = 0`` ⇒ that slice is zero (position evolves normally).
+        Zero-padded — first ``d`` rows hold the inflight chunk's
+        model-space actions starting at the position aligned with the
+        new chunk's index 0, remaining rows are zero. Paired with
+        ``rtc_weights_buf`` (whose corresponding rows ramp to 0), so
+        the padded rows are inert in the soft-guidance kernel.
 
-        Default contents are zero (no-op); the frontend overwrites this
-        on each :meth:`forward` when RTC prefix-freeze is active.
+        Default contents are zero (kernel becomes a no-op for non-RTC
+        inferences). The frontend overwrites this on each
+        :meth:`forward` when RTC is active.
         """
-        return self.bufs["rtc_neg_mask"]
+        return self.bufs["rtc_prev_chunk"]
 
     @property
-    def rtc_prev_chunk_masked_buf(self) -> CudaBuffer:
-        """Pipeline input: ``mask * prev_chunk`` element-wise, bf16.
+    def rtc_weights_buf(self) -> CudaBuffer:
+        """Pipeline input: per-position soft-guidance weights, shape ``(ds, 32)`` bf16.
 
-        Shape ``(chunk_size, 32)`` flattened. Holds the previous chunk's
-        **model-space** action values at the prefix positions (where the
-        new chunk is forced to match the inflight prefix) and zeros at
-        all other positions. The frontend pre-multiplies by the per-
-        position mask so the captured pipeline can stay branchless.
+        Per-chunk-position weight broadcast across the action_dim axis
+        so the in-graph kernel can do element-wise multiply without an
+        extra broadcast op. The frontend builds this from the schedule
+        (LINEAR/EXP) given ``start = d`` (inference delay in chunk
+        positions) and ``end = execution_horizon``:
+
+          - positions ``[0, d)`` → weight 1.0 (full guidance toward the
+            inflight prefix that we have already committed to playing)
+          - positions ``[d, end)`` → ramp 1 → 0 (merge window)
+          - positions ``[end, ds)`` → weight 0.0 (free continuation)
+
+        Default contents are zero ⇒ kernel reduces to ``v_new = v``
+        (identity). The frontend overwrites this on each :meth:`forward`
+        when RTC is active and zeros it when RTC becomes inactive (so
+        residual weights from a previous inference don't bleed forward).
         """
-        return self.bufs["rtc_prev_chunk_masked"]
+        return self.bufs["rtc_weights"]
+
+    # ══════════════════════════════════════════════════════════════════
+    #   RTC soft-guidance helper
+    # ══════════════════════════════════════════════════════════════════
+
+    def _rtc_apply_guidance(self, step: int, n_noise: int,
+                            stream: int) -> None:
+        """Per-step RTC soft-guidance correction.
+
+        Applies the analytic gradient correction derived in
+        ``docs/spark_phase6_soft_guidance.md`` (the autograd-free
+        equivalent of lerobot's ``RTCProcessor.denoise_step``). One
+        element-wise kernel launch; in-graph; no-op when
+        ``rtc_weights`` is all zero.
+
+        ─── Scalar derivation (subtle) ───
+        The kernel operates on the *raw* velocity convention
+        ``v_new = v_t - guidance_weight * err`` where
+        ``x1 = x_t - time * v_t`` and ``err = (prev - x1) * weights``.
+
+        However, ``decoder_action_buf`` here holds ``dt * v_t``, not
+        ``v_t`` — the output projection weights/bias are pre-scaled by
+        ``-1/num_steps`` (= ``dt``) by the frontend so the subsequent
+        ``residual_add(noise, action_buf)`` is the full Euler step
+        ``noise -= dt * v_t``. To keep the kernel oblivious to that
+        scaling we pre-compute the effective scalars:
+
+            eff_time = time / dt      = -time * num_steps
+            eff_gw   = dt * gw        = -gw / num_steps
+
+        Substituting into the kernel:
+            x1     = x_t - eff_time * (dt*v_t) = x_t - time*v_t   ✓
+            v_buf' = (dt*v_t) - eff_gw * err = dt*(v_t - gw*err) = dt*v_t_new   ✓
+
+        So the post-kernel ``action_buf`` contents are exactly
+        ``dt * v_t_new`` and the existing ``residual_add`` continues to
+        do the correct corrected Euler step.
+
+        ─── Time + guidance_weight schedules ───
+        ``time``: Pi flow-matching convention runs 1.0 → 0.0 across the
+        Euler loop. At step 0 we're integrating at time=1.0 (pure
+        noise); at step num_steps-1 we're at time=1/num_steps (almost
+        clean). Formula: ``time = 1.0 + step * dt`` with ``dt < 0``.
+
+        ``guidance_weight``: lerobot's time-decay schedule
+        (modeling_rtc.py:221-227). Grows from 0 toward
+        ``max_guidance_weight`` as denoising progresses, peaking near
+        ``time=0``. The values are deterministic from ``step`` and
+        ``num_steps`` so CUDA-graph capture bakes them in as kernel
+        scalars — no per-inference recapture needed.
+        """
+        dt = -1.0 / float(self.num_steps)
+        time_t = 1.0 + step * dt
+        tau = 1.0 - time_t
+        one_minus_tau = 1.0 - tau
+        if one_minus_tau > 0.0:
+            inv_r2 = (tau * tau + one_minus_tau * one_minus_tau) \
+                / (one_minus_tau * one_minus_tau)
+            c = one_minus_tau / tau if tau > 0.0 else self._rtc_max_gw
+            gw = min(c * inv_r2, self._rtc_max_gw)
+        else:
+            gw = self._rtc_max_gw
+        eff_time = -time_t * float(self.num_steps)
+        eff_gw = -gw / float(self.num_steps)
+        self.fvk.rtc_guidance_correction_bf16(
+            self.bufs["decoder_action_buf"].ptr.value,
+            self.bufs["diffusion_noise"].ptr.value,
+            self.bufs["rtc_prev_chunk"].ptr.value,
+            self.bufs["rtc_weights"].ptr.value,
+            eff_time, eff_gw, n_noise, stream=stream)
 
     def set_language_embeds(self, lang_embeds_np) -> None:
         """Store language embeddings for this prompt.

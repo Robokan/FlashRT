@@ -434,7 +434,13 @@ def test_async_runner_attaches_prefix_when_freeze_enabled():
         d = later["_rtc_inference_delay"]
         prev = later["_rtc_prev_chunk"]
         assert isinstance(d, int) and d >= 1
-        assert prev.shape == (d, 1)
+        # Phase 6 (G11): async submission carries the entire unconsumed
+        # tail of the prev chunk (not just the d_pred anchor positions)
+        # so the server's soft-guidance kernel has prev values across
+        # the merge window. The length is therefore >= d, bounded by
+        # the chunk size (10 here).
+        assert prev.shape[0] >= d
+        assert prev.shape[1] == 1
         assert prev.dtype == np.float32
     finally:
         runner.close()
@@ -517,8 +523,14 @@ def test_async_runner_prefix_freeze_caps_at_max_steps():
             "no submission carried a freeze prefix")
         for obs in submitted_obs:
             if "_rtc_inference_delay" in obs:
+                # ``prefix_freeze_max_steps`` caps the ANCHOR length
+                # (d_pred = positions hard-pinned to the prefix in
+                # the merge kernel). Phase 6 (G11): the
+                # ``_rtc_prev_chunk`` payload itself is the full
+                # unconsumed tail (variable length, bounded by the
+                # chunk size), independent of the cap.
                 assert obs["_rtc_inference_delay"] <= 3
-                assert obs["_rtc_prev_chunk"].shape[0] <= 3
+                assert obs["_rtc_prev_chunk"].shape[0] <= 10
     finally:
         runner.close()
 

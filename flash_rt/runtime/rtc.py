@@ -250,6 +250,15 @@ class RTCConfig:
     enable_prefix_freeze: bool = False
     prefix_freeze_margin_steps: int = 2
     prefix_freeze_max_steps: int | None = None
+    # RTC soft-guidance (Phase 6 / G11). Forwarded to the server via
+    # ``_rtc_execution_horizon`` / ``_rtc_schedule`` so the model's
+    # per-Euler-step guidance kernel knows the merge window shape.
+    # None means "use the server frontend's default" (lerobot default
+    # is execution_horizon=10, schedule='linear'). Setting these on the
+    # client side overrides per-call without changing the model
+    # config / requiring a graph recapture.
+    execution_horizon: int | None = None
+    rtc_schedule: str | None = None
     max_workers: int = 1
 
     def __post_init__(self) -> None:
@@ -281,6 +290,16 @@ class RTCConfig:
         ):
             raise ValueError(
                 "prefix_freeze_max_steps must be non-negative")
+        if (
+            self.execution_horizon is not None
+            and self.execution_horizon <= 0
+        ):
+            raise ValueError("execution_horizon must be positive")
+        if self.rtc_schedule is not None and self.rtc_schedule not in (
+                "linear", "exp", "ones", "zeros"):
+            raise ValueError(
+                "rtc_schedule must be one of "
+                "'linear', 'exp', 'ones', 'zeros'")
         if self.max_workers != 1:
             raise ValueError("RTC-lite supports exactly one model worker")
 
@@ -498,8 +517,8 @@ class AsyncChunkRunner:
             # fires at chunk exhaustion (self._idx == horizon). There are
             # no future actions of the current chunk to project the
             # prefix from — instead, take the LAST d_pred actions we
-            # already played as the prefix. The server constrains the
-            # new chunk's first d_pred positions to MATCH those (the
+            # already played as the anchor prefix. The server constrains
+            # the new chunk's first d_pred positions to MATCH those (the
             # actions the low-level controller is currently tracking
             # toward), so the inter-chunk boundary is continuous by
             # construction. After block, _idx is set to d_pred so we
@@ -509,22 +528,29 @@ class AsyncChunkRunner:
             # IMPORTANT: in sync mode no control ticks elapse during
             # inference (the control loop is blocked on the result), so
             # we do NOT need d_pred to predict elapsed-tick count. We
-            # only need enough frozen positions to give the inpainting
-            # kernel a stable boundary condition. Keep d_pred small so
-            # we waste as few of the new chunk's model-free predictions
-            # as possible. EMA-based sizing here over-counts and lands
-            # the splice INSIDE the frozen region (backward jump bug).
+            # only need enough anchored positions to give the soft-
+            # guidance kernel a stable boundary condition. Keep d_pred
+            # small so we waste as few of the new chunk's model-free
+            # predictions as possible.
             d_pred = int(cfg.prefix_freeze_margin_steps) + 2
             prev_end = min(cm.shape[0], idx_at_submit)
             d_pred = max(1, min(d_pred, cap, prev_end))
             if d_pred <= 0:
                 return observation
+            # Soft-guidance Phase 6 (G11): in sync block mode there's
+            # nothing future of the current chunk to merge against, so
+            # the prev_chunk is just the anchor positions. The
+            # frontend's exec_horizon will cap to d_pred and the merge
+            # window will be empty — effectively a hard anchor + free
+            # continuation, which is the right behavior here.
             prev_prefix = np.asarray(cm[prev_end - d_pred : prev_end]).copy()
         else:
             # Async case (modes 2..5): submit fires while the current
-            # chunk is still being consumed. The prefix is the next
-            # d_pred actions of the current chunk, which we WILL HAVE
-            # played by the time the new chunk arrives.
+            # chunk is still being consumed. The first d_pred positions
+            # of the new chunk overlap actions we WILL HAVE played by
+            # the time the new chunk arrives (committed). Positions
+            # past d_pred are the previous chunk's free plan — these
+            # are the merge window for soft guidance.
             ema_ticks = max(0.0, self.stats.ema_latency_s * cfg.target_hz)
             d_pred = (int(math.ceil(ema_ticks))
                       + int(cfg.prefix_freeze_margin_steps))
@@ -535,12 +561,35 @@ class AsyncChunkRunner:
                 d_pred = max(0, cm.shape[0] - idx_at_submit)
                 if d_pred <= 0:
                     return observation
-            prev_prefix = np.asarray(
-                cm[idx_at_submit:idx_at_submit + d_pred]).copy()
+            # Soft-guidance Phase 6 (G11): send the entire unconsumed
+            # tail of the previous chunk (not just the d_pred anchor
+            # positions). The frontend uses this to populate the merge
+            # window past d_pred where the model is softly nudged
+            # toward continuity but not hard-anchored. Without the
+            # tail, the merge-window weights would multiply against
+            # zero-padded prev values and steer the trajectory toward
+            # 0, collapsing the action stream. The runtime cost is
+            # negligible: a numpy slice of a (chunk_size, ACTION_DIM)
+            # tensor that the runner already has cached.
+            #
+            # Wire-format-compatible: ``_rtc_inference_delay`` is still
+            # d_pred (the anchor length); the prefix tensor itself is
+            # longer. Old hard-freeze servers will only consume the
+            # first d_pred rows; soft-guidance servers will use the
+            # whole thing.
+            prev_prefix = np.asarray(cm[idx_at_submit:]).copy()
 
         augmented = dict(observation)
         augmented["_rtc_prev_chunk"] = prev_prefix
         augmented["_rtc_inference_delay"] = int(d_pred)
+        # Per-call soft-guidance config (Phase 6 / G11). Only set when
+        # the config explicitly overrides — None means "let the model
+        # frontend use its own default" (lerobot defaults
+        # execution_horizon=10, schedule='linear').
+        if cfg.execution_horizon is not None:
+            augmented["_rtc_execution_horizon"] = int(cfg.execution_horizon)
+        if cfg.rtc_schedule is not None:
+            augmented["_rtc_schedule"] = str(cfg.rtc_schedule)
         # Coupling for the splice path: when the resulting chunk arrives,
         # _idx must land at d_pred (the first FREE position past the
         # frozen prefix). Stored here, consumed by _promote_ready_locked

@@ -421,3 +421,18 @@ void cfg_combine_into_residual_fp16(__half* residual,
                                     const __half* v_uncond,
                                     float beta, int n,
                                     cudaStream_t stream = 0);
+
+// ── Real-Time Chunking (RTC) soft-guidance correction ──
+// Per-step velocity correction:
+//   x1 = x_t - time * v
+//   v -= guidance_weight * (prev - x1) * weights         (in-place)
+// All buffers are flat (chunk_size * action_dim) bf16. ``weights`` is
+// expected to be pre-broadcast across action_dim by the frontend.
+// One launch per Euler step; no-op when ``weights`` is all-zero.
+// See docs/spark_phase6_soft_guidance.md for derivation.
+void rtc_guidance_correction_bf16(__nv_bfloat16* v,
+                                  const __nv_bfloat16* x_t,
+                                  const __nv_bfloat16* prev,
+                                  const __nv_bfloat16* weights,
+                                  float time, float guidance_weight,
+                                  int n, cudaStream_t stream = 0);

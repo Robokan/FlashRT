@@ -1313,19 +1313,24 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda"
         )
-        # ── RTC hard-freeze inpainting staging tensors ──
+        # ── RTC soft-guidance staging tensors (Phase 6 / G11) ──
         # Body-replicated from Pi05TorchFrontendRtx.__init__ because this
         # __init__ does not chain to super (see comment up top). Without
         # these allocations the inherited ``_stage_rtc_inputs`` would
         # AttributeError on the first inference. Both tensors default to
-        # zero so the captured pipeline ops degrade to a no-op for
-        # non-RTC traffic. See ``Pi05Pipeline.transformer_decoder`` for
-        # the inpainting math.
-        self._rtc_neg_mask_buf = torch.zeros(
+        # zero so the captured pipeline kernel is a numerical no-op
+        # (``v_new = v``) for non-RTC traffic. See
+        # ``Pi05Pipeline._rtc_apply_guidance`` for the algorithm.
+        from flash_rt.frontends.torch.pi05_rtx import (
+            _RTC_DEFAULT_EXECUTION_HORIZON, _RTC_DEFAULT_SCHEDULE,
+        )
+        self._rtc_prev_chunk_buf = torch.zeros(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
-        self._rtc_prev_chunk_masked_buf = torch.zeros(
+        self._rtc_weights_buf = torch.zeros(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._rtc_last_call_active = False
+        self._rtc_execution_horizon: int = _RTC_DEFAULT_EXECUTION_HORIZON
+        self._rtc_schedule: str = _RTC_DEFAULT_SCHEDULE
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 

@@ -61,6 +61,83 @@ MAX_PROMPT_LEN_DEFAULT = 48
 
 
 # ════════════════════════════════════════════════════════════════════
+#   RTC soft-guidance: per-position prefix weights schedule
+# ════════════════════════════════════════════════════════════════════
+#
+# Byte-for-byte port of
+# ``third_party/lerobot_rtc_reference/modeling_rtc.py:251-298``
+# (``RTCProcessor.get_prefix_weights`` + helpers). Returned as numpy
+# float32 because the staging buffer is bf16 torch and the cast happens
+# in the staging path. Kept here (not in ``rtc.py``) so the function
+# lives next to the only frontend that uses it; if other frontends
+# need it later we can promote.
+_RTC_SCHEDULES = ("linear", "exp", "ones", "zeros")
+_RTC_DEFAULT_SCHEDULE = "linear"      # lerobot default (configuration_rtc.py:42)
+_RTC_DEFAULT_EXECUTION_HORIZON = 10   # lerobot default (configuration_rtc.py:44)
+
+
+def _rtc_linweights(start: int, end: int, total: int) -> np.ndarray:
+    """Lerobot ``RTCProcessor._linweights`` parity.
+
+    Returns linspace(1, 0, linspace_steps + 2)[1:-1] over the merge
+    window [start, end). Excludes the endpoints so the boundary
+    constraint joins smoothly to the leading ones / trailing zeros
+    (lerobot does the exact same dropping of endpoints).
+    """
+    skip_steps_at_end = max(total - end, 0)
+    linspace_steps = total - skip_steps_at_end - start
+    if end <= start or linspace_steps <= 0:
+        return np.zeros(0, dtype=np.float32)
+    return np.linspace(1.0, 0.0, linspace_steps + 2, dtype=np.float32)[1:-1]
+
+
+def _get_prefix_weights(start: int, end: int, total: int,
+                        schedule: str) -> np.ndarray:
+    """Per-position soft-guidance weights, shape ``(total,)``.
+
+    Mirrors ``RTCProcessor.get_prefix_weights``. Always returns a fresh
+    float32 numpy array.
+
+    Args:
+        start: Inference delay in chunk positions (``d``). Positions
+            ``[0, start)`` are weighted 1.0 (full guidance toward the
+            inflight prefix that we have already committed to playing).
+        end: Execution horizon. Positions ``[start, end)`` are the
+            merge window with the schedule-specific ramp; positions
+            ``[end, total)`` are weighted 0.0 (free continuation).
+        total: Chunk size.
+        schedule: One of ``"linear"``, ``"exp"``, ``"ones"``, ``"zeros"``
+            (case-insensitive). Unknown schedules fall back to
+            ``"linear"`` with a warning. See
+            ``RTCAttentionSchedule`` for the upstream semantics.
+    """
+    sched = (schedule or _RTC_DEFAULT_SCHEDULE).lower()
+    if sched not in _RTC_SCHEDULES:
+        logger.warning("Unknown RTC schedule %r; falling back to %r",
+                       schedule, _RTC_DEFAULT_SCHEDULE)
+        sched = _RTC_DEFAULT_SCHEDULE
+    start = min(start, end)
+    if sched == "zeros":
+        w = np.zeros(total, dtype=np.float32)
+        w[:start] = 1.0
+        return w
+    if sched == "ones":
+        w = np.ones(total, dtype=np.float32)
+        w[end:] = 0.0
+        return w
+    lin = _rtc_linweights(start, end, total)
+    if sched == "exp":
+        # lerobot: lin * expm1(lin) / (e - 1)
+        lin = lin * np.expm1(lin) / (math.e - 1.0)
+    out = np.zeros(total, dtype=np.float32)
+    if start > 0:
+        out[:min(start, total)] = 1.0
+    if lin.size > 0:
+        out[start:start + lin.size] = lin
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════
 #   HF safetensors → pipeline weight dict (BF16 torch tensors)
 # ════════════════════════════════════════════════════════════════════
 
@@ -750,22 +827,34 @@ class Pi05TorchFrontendRtx:
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
-        # ── RTC hard-freeze inpainting staging tensors ──
-        # The captured pipeline always runs the inpainting ops; these
-        # staging tensors get uploaded into the pipeline's RTC slots on
-        # every :meth:`infer` call. Default contents are zero, which
-        # makes the captured ops a numerical no-op for non-RTC traffic.
-        # See ``Pi05Pipeline.transformer_decoder`` for the math.
-        self._rtc_neg_mask_buf = torch.zeros(
+        # ── RTC soft-guidance staging tensors (Phase 6 / G11) ──
+        # The captured pipeline always runs the per-step RTC kernel;
+        # these staging tensors are uploaded into the pipeline's RTC
+        # slots on every :meth:`infer` call. Default contents are zero
+        # — zero ``rtc_weights`` makes the kernel a numerical no-op
+        # (``v_new = v``) for non-RTC traffic. See
+        # ``Pi05Pipeline._rtc_apply_guidance`` for the algorithm.
+        self._rtc_prev_chunk_buf = torch.zeros(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
-        self._rtc_prev_chunk_masked_buf = torch.zeros(
+        self._rtc_weights_buf = torch.zeros(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         # Tracks whether the last upload was non-zero, so a non-RTC
         # call right after an RTC call can re-zero in one upload
-        # instead of skipping it (which would leave a stale prefix on
-        # the GPU and cause the next chunk to freeze to last frame's
-        # prefix even though the client didn't ask for it).
+        # instead of skipping it (which would leave stale weights on
+        # the GPU and cause the next chunk to apply guidance toward
+        # last frame's prefix even though the client didn't ask for
+        # it).
         self._rtc_last_call_active = False
+        # RTC config (set by frontend caller before infer; defaults
+        # match lerobot RTCConfig). These are read by ``_stage_rtc_inputs``
+        # at every call so they can be updated between inferences
+        # without recapturing the pipeline graph (the *values* baked
+        # into the captured graph are time and guidance_weight, both
+        # of which are functions of ``step`` and ``num_steps`` — not
+        # of execution_horizon / schedule, which only affect the
+        # uploaded weights tensor contents).
+        self._rtc_execution_horizon: int = _RTC_DEFAULT_EXECUTION_HORIZON
+        self._rtc_schedule: str = _RTC_DEFAULT_SCHEDULE
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 
@@ -2316,26 +2405,52 @@ class Pi05TorchFrontendRtx:
             dst_buf.ptr, ctypes.c_void_p(src.data_ptr()), nbytes, 3, stream_int)
 
     def _stage_rtc_inputs(self, observation: dict, stream_int: int) -> None:
-        """Fill the pipeline's RTC buffers from ``observation``.
+        """Fill the pipeline's RTC soft-guidance buffers from ``observation``.
 
-        Recognised observation keys (both must be present to activate
-        the prefix-freeze; either missing → buffers are zeroed and the
-        captured inpainting ops degrade to a no-op):
+        Phase 6 (G11) replacement for hard-freeze inpainting. Builds
+        the zero-padded previous chunk + per-position weights tensor
+        and uploads both to the pipeline. The captured per-step kernel
+        ``rtc_guidance_correction_bf16`` then nudges the velocity field
+        toward continuity at each Euler step. See
+        ``Pi05Pipeline._rtc_apply_guidance`` for the algorithm,
+        ``docs/spark_phase6_soft_guidance.md`` for the math, and
+        ``third_party/lerobot_rtc_reference/modeling_rtc.py`` for the
+        upstream reference.
+
+        Recognised observation keys (all RTC-related keys default
+        sensibly when missing; only ``_rtc_prev_chunk`` + a positive
+        ``_rtc_inference_delay`` are required to activate guidance):
 
         ``_rtc_prev_chunk``
             ``np.ndarray`` of shape ``(d, 32)`` (model-space, normalized
-            to ``[-1, 1]``) holding the previous chunk's actions starting
-            at the position the new chunk will splice to. Effectively the
-            **inflight prefix** that the new chunk must continue.
+            to ``[-1, 1]``) holding the previous chunk's actions
+            starting at the splice position. Effectively the inflight
+            prefix that the new chunk must continue smoothly. Padded
+            with zeros to ``(chunk_size, 32)`` before upload; padded
+            positions have weight 0 so they're inert in the kernel.
 
         ``_rtc_inference_delay``
-            Integer ``d`` ∈ ``[0, chunk_size)``. The number of leading
-            new-chunk positions to freeze to ``_rtc_prev_chunk``. Must
-            equal ``_rtc_prev_chunk.shape[0]``.
+            Integer ``d`` ∈ ``[1, chunk_size]``. The number of leading
+            new-chunk positions strongly anchored to the prefix
+            (weighted 1.0 in the kernel). Must equal
+            ``_rtc_prev_chunk.shape[0]``.
 
-        For non-RTC traffic the caller passes neither, and this routine
-        re-zeros the pipeline RTC buffers iff the previous call had
-        them set (cheap, ~6 KB upload).
+        ``_rtc_execution_horizon`` (optional)
+            Integer ``end`` ∈ ``[d, chunk_size]``. The merge window
+            extends from ``d`` to ``end``; positions ``[end, chunk_size)``
+            are free (weight 0). Defaults to
+            ``self._rtc_execution_horizon`` (lerobot default 10).
+            Capped at the prefix length per
+            ``RTCProcessor.denoise_step:189-190``.
+
+        ``_rtc_schedule`` (optional)
+            One of ``"linear"``, ``"exp"``, ``"ones"``, ``"zeros"``.
+            Defaults to ``self._rtc_schedule`` (lerobot default
+            ``"linear"``). Controls the ramp shape in the merge window.
+
+        For non-RTC traffic (no prev chunk / d=0) this re-zeros the
+        weight buffer iff the previous call was active (cheap ~3 KB
+        upload), so stale weights don't bleed across inferences.
         """
         d_raw = observation.get("_rtc_inference_delay", 0)
         prev = observation.get("_rtc_prev_chunk", None)
@@ -2343,41 +2458,81 @@ class Pi05TorchFrontendRtx:
             d = int(d_raw)
         except (TypeError, ValueError):
             d = 0
+        prev_shape = getattr(prev, "shape", None)
+        prev_len = int(prev_shape[0]) if (
+            prev_shape is not None and len(prev_shape) >= 1) else 0
         active = (
             prev is not None
             and d > 0
             and d <= self.chunk_size
-            and getattr(prev, "shape", None) is not None
-            and prev.shape == (d, ACTION_DIM))
+            and prev_shape is not None
+            and len(prev_shape) == 2
+            and prev_shape[1] == ACTION_DIM
+            and prev_len >= d)
 
         if not active:
             if not self._rtc_last_call_active:
                 return
-            self._rtc_neg_mask_buf.zero_()
-            self._rtc_prev_chunk_masked_buf.zero_()
+            # Zero only the weights buffer — prev_chunk is irrelevant
+            # when weights are all zero. Save one DMA upload.
+            self._rtc_weights_buf.zero_()
             self._copy_tensor_to_pipeline_buf_stream(
-                self._rtc_neg_mask_buf,
-                self.pipeline.rtc_neg_mask_buf, stream_int)
-            self._copy_tensor_to_pipeline_buf_stream(
-                self._rtc_prev_chunk_masked_buf,
-                self.pipeline.rtc_prev_chunk_masked_buf, stream_int)
+                self._rtc_weights_buf,
+                self.pipeline.rtc_weights_buf, stream_int)
             self._rtc_last_call_active = False
             return
 
-        prev_np = np.ascontiguousarray(prev, dtype=np.float32)
-        neg_mask_np = np.zeros((self.chunk_size, ACTION_DIM), dtype=np.float32)
-        neg_mask_np[:d, :] = -1.0
-        pcm_np = np.zeros((self.chunk_size, ACTION_DIM), dtype=np.float32)
-        pcm_np[:d, :] = prev_np
+        # Resolve per-call config (fall back to frontend defaults).
+        exec_horizon_raw = observation.get(
+            "_rtc_execution_horizon", self._rtc_execution_horizon)
+        try:
+            exec_horizon = int(exec_horizon_raw)
+        except (TypeError, ValueError):
+            exec_horizon = self._rtc_execution_horizon
+        # ``RTCProcessor.denoise_step:189-190``: can't merge past the
+        # end of what the client sent — cap end at the available prev
+        # length. If the client only sent ``d`` positions (legacy/
+        # hard-freeze format) the merge window collapses to empty and
+        # we effectively do hard anchor + free continuation. If the
+        # client sent the full unconsumed tail (FlashRT G11+) we get
+        # a proper merge window up to ``exec_horizon``.
+        exec_horizon = min(exec_horizon, prev_len)
+        exec_horizon = min(exec_horizon, self.chunk_size)
+        # ``RTCProcessor.get_prefix_weights:252``: start = min(start, end).
+        # Keep that semantics by clamping d at exec_horizon when the
+        # merge window has collapsed — otherwise ``start=d > end`` would
+        # extend the weight=1.0 region past where prev actually has
+        # values to anchor against.
+        d_eff = min(d, exec_horizon) if exec_horizon > 0 else d
+        schedule = observation.get("_rtc_schedule", self._rtc_schedule)
 
-        neg_mask_t = torch.from_numpy(neg_mask_np).to(bf16)
-        pcm_t = torch.from_numpy(pcm_np).to(bf16)
-        self._rtc_neg_mask_buf.copy_(neg_mask_t, non_blocking=True)
-        self._rtc_prev_chunk_masked_buf.copy_(pcm_t, non_blocking=True)
+        # Pad / truncate prev to (chunk_size, ACTION_DIM); trailing rows
+        # are zero and (paired with weight 0) inert in the kernel.
+        prev_np = np.zeros(
+            (self.chunk_size, ACTION_DIM), dtype=np.float32)
+        prev_clip = min(prev_len, self.chunk_size)
+        prev_np[:prev_clip, :] = np.ascontiguousarray(
+            prev[:prev_clip], dtype=np.float32)
+
+        # Per-position weights, broadcast across the action_dim axis so
+        # the in-graph kernel can do element-wise multiply without a
+        # broadcast op (the C++ side wants a flat (ds*ACTION_DIM,) bf16
+        # buffer).
+        weights_1d = _get_prefix_weights(
+            start=d_eff, end=exec_horizon, total=self.chunk_size,
+            schedule=schedule)
+        weights_full = np.broadcast_to(
+            weights_1d[:, None],
+            (self.chunk_size, ACTION_DIM)).copy()
+
+        prev_t = torch.from_numpy(prev_np).to(bf16)
+        weights_t = torch.from_numpy(weights_full).to(bf16)
+        self._rtc_prev_chunk_buf.copy_(prev_t, non_blocking=True)
+        self._rtc_weights_buf.copy_(weights_t, non_blocking=True)
         self._copy_tensor_to_pipeline_buf_stream(
-            self._rtc_neg_mask_buf,
-            self.pipeline.rtc_neg_mask_buf, stream_int)
+            self._rtc_prev_chunk_buf,
+            self.pipeline.rtc_prev_chunk_buf, stream_int)
         self._copy_tensor_to_pipeline_buf_stream(
-            self._rtc_prev_chunk_masked_buf,
-            self.pipeline.rtc_prev_chunk_masked_buf, stream_int)
+            self._rtc_weights_buf,
+            self.pipeline.rtc_weights_buf, stream_int)
         self._rtc_last_call_active = True

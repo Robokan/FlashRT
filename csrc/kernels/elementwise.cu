@@ -2210,6 +2210,76 @@ void cfg_combine_into_residual_fp16(__half* residual,
         residual, v_cond, v_uncond, beta, n);
 }
 
+// ── Real-Time Chunking (RTC) soft-guidance correction ──
+// Applies per-step prefix guidance to the diffusion velocity field.
+// Pi flow-matching convention (time runs 1 → 0):
+//
+//     x1     = x_t - time * v_t        (predicted denoised endpoint)
+//     err    = (prev - x1) * weights
+//     v_new  = v_t - guidance_weight * err           [in-place on v_t]
+//
+// For Pi's flow matching the autograd-based correction in
+// lerobot/RTC reduces to this analytic form because v_t is treated as
+// constant when taking d/dx_t (see docs/spark_phase6_soft_guidance.md
+// "Math" section). One kernel launch per Euler step replaces the
+// previous hard-freeze mask-clobber + zero-out pair.
+//
+// Buffer shapes: all four buffers are (chunk_size * action_dim) bf16,
+// laid out as a flat row-major tensor. ``weights`` is broadcast
+// across action_dim by the frontend (it computes a per-position
+// weight, then tiles to (chunk_size, action_dim)). ``prev`` is
+// zero-padded past the prefix length so trailing positions are inert.
+//
+// When no RTC is active, the frontend uploads all-zero ``weights``,
+// which makes ``err == 0`` and the kernel is a no-op (v stays
+// unchanged). That keeps the kernel in the captured CUDA graph at
+// all times and avoids a graph rebuild when toggling RTC on/off.
+template<typename T>
+__global__ void rtc_guidance_correction_kernel(
+    T* __restrict__ v,                 // in/out: v_t (decoder_action_buf)
+    const T* __restrict__ x_t,         // read-only: current noisy state
+    const T* __restrict__ prev,        // read-only: zero-padded prev chunk
+    const T* __restrict__ weights,     // read-only: per-position weights
+    float time, float guidance_weight, int n) {
+    using T2 = typename packed2<T>::type;
+    T2* v2 = reinterpret_cast<T2*>(v);
+    const T2* xt2 = reinterpret_cast<const T2*>(x_t);
+    const T2* pv2 = reinterpret_cast<const T2*>(prev);
+    const T2* wt2 = reinterpret_cast<const T2*>(weights);
+    int n2 = n >> 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n2) {
+        T2 vv = v2[idx], xv = xt2[idx], pv = pv2[idx], wv = wt2[idx];
+        float v0 = to_f32(vv.x), v1 = to_f32(vv.y);
+        float xt0 = to_f32(xv.x), xt1 = to_f32(xv.y);
+        float p0 = to_f32(pv.x), p1 = to_f32(pv.y);
+        float w0 = to_f32(wv.x), w1 = to_f32(wv.y);
+        float x1_0 = xt0 - time * v0;
+        float x1_1 = xt1 - time * v1;
+        float err0 = (p0 - x1_0) * w0;
+        float err1 = (p1 - x1_1) * w1;
+        float vnew0 = v0 - guidance_weight * err0;
+        float vnew1 = v1 - guidance_weight * err1;
+        v2[idx] = make_packed2<T>(from_f32<T>(vnew0), from_f32<T>(vnew1));
+    }
+}
+
+template __global__ void rtc_guidance_correction_kernel<__nv_bfloat16>(
+    __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, float, float, int);
+
+void rtc_guidance_correction_bf16(__nv_bfloat16* v,
+                                  const __nv_bfloat16* x_t,
+                                  const __nv_bfloat16* prev,
+                                  const __nv_bfloat16* weights,
+                                  float time, float guidance_weight,
+                                  int n, cudaStream_t stream) {
+    int n2 = n >> 1;
+    rtc_guidance_correction_kernel<__nv_bfloat16>
+        <<<(n2 + 255) / 256, 256, 0, stream>>>(
+            v, x_t, prev, weights, time, guidance_weight, n);
+}
+
 // ================================================================
 // GPU memory/copy ops for CUDA Graph compatibility (DiT pipeline)
 // These replace PyTorch .copy_()/.fill_()/.half() which don't

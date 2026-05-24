@@ -20,20 +20,25 @@ actions of each new chunk to absorb the discontinuity at the swap.
 
 ::
 
-    1: sync full-chunk + freeze  - block per chunk, play ALL ``chunk_len``
-                                    actions before re-inferring. With
-                                    ``prefix_freeze=True`` (default) the
-                                    server constrains the new chunk's
-                                    first ``d`` positions to match the
-                                    last ``d`` actions played from the
-                                    previous chunk → inter-chunk boundary
-                                    is continuous by construction. Robot
-                                    pauses briefly at each boundary while
-                                    inference runs (~150 ms) but in-chunk
-                                    and cross-chunk motion are both
-                                    smooth. Set ``prefix_freeze=False`` to
-                                    A/B compare against the unfreezed
-                                    baseline.
+    1: sync truncate-replan k=25, seam blend = 5
+                                  - block per chunk, but play only the
+                                    first 25 actions (= 0.5 s at 50 Hz)
+                                    of each chunk before re-inferring;
+                                    remainder of the old chunk is
+                                    discarded. Matches the historical
+                                    openpi ``ActionChunkBroker`` (ALOHA
+                                    default) that is known to produce
+                                    good task performance on pi0.5
+                                    chocolate-bars. The first 5 actions
+                                    of each new chunk are linearly
+                                    blended from the last action served
+                                    out of the previous chunk; without
+                                    this the gripper (absolute action
+                                    space) can step-jump > 1 rad at
+                                    chunk boundaries and trip SparkJAX
+                                    safety. ``prefix_freeze`` (default
+                                    False at SparkJAX) is available for
+                                    A/B comparison.
     2: async, fire ASAP, splice at d, no seam blend (raw)
                                   - background inference; freshest plan
                                     always served. Hard step at each
@@ -122,16 +127,75 @@ logger = logging.getLogger(__name__)
 
 _PI05_FALLBACK_CHUNK_LEN = 50
 
+# Mode 1's "execute horizon": how many actions of each freshly-received
+# chunk we actually serve before blocking on the next inference. This
+# replicates the historical openpi ``ActionChunkBroker`` default
+# (``action_horizon=25``, commented "ALOHA default") that SparkJAX used
+# successfully on the pi0.5 chocolate-bars checkpoint before we switched
+# to the FlashRT-side client wrapper. Empirically that 25-tick (= 0.5 s
+# at 50 Hz) re-plan cadence is the sweet spot for this checkpoint:
+# long enough that intra-chunk motion is coherent, short enough that
+# the model never commits the robot to a stale full-chunk plan whose
+# tail (grasp / lift / place) was forecast from out-of-date pixels.
+# Playing the full 50-action chunk back-to-back, even with prefix-
+# freeze, regressed chocolate-bar grasping noticeably; this constant
+# restores the baseline. Clamped per-call to the actual chunk length
+# so smaller-chunk servers (e.g. chunk_size=10) still work sensibly.
+_MODE1_EXECUTE_HORIZON = 25
+
+# Mode 1's "seam blend window": how many actions of each freshly-
+# received chunk are linearly blended from the last-served previous
+# action toward the raw new-chunk action. Without seam blending the
+# boundary between chunk A and chunk B is a hard step whose magnitude
+# is whatever the model commanded in the inference gap — which on the
+# OpenArm chocolate_bars checkpoint can be ~2 rad on the absolute-
+# space gripper joints when the model transitions phase (approach
+# → grasp), tripping per-step joint safety limits. Five ticks at
+# 50 Hz (= 100 ms) splits a 2 rad command into 0.4 rad/step, well
+# under SparkJAX's 1.0 rad/step limit, while still letting the
+# gripper close fast enough to grasp. Clamped to ``execute_horizon``
+# so smaller-chunk servers degrade safely.
+_MODE1_BLEND_STEPS = 5
+
+# Mode 5's seam-blend safety net. Server-side prefix-freeze covers the
+# common case (splice inside frozen region → blend is a no-op), so this
+# is only exercised when the realised latency overshoots the predicted
+# ``d_pred`` — typically a Pi05Pipeline rebuild on Spark. Five ticks
+# matches mode 1's blend window; see ``_build_config_for_mode``'s
+# mode-5 comment for the per-joint magnitude analysis.
+_MODE5_BLEND_STEPS = 5
+
+# Mode 5's hard cap on prefix-freeze coverage as a fraction of the
+# chunk. Pi0.5 OpenArm with state-in-prompt produces a different
+# prompt_len for almost every observation (the float-encoded state
+# tokens shift), and each cache miss is an ~800 ms Pi05Pipeline
+# rebuild. With the default cap of ``horizon // 2``, the EMA latency
+# is dragged up by the initial build (~1.3 s) and stays pinned at
+# horizon/2 even in steady state (a 5x latency outlier poisons the
+# 0.3-alpha EMA for many subsequent calls); the new chunk's usable
+# free region then shrinks to ``horizon - cap`` ticks of play time,
+# which at horizon=50 and cap=25 is 500 ms — exactly the SparkJAX
+# default ``miss_policy="hold_last"`` 25-tick abort window, so the
+# next rebuild deadline-misses by definition. Capping at horizon/4
+# instead leaves ~horizon * 3/4 ticks (760 ms at horizon=50 / 50 Hz)
+# of play time per chunk, absorbing typical pipeline rebuilds with
+# margin. The reduced freeze coverage is what the seam blend above
+# exists to backstop: with cap=12, the splice for a ~480 ms outlier
+# inference lands well outside the frozen region, and blend rescales
+# the cliff to under SparkJAX's 0.5 rad/step delta-joint safety
+# limit.
+_MODE5_PREFIX_FREEZE_CAP_DIVISOR = 4
+
 VALID_MODES = (1, 2, 3, 4, 5)
 
 DEFAULT_MODE = 3
 
 MODE_DESCRIPTIONS = {
-    1: "sync full-chunk + server-side prefix-freeze (default freeze=on)",
+    1: "sync truncate-replan k=25, seam blend = 5 (ALOHA-default; freeze optional)",
     2: "async fire-ASAP, splice at d, no seam blend",
     3: "async fire-ASAP, splice at d, seam blend = 3 (default)",
     4: "async fire-ASAP, splice at d, seam blend = 5",
-    5: "async fire-ASAP, splice at d, server-side prefix-freeze",
+    5: "async fire-ASAP, splice at d, server-side prefix-freeze + seam blend = 5, miss=block",
 }
 
 
@@ -212,40 +276,59 @@ def _build_config_for_mode(
         as a one-shot fallback for the very first promotion only.
     """
     if mode == 1:
-        # Sync full-chunk: play all ``chunk_len`` actions of the freshly
-        # received chunk, then synchronously block on the next chunk.
-        # This is the "original" synchronous baseline (openpi
-        # AsyncActionChunkBroker-equivalent) — robot pauses briefly at
-        # each chunk boundary while inference runs, but plans within a
-        # chunk are temporally coherent and the model never produces
-        # half-chunks that conflict with the next half.
+        # Sync truncate-replan baseline. Play the first
+        # ``_MODE1_EXECUTE_HORIZON`` (=25) actions of each chunk, then
+        # synchronously block on a fresh inference; remaining actions
+        # of the old chunk are discarded. This matches the historical
+        # openpi ``ActionChunkBroker`` (action_horizon=25, "ALOHA
+        # default") that SparkJAX used successfully on pi0.5
+        # chocolate-bars before we switched the client to this
+        # wrapper, and which the operator confirms produces noticeably
+        # better task performance than playing the full 50-action
+        # chunk back-to-back (the latter commits the robot to a stale
+        # forecast of the manipulation phase before any fresh visual
+        # observation can correct it).
         #
-        # ``prefix_freeze`` (default True) additionally instructs the
-        # server to constrain the new chunk's first d positions to
-        # match the LAST d actions we just played from the previous
-        # chunk. ``d`` is derived from measured inference latency
-        # (~8 ticks at 50 Hz / 150 ms). Closes the inter-chunk
-        # boundary discontinuity caused by stale observations (the obs
-        # captured at exhaustion reflects mid-tracking pose; without
-        # the freeze the next chunk's first action plans from that
-        # stale pose and the controller must reverse-track once the
-        # robot caught up during the 150 ms block). With the freeze,
-        # the new chunk's first d actions are forced equal to the
-        # last d of the previous chunk → no jump at the boundary.
-        # After block, ``_idx`` is set to ``d`` so we skip those
-        # constrained positions and serve the model's free
-        # continuation from chunk_B[d] onward.
+        # ``blend_steps=_MODE1_BLEND_STEPS`` (=5) ramps the first 5
+        # actions of each new chunk linearly from the last action
+        # served out of the previous chunk toward the raw new-chunk
+        # action. Without it the seam between A[execute_horizon-1] and
+        # B[0] is a hard step whose magnitude is whatever the model
+        # decided to do between the two inferences. For the
+        # pi05_openarm_ngc_lora_v4 / chocolate_bars checkpoint the
+        # gripper is in absolute (not delta) action space and the
+        # model legitimately commands large step-changes there when
+        # it transitions from "approach" to "grasp" (observed ~2 rad
+        # gripper command jump from -2.205 → -0.217 at the very first
+        # chunk boundary, tripping SparkJAX's per-step 1.0 rad safety
+        # limit). Splitting that 2 rad command across 5 ticks (= 0.4
+        # rad/tick at 50 Hz = 20 rad/s peak) keeps the seam under the
+        # safety limit while still letting the gripper close in 100
+        # ms, which is fast enough to grasp.
         #
-        # An earlier revision of this mode set action_horizon=5 to give
-        # a "replan every 5 actions" baseline. That turned out to be
-        # catastrophic on real robots (see git history); the fix was
-        # to use the negotiated chunk_len as the horizon.
+        # ``prefix_freeze`` is honoured but defaults False at the
+        # SparkJAX caller for this mode — the seam blend above already
+        # smooths the boundary; the prefix-freeze inpainting path is
+        # tested at mode 5. Set to True to A/B compare; when on, the
+        # server constrains the new chunk's first d positions to match
+        # the last d actions of the previous chunk and ``_idx`` is set
+        # to d after the splice so we skip the constrained prefix.
+        #
+        # The execute horizon is clamped to the negotiated chunk
+        # length so smaller-chunk servers (e.g. chunk_size=10) degrade
+        # to "play the whole chunk" rather than running off the end.
+        # Blend steps are also clamped so they can't exceed the
+        # execute horizon (defensive — a 25-tick window with a 5-tick
+        # blend is comfortable; if execute_horizon ever shrinks below
+        # blend_steps the blend would overrun the chunk).
+        execute_horizon = min(_MODE1_EXECUTE_HORIZON, chunk_len)
+        blend_steps = min(_MODE1_BLEND_STEPS, execute_horizon)
         return RTCConfig(
             target_hz=target_hz,
-            action_horizon=chunk_len,
-            start_next_at=chunk_len,
+            action_horizon=execute_horizon,
+            start_next_at=execute_horizon,
             miss_policy="block",
-            blend_steps=0,
+            blend_steps=blend_steps,
             auto_inference_delay=prefix_freeze,
             enable_prefix_freeze=prefix_freeze)
     d_seed = _initial_inference_delay_steps(target_hz, expected_latency_ms)
@@ -264,14 +347,81 @@ def _build_config_for_mode(
     if mode == 4:
         return RTCConfig(**common, blend_steps=5)
     if mode == 5:
-        # Server-side prefix-freeze handles the smoothness contract.
-        # blend_steps=0 because client-side blending now hides the
-        # very feature we'd otherwise observe in motion smoothness
-        # numbers (the prefix-freeze is the smoothing).
+        # Server-side prefix-freeze is the PRIMARY smoothness mechanism:
+        # see ``_MODE5_BLEND_STEPS`` and ``_MODE5_PREFIX_FREEZE_CAP_DIVISOR``
+        # for the joint analysis of cap + blend.
+        #
+        # Mode 5 overrides ``miss_policy`` from the async default of
+        # ``hold_last`` to ``block``. With ``hold_last``, when the
+        # inflight inference doesn't return before chunk exhaustion
+        # the runner repeats the last-served action; SparkJAX's
+        # ``openpi_runner_node`` then trips its 25-consecutive-holds
+        # safety abort (~500 ms) and the policy halts. With Pi0.5
+        # state-in-prompt on Spark this happens regularly: each new
+        # ``prompt_len`` triggers a ~750 ms lazy graph capture on
+        # first touch (even with --prewarm-prompt-lens, which only
+        # pays the pipeline-build cost, not the capture cost), and
+        # two back-to-back lazy captures cumulatively exceed the
+        # ~880 ms play window between chunk swaps even at the
+        # current cap=12, deadline-missing the SparkJAX safety
+        # threshold.
+        #
+        # ``block`` instead waits on the inflight inference when the
+        # chunk exhausts. The block path is a no-op against the
+        # already-submitted future (``_submit_locked`` early-returns
+        # when ``_pending is not None``), so all it does is call
+        # ``.result()`` on the existing future and splice when it
+        # lands. The visible effect on the robot is a brief pause
+        # instead of a held repeat — closer to "the model is
+        # thinking" than "the model is stuck", and not a per-tick
+        # safety violation. We still keep the seam blend so the
+        # post-pause splice is smooth even when latency overshoots
+        # ``d_pred``.
+        # the diffusion decoder is constrained so the first ``d_pred``
+        # positions of the new chunk equal the inflight prefix in
+        # model space, and the rest of the trajectory is denoised
+        # conditional on that constraint. When the splice lands inside
+        # the frozen region (``d_actual <= d_pred``), the boundary is
+        # continuous by construction and the blend below interpolates
+        # between two near-equal values — i.e. a near-no-op.
+        #
+        # ``blend_steps=_MODE5_BLEND_STEPS`` (=5) is a SAFETY NET for
+        # the case where the splice lands OUTSIDE the frozen region
+        # (``d_actual > d_pred``). This happens when the realised
+        # latency for the inflight inference exceeds what the EMA
+        # predicted at submission time — the most common cause on
+        # Spark is a Pi05Pipeline rebuild for a never-seen prompt
+        # length (the OpenArm Pi0.5 frontend embeds floating-point
+        # state into the prompt, so token counts shift slightly per
+        # observation and the prompt-len cache misses cost ~800 ms
+        # each, blowing past the typical 200 ms steady-state latency
+        # by 4x). In that regime the first served action from the
+        # new chunk is from the free (unconstrained) region and has
+        # no continuity guarantee with the last action served from
+        # the old chunk — empirically a 1.4 rad jump on a delta
+        # joint at the chocolate-bars task. Splitting that across 5
+        # ticks (= 100 ms at 50 Hz, ~0.28 rad/step on the worst
+        # observation) keeps the seam under SparkJAX's 0.5 rad/step
+        # delta-joint safety limit while still letting the splice
+        # converge fast enough that we're not playing a stale plan.
+        #
+        # The blend does cost some of mode 5's theoretical purity (we
+        # can no longer claim "raw server-side smoothing only"), but
+        # the alternative — safety-stopping on every Pi05Pipeline
+        # rebuild — is worse. If the prompt-length cache misses are
+        # later eliminated by pre-building or by stripping floats from
+        # the prompt, this can drop back to 0.
+        cap = max(1, chunk_len // _MODE5_PREFIX_FREEZE_CAP_DIVISOR)
+        # Build kwargs explicitly so we can override miss_policy from
+        # the async ``hold_last`` default to ``block`` without
+        # mutating the shared ``common`` dict.
+        mode5_kwargs = dict(common)
+        mode5_kwargs["miss_policy"] = "block"
         return RTCConfig(
-            **common,
-            blend_steps=0,
-            enable_prefix_freeze=True)
+            **mode5_kwargs,
+            blend_steps=_MODE5_BLEND_STEPS,
+            enable_prefix_freeze=True,
+            prefix_freeze_max_steps=cap)
     raise ValueError(
         f"blending_mode must be in {VALID_MODES}, got {mode}")
 

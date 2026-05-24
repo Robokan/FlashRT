@@ -555,27 +555,33 @@ class AsyncChunkRunner:
         self._pending = None
         self._record_latency_locked(result.latency_s)
         horizon = self._configured_horizon(result.actions)
-        # Use the latency of THIS specific inference for d. With variable
-        # inference time (pipeline rebuilds, network jitter), the EMA
-        # underestimates fresh long outliers and lags fresh short
-        # recoveries — both produce time-skip jumps at the splice.
+        # Async splice: ``d`` must equal the number of control ticks of
+        # the OLD chunk we played while the new inference was in flight.
+        # We splice at chunk_new[d] which then sits at exactly the same
+        # trajectory position as chunk_old[idx_at_submit + d] — and the
+        # last action we just served was chunk_old[idx_at_submit + d - 1].
+        # With prefix-freeze active, chunk_new[d-1] is FROZEN to equal
+        # chunk_old[idx_at_submit + d - 1] in model space, so the splice
+        # is a smooth single-tick continuation. (When d == d_pred_used
+        # we land at the first FREE position; when d < d_pred_used we
+        # land inside the frozen region and serve a constrained action
+        # that equals what we would have served from chunk_old anyway
+        # — also smooth.)
+        #
+        # IMPORTANT: do NOT lift ``d`` up to ``max(d, d_pred_used)`` in
+        # the async path. That sounds defensive but actually makes the
+        # splice JUMP FORWARD by (d_pred_used - d) ticks: we'd serve
+        # chunk_new[d_pred_used] (free continuation from frozen anchor
+        # at index d_pred_used-1 = chunk_old[idx+d_pred-1]) when our
+        # actual last-served was chunk_old[idx+d-1]. That's a (d_pred-d)-
+        # tick "fast-forward" worth ~0.03 rad/tick → visible jerkiness
+        # at every swap. Symptom observed in mode 5 chocolate_bars,
+        # 2026-05; remove of the max() restored smooth async boundaries.
+        # The ``_last_d_pred`` is still consumed here so the sync block
+        # path (which DOES need it) gets a clean slate next time.
         d = self._effective_splice_d_locked(
             horizon, measured_latency_s=result.latency_s)
-        # If the submission carried a frozen-prefix of length d_pred,
-        # the resulting chunk's first d_pred positions are equal to old-
-        # chunk actions (in model space). Splicing at d < d_pred lands
-        # inside the frozen region and serves replays of OLD actions —
-        # in sync mode this is a backward jump (the visible bug fixed
-        # 2026-05). Always splice at the first FREE position by lifting
-        # d to d_pred when the prefix is wider than the latency-derived
-        # ``d``. ``_last_d_pred`` is consumed (reset to 0) so the next
-        # promotion without a prefix uses the bare latency-derived d.
-        d_pred_used = self._last_d_pred
         self._last_d_pred = 0
-        if d_pred_used > d:
-            d = d_pred_used
-            if horizon > 0 and d > horizon - 1:
-                d = horizon - 1
         self._current = result
         # Snapshot the seam anchor BEFORE overwriting _idx. If
         # blend_steps>0, the next emitted action will linearly interpolate
@@ -615,17 +621,34 @@ class AsyncChunkRunner:
             self._pending = None
             self._record_latency_locked(result.latency_s)
             horizon = self._configured_horizon(result.actions)
-            d = self._effective_splice_d_locked(
-                horizon, measured_latency_s=result.latency_s)
-            # Mirror _promote_ready_locked: when a prefix was sent, the
-            # splice must clear the frozen region. See the comment in
-            # _promote_ready_locked for the math.
+            # Sync block path: the control loop was blocked on the
+            # result while inference ran, so NO control ticks elapsed
+            # during inference. The measured-latency-derived ``d`` is
+            # semantically meaningless here — it would tell us how
+            # many ticks of chunk_A we played during inference, but
+            # the answer is zero by construction.
+            #
+            # The correct splice in sync mode is exactly ``d_pred_used``:
+            # land at the first model-free position past the frozen
+            # prefix. Splicing later (e.g. at measured_d when the
+            # inference was slow due to a pipeline rebuild) lands in
+            # chunk_B's free region with NO continuity guarantee
+            # against chunk_A[49] — visible as a multi-tenth-radian
+            # jump at the boundary. Splicing earlier (inside the
+            # frozen region) re-serves OLD chunk_A actions (the bug
+            # the original G9 fix already addressed for ``d_pred > d``).
+            #
+            # If no prefix was sent (older configs or prefix-freeze
+            # disabled), fall back to the latency-derived d.
             d_pred_used = self._last_d_pred
             self._last_d_pred = 0
-            if d_pred_used > d:
+            if d_pred_used > 0:
                 d = d_pred_used
                 if horizon > 0 and d > horizon - 1:
                     d = horizon - 1
+            else:
+                d = self._effective_splice_d_locked(
+                    horizon, measured_latency_s=result.latency_s)
             self._current = result
             if self._last_action is not None:
                 self._seam_anchor = np.asarray(self._last_action).copy()

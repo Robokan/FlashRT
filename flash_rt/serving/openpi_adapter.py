@@ -308,6 +308,23 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
                 "_rtc_prev_chunk": np.asarray(rtc_prev),
                 "_rtc_inference_delay": int(rtc_d),
             }
+            # Diagnostic log — fires on the first 5 inferences (so we
+            # can confirm the prefix-freeze wiring is alive without
+            # needing a long run that may safety-stop before throttle
+            # hits), then once per 50 thereafter. If mode 5 in SparkJAX
+            # is producing safety-tripping chunk boundaries, the first
+            # thing to check is whether this log is firing at all —
+            # silence here means the client is not populating the
+            # fields (server-side freeze is a no-op, mode 5 silently
+            # degrades to mode 2).
+            if self._infer_count < 5 or self._infer_count % 50 == 0:
+                prev_arr = np.asarray(rtc_prev)
+                logger.info(
+                    "[RTC] received _rtc_prev_chunk shape=%s d=%d "
+                    "(prev[0,:4]=%s prev[-1,:4]=%s)",
+                    prev_arr.shape, int(rtc_d),
+                    np.round(prev_arr[0, :4], 3).tolist(),
+                    np.round(prev_arr[-1, :4], 3).tolist())
 
         result = self._model.predict(
             images=images, prompt=str(prompt), state=state_for_model,
@@ -344,6 +361,15 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
         # that haven't been updated), fall back to the post-unnorm
         # chunk — RTC guidance still works but is numerically less
         # faithful (mirrors the openpi-server behaviour).
+        # Mirror diagnostic on the OUTBOUND side so we can tell whether
+        # the model frontend is actually populating model-space chunks
+        # (required for the prefix-freeze loop to close). If
+        # chunk_model_space is None here we fell back to the
+        # post-unnorm actions, which RTC can still use but is
+        # numerically less faithful. Same throttle as the inbound log.
+        if self._infer_count < 5 or self._infer_count % 50 == 0:
+            cms_src = "model" if chunk_model_space is not None else "fallback(actions)"
+            logger.info("[RTC] returning _rtc_chunk_model_space (source=%s)", cms_src)
         self._infer_count += 1
         if chunk_model_space is None:
             chunk_model_space = actions_np

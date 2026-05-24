@@ -604,24 +604,30 @@ def test_sync_block_runner_prefix_from_chunk_tail():
         runner.close()
 
 
-def test_prefix_freeze_splice_skips_frozen_region():
-    """Regression: when the augmentation sends a frozen prefix of length
-    ``d_pred``, the resulting chunk's splice index must land at the first
-    FREE position (>= d_pred), never inside the frozen region.
+def test_sync_block_splice_lands_at_d_pred_exactly():
+    """Regression: in sync block mode with prefix-freeze, the splice
+    index must equal ``d_pred_used`` EXACTLY, regardless of measured
+    inference latency.
 
-    Without the splice-coupling, a small latency-derived ``d`` combined
-    with a larger ``d_pred`` causes ``_idx`` to land inside the frozen
-    region — which in sync block-mode is a backward-time replay of the
-    OLD chunk's tail and produces a visible jump at the boundary
-    (chocolate_bars symptom observed 2026-05).
+    Two failure modes are ruled out:
+
+    1. Splice INSIDE the frozen region (d < d_pred). The frozen
+       positions are replays of the previous chunk's tail; serving
+       them is a backward-time jump (the original G9 bug).
+
+    2. Splice PAST the frozen region (d > d_pred). The frozen
+       region only constrains ``chunk_B[0..d_pred-1]`` to match the
+       previous chunk's tail. ``chunk_B[d_pred..49]`` are free
+       predictions with no continuity guarantee against
+       ``chunk_A[49]``. Splicing at ``measured_d > d_pred`` (e.g.
+       because of a slow pipeline rebuild) produces an arbitrarily
+       large jump at the boundary — the chocolate_bars 0.56 rad
+       symptom observed 2026-05.
+
+    In sync mode no control ticks elapse during inference (loop is
+    blocked on the result), so ``measured_d`` is semantically
+    meaningless for the splice. Only ``d_pred_used`` matters.
     """
-    # Two distinguishable chunks: chunk0 = arange(20), chunk1 = arange(20)+100.
-    # With margin=0, d_pred = 2 in sync mode. The latency-derived d (from
-    # a ~5 ms inference at 1000 Hz) is ceil(0.005 * 1000) = 5, which is
-    # already > d_pred=2 — so this test needs a SLOW first inference to
-    # build EMA, then a FAST second inference whose latency d would
-    # otherwise be smaller than d_pred. Easier: use margin large enough
-    # to force d_pred > observed-latency-d.
     chunks_returned = [
         np.arange(20, dtype=np.float32)[:, None],
         (np.arange(20, dtype=np.float32) + 100.0)[:, None],
@@ -631,11 +637,17 @@ def test_prefix_freeze_splice_skips_frozen_region():
     def policy(obs):
         idx = min(call_idx[0], len(chunks_returned) - 1)
         call_idx[0] += 1
-        time.sleep(0.001)  # 1 tick of inference at 1000 Hz; d = 1
+        # The SECOND inference simulates a slow pipeline rebuild:
+        # 50ms at 1000Hz = measured_d would be 50 if used. With
+        # the sync-mode splice fix, d_pred=10 is what gets used.
+        if idx == 1:
+            time.sleep(0.050)
+        else:
+            time.sleep(0.001)
         actions = chunks_returned[idx]
         return {
             "actions": actions,
-            "_rtc_chunk_model_space": actions,  # identity for clarity
+            "_rtc_chunk_model_space": actions,
         }
 
     runner = AsyncChunkRunner(
@@ -648,12 +660,10 @@ def test_prefix_freeze_splice_skips_frozen_region():
             miss_policy="block",
             auto_inference_delay=True,
             enable_prefix_freeze=True,
-            # margin=8 → d_pred = 10 in sync mode, much larger than the
-            # ~1 tick of measured latency. Without the splice-coupling
-            # fix, _idx would land at d=1 (inside the d_pred=10 frozen
-            # region) and we'd serve chunk1[1] which equals chunk0[11]
-            # (frozen replay of old chunk). With the fix, _idx lands at
-            # d_pred=10 and we serve chunk1[10] = 110 = first FREE.
+            # margin=8 → d_pred = 10 in sync mode. Measured latency
+            # for the boundary inference is 50ms × 1000Hz = 50 ticks,
+            # which would (under the broken max() splice) become the
+            # splice index. With the fix, splice = d_pred = 10.
             prefix_freeze_margin_steps=8,
         ),
     )
@@ -661,19 +671,15 @@ def test_prefix_freeze_splice_skips_frozen_region():
         runner.reset({"step": "init"})
         for tick in range(20):
             runner.next_action({"step": tick})
-        # Next tick is the boundary: triggers exhaustion -> block.
+        # Boundary tick: triggers exhaustion -> block on slow inference.
         boundary_action = runner.next_action({"step": 20})
-        # Must serve from chunk1 (>=100). If we wrongly serve from the
-        # frozen region, we'd see a value < 100 (it would be chunk0's
-        # tail values 10..19 replayed via the freeze).
-        assert boundary_action[0] >= 100.0, (
-            f"splice landed inside frozen region: got {boundary_action[0]}, "
-            f"expected >= 100.0 (first free position of chunk1). "
-            f"This is the chocolate_bars backward-jump bug.")
-        # Specifically, with margin=8, d_pred=10, the splice must be at
-        # exactly 10 -> chunk1[10] = 110.
+        # Splice must land at chunk1[d_pred=10] = 110.0 exactly.
+        # If broken (splice at measured_d=50), would clamp to
+        # horizon-1=19 -> chunk1[19] = 119 (or whatever).
         assert boundary_action[0] == 110.0, (
-            f"splice should land at d_pred=10 (first free position) -> "
-            f"chunk1[10]=110.0, got {boundary_action[0]}")
+            f"sync splice should land at d_pred=10 exactly -> "
+            f"chunk1[10]=110.0, got {boundary_action[0]}. "
+            f"With measured_d=50 and the broken max() splice this "
+            f"would land at chunk1[19]=119 (clamped to horizon-1).")
     finally:
         runner.close()

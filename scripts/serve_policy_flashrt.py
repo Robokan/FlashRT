@@ -138,6 +138,22 @@ def main() -> int:
                              "match the checkpoint's training-time horizon; "
                              "serving a chunk_size that doesn't match the "
                              "trained horizon produces degenerate motion.")
+    parser.add_argument("--runtime-lora", default="all",
+                        choices=["0", "all", "encoder", "encoder_ffn"],
+                        help="Where to apply LoRA at inference time. "
+                             "Pi0.5 OpenArm LoRA checkpoints need 'all' (the "
+                             "default) so the decoder gemma_300m expert "
+                             "LoRA is applied as a runtime BF16 matmul + "
+                             "residual rather than merged into the base "
+                             "weights at conversion. Without 'all' the "
+                             "OpenArm L3/R3 shoulder-pitch joints pick up "
+                             "a +0.21 / +0.15 rad bias from bf16 precision "
+                             "loss in the LoRA merge — see docs/spark_status.md "
+                             "G6. '0' = legacy merge-everything (fast load, "
+                             "wrong on LoRA checkpoints). 'encoder' / "
+                             "'encoder_ffn' are diagnostic-only scopes. "
+                             "Sets FLASHRT_RUNTIME_LORA before flash_rt is "
+                             "imported; explicit env var still wins.")
     parser.add_argument("--port", type=int, default=8002,
                         help="Websocket port. Default 8002 leaves 8001 free "
                              "for the openpi JAX reference server when "
@@ -169,6 +185,24 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         force=True,
     )
+
+    # Decide runtime-LoRA mode BEFORE importing flash_rt, because the JAX
+    # frontend reads FLASHRT_RUNTIME_LORA at import / load time to decide
+    # whether each LoRA pair gets extracted for runtime application or
+    # merged into the BF16 base weights. An explicit env var (set by the
+    # user or by an external launcher) wins over the CLI default so
+    # diagnostic runs can still force '0' / 'encoder_ffn' / 'encoder'
+    # without editing this script.
+    _env_lora = os.environ.get("FLASHRT_RUNTIME_LORA")
+    if _env_lora is None:
+        os.environ["FLASHRT_RUNTIME_LORA"] = args.runtime_lora
+        logger.info("FLASHRT_RUNTIME_LORA=%s (from --runtime-lora default; "
+                    "OpenArm-LoRA checkpoints need 'all' to avoid "
+                    "+0.21/+0.15 rad shoulder bias from bf16 merge)",
+                    args.runtime_lora)
+    else:
+        logger.info("FLASHRT_RUNTIME_LORA=%s (from environment; --runtime-lora=%s ignored)",
+                    _env_lora, args.runtime_lora)
 
     # 1. Load FlashRT model.
     try:

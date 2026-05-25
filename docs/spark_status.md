@@ -2129,6 +2129,40 @@ percentile from 99.9 to 99.5, (b) raise sample count to 200+, or
 (c) keep `encoder_ffn_down_w_{15,16}` in BF16 as a mixed-precision
 exception.
 
+## G12 — FP8 + runtime-LoRA decoder fix (Phase 8, code-complete)
+
+The G11 RTC soft-guidance work surfaced a latent bug: running the
+production server with `--fp8` + `FLASHRT_RUNTIME_LORA=all` produced
+"catastrophic" actions on the OpenArm v4 LoRA checkpoint. Root cause:
+the Pi0.5 FP8 decoder pipeline silently dropped *all* runtime-LoRA
+contributions because the encoder's "force non-fused FP8 when LoRA
+on + apply LoRA via bf16_nn_res" pattern was never ported to the
+decoder. The four FP8 decoder GEMM sites (QKV, attn O, FFN gate/up,
+FFN down) had no `_apply_dec_lora` calls at all.
+
+Fix in this commit (G12):
+
+* JAX converter emits the fused `(D, 2r)` / `(2r, 2H)` block-diagonal
+  `decoder_ffn_gateup_lora_{a,b}` (mirror of the encoder's
+  `_build_padded_gateup_lora`).
+* `Pi05Pipeline.__init__` detects `_has_dec_ffn_gateup_lora_fused`
+  and widens `dec_max_neck` to `2r`.
+* `transformer_decoder` and `_decoder_layer` compute `_dec_lora_on`
+  and force the fused FP8 path off when LoRA is active; the four
+  non-fused FP8 decoder branches each apply runtime LoRA via the
+  existing `_apply_dec_lora` helper.
+
+Verification:
+
+* `tests/test_fp8_lora_decoder_wiring.py` — 9 unit cases, pure
+  numpy + source-inspection regression gate.
+* `scripts/spark_phase8_fp8_lora_parity.py` — three-step in-process
+  parity harness (`--mode bf16` → `--mode fp8` → `--compare`) the user
+  runs on Spark to confirm BF16+LoRA vs FP8+LoRA cosine ≥ 0.99.
+
+Full rationale, algebra, and acceptance gates:
+[`spark_phase8_fp8_lora.md`](spark_phase8_fp8_lora.md).
+
 ## What's not yet verified
 
 - The flashrt_spark Docker image build (`docker compose -f

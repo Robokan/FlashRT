@@ -916,6 +916,16 @@ def convert_pi05_orbax(
     dec_ffn_gate_la_list, dec_ffn_gate_lb_list = [], []
     dec_ffn_up_la_list,   dec_ffn_up_lb_list   = [], []
     dec_ffn_down_la_list, dec_ffn_down_lb_list = [], []
+    # Fused (D, 2r) / (2r, 2H) padded gateup LoRA for the FP8 decoder
+    # FFN path. The base FP8 GEMM writes ``decoder_gate_merged`` of
+    # shape (ds, 2H) from a single fused ``decoder_ffn_gate_up_w_{i}``
+    # of shape (D, 2H); the fused LoRA below adds the matching delta
+    # in a single bf16_nn + bf16_nn_res call. See
+    # _build_padded_gateup_lora() for the algebra. Without this, the
+    # decoder FP8 FFN gate/up path would silently drop the LoRA
+    # contribution (the catastrophic FP8 + runtime_lora=all bug
+    # diagnosed in G12 / spark_phase8_fp8_lora.md).
+    dec_ffn_gateup_la_list, dec_ffn_gateup_lb_list = [], []
     _dec_gating_base = "PaliGemma.llm.layers.mlp_1.gating_einsum"
     _dec_linear_base = "PaliGemma.llm.layers.mlp_1.linear"
     _dec_gating_pair = runtime_lora_pairs.get(_dec_gating_base)
@@ -1028,12 +1038,24 @@ def convert_pi05_orbax(
         if _has_dec_ffn_lora:
             la_gu, lb_gu = _dec_gating_pair   # (L, 2, D, r), (L, 2, r, H)
             la_dn, lb_dn = _dec_linear_pair   # (L, H, r), (L, r, D)
-            dec_ffn_gate_la_list.append(la_gu[i, 0].astype(np.float32))  # (D, r)
-            dec_ffn_up_la_list.append(  la_gu[i, 1].astype(np.float32))
-            dec_ffn_gate_lb_list.append(lb_gu[i, 0].astype(np.float32))  # (r, H)
-            dec_ffn_up_lb_list.append(  lb_gu[i, 1].astype(np.float32))
+            la_gate_i = la_gu[i, 0].astype(np.float32)                   # (D, r)
+            la_up_i   = la_gu[i, 1].astype(np.float32)
+            lb_gate_i = lb_gu[i, 0].astype(np.float32)                   # (r, H)
+            lb_up_i   = lb_gu[i, 1].astype(np.float32)
+            dec_ffn_gate_la_list.append(la_gate_i)
+            dec_ffn_up_la_list.append(la_up_i)
+            dec_ffn_gate_lb_list.append(lb_gate_i)
+            dec_ffn_up_lb_list.append(lb_up_i)
             dec_ffn_down_la_list.append(la_dn[i].astype(np.float32))     # (H, r)
             dec_ffn_down_lb_list.append(lb_dn[i].astype(np.float32))     # (r, D)
+            # Fused (D, 2r) / (2r, 2H) padded form mirroring the
+            # encoder's enc_gateup_l{a,b}_list construction — required
+            # by the FP8 decoder FFN path, which uses a single fused
+            # decoder_ffn_gate_up_w_{i} base weight.
+            gu_la, gu_lb = _build_padded_gateup_lora(
+                la_gate_i, la_up_i, lb_gate_i, lb_up_i)
+            dec_ffn_gateup_la_list.append(gu_la)
+            dec_ffn_gateup_lb_list.append(gu_lb)
 
     ckpt["decoder_attn_qkv_w"] = _to_bf16_cuda(np.stack(dec_qkv_list))
     ckpt["decoder_attn_o_w"] = _to_bf16_cuda(np.stack(dec_o_list))
@@ -1057,6 +1079,20 @@ def convert_pi05_orbax(
         ckpt["decoder_ffn_up_lora_b"]   = _to_bf16_cuda(np.stack(dec_ffn_up_lb_list))
         ckpt["decoder_ffn_down_lora_a"] = _to_bf16_cuda(np.stack(dec_ffn_down_la_list))
         ckpt["decoder_ffn_down_lora_b"] = _to_bf16_cuda(np.stack(dec_ffn_down_lb_list))
+        ckpt["decoder_ffn_gateup_lora_a"] = _to_bf16_cuda(np.stack(dec_ffn_gateup_la_list))
+        ckpt["decoder_ffn_gateup_lora_b"] = _to_bf16_cuda(np.stack(dec_ffn_gateup_lb_list))
+        logger.info(
+            "Runtime LoRA: stashed decoder ffn gate/up lora_a/lora_b "
+            "(shape %s, %s) + fused gateup (shape %s, %s) + down (%s, %s) "
+            "across %d layers",
+            tuple(ckpt["decoder_ffn_gate_lora_a"].shape),
+            tuple(ckpt["decoder_ffn_gate_lora_b"].shape),
+            tuple(ckpt["decoder_ffn_gateup_lora_a"].shape),
+            tuple(ckpt["decoder_ffn_gateup_lora_b"].shape),
+            tuple(ckpt["decoder_ffn_down_lora_a"].shape),
+            tuple(ckpt["decoder_ffn_down_lora_b"].shape),
+            DEC_L,
+        )
 
     ckpt["decoder_pre_attn_norm_mod_w"] = _to_bf16_cuda(np.stack(dec_attn_mod_w_list))
     ckpt["decoder_pre_attn_norm_mod_b"] = _to_bf16_cuda(np.stack(dec_attn_mod_b_list))

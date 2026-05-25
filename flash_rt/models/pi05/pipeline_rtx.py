@@ -290,6 +290,17 @@ class Pi05Pipeline:
             and "decoder_ffn_up_lora_a" in weights
             and "decoder_ffn_up_lora_b" in weights
         )
+        # Fused (D, 2r) / (2r, 2H) padded gateup form, used by the
+        # FP8 decoder path whose base GEMM writes decoder_gate_merged
+        # in one shot from a single decoder_ffn_gate_up_w_{i} weight.
+        # Built by the JAX converter (G12); see
+        # _build_padded_gateup_lora in flash_rt/frontends/jax/pi05_rtx.py
+        # for the algebra. Without this the FP8 decoder FFN path
+        # silently drops the LoRA contribution.
+        self._has_dec_ffn_gateup_lora_fused = (
+            "decoder_ffn_gateup_lora_a" in weights
+            and "decoder_ffn_gateup_lora_b" in weights
+        )
         self._has_dec_ffn_down_lora = (
             "decoder_ffn_down_lora_a" in weights
             and "decoder_ffn_down_lora_b" in weights
@@ -305,6 +316,7 @@ class Pi05Pipeline:
                          or self._has_enc_ffn_down_lora
                          or self._has_enc_attn_lora)
         _any_dec_lora = (self._has_dec_ffn_gateup_lora
+                         or self._has_dec_ffn_gateup_lora_fused
                          or self._has_dec_ffn_down_lora
                          or self._has_dec_attn_lora)
         if _any_enc_lora:
@@ -380,14 +392,21 @@ class Pi05Pipeline:
                 dec_max_neck = max(
                     dec_max_neck,
                     int(weights["decoder_attn_qkv_lora_a"].shape[-1]))
+            if self._has_dec_ffn_gateup_lora_fused:
+                # 2r for the fused gateup form (typical 2*32 = 64 on
+                # Pi0.5 OpenArm). Same widening logic as the encoder.
+                dec_max_neck = max(
+                    dec_max_neck,
+                    int(weights["decoder_ffn_gateup_lora_a"].shape[-1]))
             self._dec_lora_neck_max = dec_max_neck
             self._dec_lora_neck = CudaBuffer.device_empty(
                 self.chunk_size * dec_max_neck, BF16)
             logger.info(
                 "Pi05Pipeline: runtime LoRA enabled for decoder "
-                "(ffn_gateup=%s, ffn_down=%s, attn=%s, rank=%d, "
-                "scaling=%.4f, max_neck=%d)",
+                "(ffn_gateup=%s, ffn_gateup_fused=%s, ffn_down=%s, attn=%s, "
+                "rank=%d, scaling=%.4f, max_neck=%d)",
                 self._has_dec_ffn_gateup_lora,
+                self._has_dec_ffn_gateup_lora_fused,
                 self._has_dec_ffn_down_lora,
                 self._has_dec_attn_lora,
                 self._dec_lora_rank, self._lora_scaling,
@@ -1806,7 +1825,22 @@ class Pi05Pipeline:
         B = self.bufs
         enc_seq = self.encoder_seq_len
         ds = self.chunk_size
-        fused = self.use_fp8_decoder and self.fp8_calibrated
+        # When runtime LoRA is active for the decoder we need BF16
+        # intermediates that the fused FP8 path overwrites (decoder_x
+        # post-AdaRMSNorm before QKV / FFN GEMMs). Disable fusion the
+        # same way the encoder does (line 1442) — the non-fused FP8
+        # path keeps every base matmul in FP8 *and* the LoRA add is
+        # wired in below for each FP8 GEMM site. Correctness > 5 % FP8
+        # speed for the decoder loop, which is anyway 10 steps × small
+        # matmuls and is not the latency-dominant phase. See
+        # docs/spark_phase8_fp8_lora.md (G12).
+        _dec_lora_on = (
+            self._has_dec_ffn_gateup_lora
+            or self._has_dec_ffn_gateup_lora_fused
+            or self._has_dec_ffn_down_lora
+            or self._has_dec_attn_lora)
+        fused = (self.use_fp8_decoder and self.fp8_calibrated
+                 and not _dec_lora_on)
         n_noise = ds * ACTION_DIM
 
         # NB: no pre-Euler init for RTC. Soft guidance steers the
@@ -1866,7 +1900,13 @@ class Pi05Pipeline:
         W = self.weights
         B = self.bufs
         attn_ptrs = self._attn_ptrs
-        fused = self.use_fp8_decoder and self.fp8_calibrated
+        _dec_lora_on = (
+            self._has_dec_ffn_gateup_lora
+            or self._has_dec_ffn_gateup_lora_fused
+            or self._has_dec_ffn_down_lora
+            or self._has_dec_attn_lora)
+        fused = (self.use_fp8_decoder and self.fp8_calibrated
+                 and not _dec_lora_on)
 
         # C1: AdaRMSNorm with style modulation → FP8 (fused) or BF16
         qkv_name = f"decoder_attn_qkv_w_{i}"
@@ -1905,6 +1945,25 @@ class Pi05Pipeline:
                     qkv_name,
                     B["decoder_QKV"].ptr.value,
                     ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D, stream)
+                # Runtime LoRA decoder QKV — base GEMM is FP8 (quantized),
+                # LoRA add is BF16 on top via bf16_nn_res. Same padded
+                # form as the BF16 path below; must run BEFORE
+                # qkv_split_rope so the LoRA contribution gets the same
+                # RoPE / cache treatment as the base QKV. Without this,
+                # FP8 + FLASHRT_RUNTIME_LORA=all silently dropped the
+                # decoder attention LoRA delta (G12 fix).
+                if self._has_dec_attn_lora:
+                    la_qkv = W["decoder_attn_qkv_lora_a"][i]
+                    lb_qkv = W["decoder_attn_qkv_lora_b"][i]
+                    self._apply_dec_lora(
+                        B["x_normed_buf"].ptr.value,
+                        la_qkv.data_ptr(), lb_qkv.data_ptr(),
+                        B["decoder_QKV"].ptr.value,
+                        ds,
+                        DEC_D,
+                        (DEC_NH + 2 * DEC_NKV) * DEC_HD,
+                        int(la_qkv.shape[-1]),
+                        stream)
             elif self.use_int8_decoder:
                 self._int8_gemm_fused(
                     B["dec_act_int8"].ptr.value, qkv_name,
@@ -1964,6 +2023,18 @@ class Pi05Pipeline:
                 f"decoder_attn_o_w_{i}",
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_NH * DEC_HD, stream)
+            # Runtime LoRA decoder attn O — base FP8, BF16 delta into
+            # the same x_normed buffer via bf16_nn_res. dec_o_ptr is
+            # the attention output in bf16, same activation the FP8
+            # base GEMM consumed. (G12 fix — was previously dropped.)
+            if self._has_dec_attn_lora:
+                self._apply_dec_lora(
+                    dec_o_ptr,
+                    W["decoder_attn_o_lora_a"][i].data_ptr(),
+                    W["decoder_attn_o_lora_b"][i].data_ptr(),
+                    B["x_normed_buf"].ptr.value,
+                    ds, DEC_NH * DEC_HD, DEC_D,
+                    self._dec_lora_rank, stream)
         elif self.use_int8_decoder:
             self._int8_gemm(
                 dec_o_ptr, ds * DEC_NH * DEC_HD,
@@ -2032,6 +2103,24 @@ class Pi05Pipeline:
                     gu_name,
                     B["decoder_gate_merged"].ptr.value,
                     ds, 2 * DEC_H, DEC_D, stream)
+                # Runtime LoRA decoder FFN gate/up — base FP8 writes
+                # (ds, 2H) into decoder_gate_merged in the [gate | up]
+                # layout; the padded gateup LoRA (D, 2r) × (2r, 2H)
+                # block-diagonal mirrors that layout exactly so a
+                # single bf16_nn + bf16_nn_res covers gate's [:, :H]
+                # and up's [:, H:] in one pass — same algebra as the
+                # encoder's _has_enc_ffn_gateup_lora_fused path.
+                # (G12 fix.)
+                if self._has_dec_ffn_gateup_lora_fused:
+                    la_gu = W["decoder_ffn_gateup_lora_a"][i]
+                    lb_gu = W["decoder_ffn_gateup_lora_b"][i]
+                    self._apply_dec_lora(
+                        B["x_normed_buf"].ptr.value,
+                        la_gu.data_ptr(), lb_gu.data_ptr(),
+                        B["decoder_gate_merged"].ptr.value,
+                        ds, DEC_D, 2 * DEC_H,
+                        int(la_gu.shape[-1]),
+                        stream)
             elif self.use_int8_decoder:
                 # INT8: separate gate GEMM → decoder_gate_buf,
                 #       up GEMM + SiLU-gated EVT → decoder_hidden.
@@ -2098,6 +2187,17 @@ class Pi05Pipeline:
                 down_name,
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_H, stream)
+            # Runtime LoRA decoder FFN down — input is post-geglu
+            # decoder_hidden in BF16 (gate_geglu_merged writes BF16),
+            # same activation the FP8 base GEMM consumed. (G12 fix.)
+            if self._has_dec_ffn_down_lora:
+                self._apply_dec_lora(
+                    B["decoder_hidden"].ptr.value,
+                    W["decoder_ffn_down_lora_a"][i].data_ptr(),
+                    W["decoder_ffn_down_lora_b"][i].data_ptr(),
+                    B["x_normed_buf"].ptr.value,
+                    ds, DEC_H, DEC_D,
+                    self._dec_lora_rank, stream)
         elif self.use_int8_decoder:
             # decoder_hidden already filled by SiLU-gated EVT in C4→C5.
             # Skip gate_geglu_merged — go directly to down GEMM.

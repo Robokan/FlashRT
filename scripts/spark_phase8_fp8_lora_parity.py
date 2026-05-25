@@ -115,18 +115,24 @@ def _l2_ratio(a: np.ndarray, b: np.ndarray) -> float:
     return na / nb
 
 
-def _chw(hwc: np.ndarray) -> np.ndarray:
-    return np.ascontiguousarray(np.transpose(hwc.astype(np.uint8), (2, 0, 1)))
-
-
 def _build_obs(data: dict, idx: int) -> dict:
+    """Build an obs dict compatible with ``flash_rt.api.VLAModel.predict``.
+
+    The frontend takes ``images`` as a **list of HWC uint8** ndarrays
+    (cam order: ego, left_wrist, right_wrist), matches the convention
+    in scripts/spark_phase3_run_calib.py. State is float32 in physical
+    units (the Pi0.5 frontend discretises into the prompt internally).
+    """
     return {
         "state": np.asarray(data["state"][idx], dtype=np.float32),
-        "images": {
-            "cam_high":         _chw(data["images_ego"][idx]),
-            "cam_left_wrist":   _chw(data["images_left"][idx]),
-            "cam_right_wrist":  _chw(data["images_right"][idx]),
-        },
+        "images": [
+            np.ascontiguousarray(np.asarray(data["images_ego"][idx],
+                                            dtype=np.uint8)),
+            np.ascontiguousarray(np.asarray(data["images_left"][idx],
+                                            dtype=np.uint8)),
+            np.ascontiguousarray(np.asarray(data["images_right"][idx],
+                                            dtype=np.uint8)),
+        ],
         "prompt": str(data["prompts"][idx]),
     }
 
@@ -185,16 +191,57 @@ def _run_one_mode(args: argparse.Namespace) -> int:
     load_ms = (time.perf_counter() - t0) * 1000.0
     print(f"  loaded in {load_ms / 1000.0:.1f} s")
 
-    # If FP8, run calibration first so the same calib set is used by
-    # both runs. BF16 path is a no-op.
+    # If FP8, run multi-sample stratified calibration so the per-tensor
+    # amax estimates aren't dominated by a single observation's
+    # outliers. BF16 path is a no-op. Uses the same prompt-override
+    # path the per-sample inference loop uses below so the calibration
+    # pipeline matches the inference pipeline (same token count, no
+    # rebuilds).
     if args.mode == "fp8":
+        calib_obs: list[dict] = []
+        n_calib = min(int(getattr(args, "calib_num", 0)) or n_total,
+                      n_total)
+        for cidx in range(n_calib):
+            o = _build_obs(data, int(cidx))
+            if args.prompt_override:
+                o["prompt"] = args.prompt_override
+            calib_obs.append(o)
+        # Pi05TorchFrontendRtx.calibrate() requires set_prompt() first
+        # (the pipeline cache is keyed by prompt-token-length, and
+        # calibration acts on the active pipeline). Seed it with the
+        # first calib sample's prompt + state; the per-frame state-in-
+        # prompt drift is handled by the per-sample predict() loop's
+        # own set_prompt re-fires.
+        seed_prompt = (args.prompt_override
+                       or str(calib_obs[0]["prompt"]))
+        seed_state = np.asarray(calib_obs[0]["state"], dtype=np.float32)
         try:
-            model.calibrate(data=str(args.calib_data),
-                            num_samples=args.num_samples)
+            import inspect as _inspect
+            sig = _inspect.signature(model._pipe.set_prompt)
+            if "state" in sig.parameters:
+                model._pipe.set_prompt(seed_prompt, state=seed_state)
+            else:
+                model._pipe.set_prompt(seed_prompt)
+            model._current_prompt = seed_prompt
+        except Exception as e:
+            print(f"{RED}FAIL{RESET}  set_prompt seed before calibrate: "
+                  f"{type(e).__name__}: {e}")
+            return 1
+        try:
+            print(f"{BOLD}Running FP8 calibration over {len(calib_obs)} "
+                  f"stratified samples...{RESET}")
+            t_cal = time.perf_counter()
+            model.calibrate(calib_obs, verbose=True)
+            cal_ms = (time.perf_counter() - t_cal) * 1000.0
+            print(f"  calibrated in {cal_ms / 1000.0:.1f} s")
         except AttributeError:
             print(f"{YELLOW}WARN{RESET}  model.calibrate() not exposed by api; "
                   f"FP8 will lazy-calibrate on the first inference using a "
                   f"single observation (less stable).")
+        except Exception as e:
+            print(f"{RED}FAIL{RESET}  calibration crashed: "
+                  f"{type(e).__name__}: {e}")
+            return 1
 
     # Force deterministic noise per-sample so the only difference
     # between BF16 and FP8 runs is the precision of the matmuls.
@@ -383,7 +430,13 @@ def main() -> int:
                    help="Path to the Orbax JAX checkpoint directory.")
     p.add_argument("--calib-data", type=Path, default=None,
                    help="Phase 3 npz with stratified observations.")
-    p.add_argument("--num-samples", type=int, default=20)
+    p.add_argument("--num-samples", type=int, default=20,
+                   help="Per-mode inference samples used for the parity "
+                        "comparison.")
+    p.add_argument("--calib-num", type=int, default=80,
+                   help="Stratified calib samples for the FP8 pass "
+                        "(ignored in BF16 mode). Default matches the "
+                        "Phase 3 calibration npz size.")
     p.add_argument("--sample-seed", type=int, default=0,
                    help="RNG seed for sample-order permutation. Must be "
                         "the same for both bf16 and fp8 runs so the same "

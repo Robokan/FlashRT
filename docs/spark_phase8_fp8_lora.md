@@ -157,14 +157,74 @@ deterministic noise per-sample and compares per-step cosine, L2 ratio,
 and max joint-step delta. See the script header for the three-step
 invocation (`--mode bf16` → `--mode fp8` → `--compare`).
 
-Acceptance gates (G12 should pass all three on the OpenArm v4 LoRA
-checkpoint at 20+ samples):
+#### Measured 2026-05-25 (Spark, n=20, pi05_openarm_ngc_lora_v4)
 
-| Metric | Threshold | Pre-G12 (broken) | Post-G12 (expected) |
+Ran the harness end-to-end on the OpenArm v4 chocolate_bars LoRA
+checkpoint (29999) with 80-sample stratified FP8 calibration. Headline
+numbers (per-sample, BF16 reference vs FP8 SUT):
+
+| Metric | Value |
+|---|---|
+| Cosine median | **0.9996** |
+| Cosine min | 0.8888 |
+| Cosine ≥ 0.99 | 15 / 20 samples |
+| L2 ratio median | 0.9961 |
+| L2 ratio in [0.95, 1.05] | 14 / 20 samples |
+| Max joint-step median | 0.0356 rad |
+| Max joint-step ≤ 0.10 rad | 18 / 20 samples |
+| Mean latency (FP8 / BF16) | 454 / 635 ms¹ |
+
+¹ Latency dominated by pipeline rebuilds (~1000 ms each) on the first
+4 samples due to state-text token-count drift across observations; the
+non-rebuild rows are ~210 ms FP8 vs ~250 ms BF16 — the expected ~15 %
+FP8 speedup. In production, `--prewarm-prompt-lens 70-85` removes the
+rebuilds.
+
+**Interpretation:** G12 closed the regression. Median cosine jumped
+from ~0.6 (pre-G12, decoder LoRA silently dropped) to 0.9996 (post-G12,
+decoder LoRA wired to all four FP8 GEMM sites). The full 75 %
+acceptance gate did **not** pass at the strict thresholds — 5 / 20
+samples drop below 0.99 cos or 0.95 ratio.
+
+#### Residual outliers — not a G12 issue
+
+The failing samples' worst-diff dimension is concentrated in the
+gripper channels (d=7 right gripper on 6 / 7 failures, d=15 left
+gripper on 1, d=3 right-arm joint on 1). Worst case sample 8 shows
+BF16 commanding `gripper = -2.30 rad` (firmly closed) while FP8 says
+`gripper = -1.50 rad` (loose closed) — a clipping pattern consistent
+with FP8 activation saturation in the encoder.
+
+This matches the long-known
+**`encoder_ffn_down_w_{14,15,16}` outlier cluster** that has been flagged
+by every FP8 calibration since Phase 1 (worst offender:
+`encoder_ffn_down_w_16` = 24.2× the median amax of 0.032). It is a
+property of the paligemma base model's mid-stack FFN-down activations
+(heavy-tailed channels), not a fine-tune or G12 issue. Pre-G12 this
+was masked by the much larger decoder-LoRA-drop signal (cos 0.6 vs
+0.99 on the gripper would round to "everything is broken"). G12 has
+exposed this as the next floor to address.
+
+Recommended next steps (out of scope for G12 itself):
+
+* **AWQ or per-channel scaling on the offending FFN-down layers** —
+  the calibration warning literally points at this fix.
+* **Keep `encoder_ffn_down_w_{14,15,16}` in BF16** — a 3-layer
+  fallback list keyed off the calibration outlier report.
+* **On-robot bake-off** — the median 0.9996 result suggests
+  on-robot behaviour will be near-identical to BF16 except for
+  occasional gripper imprecision (the affected dims are bounded).
+  Run mode 1 (sync, with blending) first; if smooth, the FP8 path is
+  production-viable for everything except tasks where gripper
+  precision is the failure mode.
+
+Acceptance gates (the strict version, applied above):
+
+| Metric | Threshold | Pre-G12 (broken) | Post-G12 (measured) |
 |---|---|---|---|
-| per-sample cosine min | ≥ 0.99 | ~0.55-0.65 | ≥ 0.99 |
-| per-sample L2 ratio | in [0.95, 1.05] | 0.4-1.6 | in [0.95, 1.05] |
-| max abs joint-step diff | ≤ 0.10 rad on ≥ 90 % | > 0.5 rad most | ≤ 0.10 rad on ≥ 90 % |
+| per-sample cosine min | ≥ 0.99 | ~0.55-0.65 | 0.89 (worst), median 0.9996 |
+| per-sample L2 ratio | in [0.95, 1.05] | 0.4-1.6 | 0.77-1.10, median 0.996 |
+| max abs joint-step diff | ≤ 0.10 rad on ≥ 90 % | > 0.5 rad most | 0.80 rad worst, 90 % below 0.10 |
 
 ### On-robot regression test
 

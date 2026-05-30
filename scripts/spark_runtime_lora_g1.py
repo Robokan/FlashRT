@@ -38,7 +38,7 @@ contaminate the G1 signal.
 Usage::
 
     .venv/bin/python3 scripts/spark_runtime_lora_g1.py \\
-        --checkpoint /home/evaughan/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_h10/29999 \\
+        --checkpoint /home/evaughan/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05/29999 \\
         --prompt "pick up the chocolate bar"
 
 The orchestrator runs two subprocesses (one per mode) to keep CUDA

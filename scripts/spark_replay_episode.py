@@ -254,8 +254,6 @@ def main(argv=None) -> int:
         if ns_path is None:
             for cand in [
                 "/home/evaughan/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/"
-                "chocolate_bars_pi05_h10/29999/assets/openarm/norm_stats.json",
-                "/home/evaughan/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/"
                 "chocolate_bars_pi05/29999/assets/openarm/norm_stats.json",
             ]:
                 if Path(cand).is_file():

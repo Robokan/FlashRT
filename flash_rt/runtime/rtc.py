@@ -259,6 +259,18 @@ class RTCConfig:
     # config / requiring a graph recapture.
     execution_horizon: int | None = None
     rtc_schedule: str | None = None
+    # Hard cap on the splice index ``d`` (latency-miss guard). A latency
+    # spike (e.g. a server pipeline rebuild) makes the per-call
+    # ``d = ceil(latency * target_hz)`` jump far into the fresh chunk —
+    # past ``execution_horizon`` the model never guided continuity, so the
+    # splice becomes a raw discontinuity (the joint whip that trips the
+    # follower's per-step safety gate). Clamping ``d`` to this value keeps
+    # the splice inside the guided merge window: the trajectory lags a few
+    # ticks in real time but stays CONTINUOUS, and continuous replanning
+    # (``start_next_at=0``) catches the lag back up within a chunk or two.
+    # ``None`` (default) = no cap (legacy behavior). Set to
+    # ``execution_horizon`` to bound spikes to the guided region.
+    max_splice_d_steps: int | None = None
     max_workers: int = 1
 
     def __post_init__(self) -> None:
@@ -295,6 +307,11 @@ class RTCConfig:
             and self.execution_horizon <= 0
         ):
             raise ValueError("execution_horizon must be positive")
+        if (
+            self.max_splice_d_steps is not None
+            and self.max_splice_d_steps < 0
+        ):
+            raise ValueError("max_splice_d_steps must be non-negative")
         if self.rtc_schedule is not None and self.rtc_schedule not in (
                 "linear", "exp", "ones", "zeros"):
             raise ValueError(
@@ -839,6 +856,18 @@ class AsyncChunkRunner:
             d = 0
         if d < 0:
             d = 0
+        # Latency-miss guard: clamp a spike-inflated ``d`` to the guided
+        # merge window so a rebuild/jitter spike degrades to a bounded,
+        # still-continuous splice instead of a raw forward skip.
+        if cfg.max_splice_d_steps is not None and d > cfg.max_splice_d_steps:
+            _logger.warning(
+                "splice d=%d exceeded max_splice_d_steps=%d (latency=%.0f ms); "
+                "clamping to keep the splice inside the guided window",
+                d,
+                cfg.max_splice_d_steps,
+                (lat * 1000.0) if cfg.auto_inference_delay else float("nan"),
+            )
+            d = cfg.max_splice_d_steps
         if horizon > 0 and d > horizon - 1:
             d = horizon - 1
         return d

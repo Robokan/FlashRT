@@ -33,7 +33,7 @@ Gate (per the plan checked into AGENTS.md / spark_status.md):
 Usage::
 
     .venv/bin/python3 scripts/spark_runtime_lora_g2.py \\
-        --checkpoint /home/evaughan/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05_h10/29999 \\
+        --checkpoint /home/evaughan/sparkpack/openpi/checkpoints/pi05_openarm_ngc_lora_v4/chocolate_bars_pi05/29999 \\
         --prompt "pick up the chocolate bar"
 
 Notes:

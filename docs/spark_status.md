@@ -38,6 +38,15 @@ faster: 95 ms p50 vs 384 ms p50). Strict numerical gate still fails
 on OpenArm because of an action-horizon mismatch (FlashRT bakes
 chunk=10, openpi serves chunk=50). Phases 6–7 still un-run against
 real artifacts (robot rollouts, latency-breakdown profile).
+**Latest (G13): first physical-robot OpenArm deploy.** Brought FlashRT's
+RTC to lerobot parity (delta-action prefix re-anchoring, guidance-weight
+ceiling 5.0, eager per-bucket graph capture to kill mid-run latency
+spikes), then a `MODE=sync` A/B isolated the residual jerk to the
+**training data**, not FlashRT: the deployed `pi05_openarm_ngc_lora_v4`
+checkpoint learned teleop demos that oscillate 18.3% (velocity sign-flips)
+vs 3.5% in the smoothed set. Fix is a retrain on the smoothed data
+(downgraded v3.0→v2.1, openpi config `pi05_openarm_ngc_lora_v4_smoothed`),
+which is the next action. See "G13" below.
 
 ## Phase status
 
@@ -2162,6 +2171,95 @@ Verification:
 
 Full rationale, algebra, and acceptance gates:
 [`spark_phase8_fp8_lora.md`](spark_phase8_fp8_lora.md).
+
+## G13 — First on-robot OpenArm deploy: RTC re-anchoring, GW parity, eager graph capture, and the jerk root-cause (training data)
+
+This is the first end-to-end deployment of the FlashRT server driving the
+**physical** OpenArm bimanual robot, via the LeRobot bridge
+(`lerobot/scripts/run_flashrt_bridge.py` + `run_chocolate_policy_flashrt.sh`)
+on the `pi05_openarm_ngc_lora_v4` chocolate-pick checkpoint. The robot saw
+the chocolate bars and reached for them, but motion was jerky/oscillating —
+it shook and banged the table on approach. Working down the stack we made
+three inference-layer fixes, then a decisive A/B test that located the real
+cause outside FlashRT entirely.
+
+### Inference-layer fixes in this commit batch (correct regardless of cause)
+
+1. **RTC delta-action prefix re-anchoring** — the missing piece vs lerobot.
+   `FlashRTPolicyAdapter._reanchor_rtc_prefix` (`serving/openpi_adapter.py`),
+   plumbed by `RTCConfig.ref_state_key` + `ChunkResult.ref_state`
+   (`runtime/rtc.py`) and the bridge forwarding `_rtc_ref_state`. The cached
+   `_rtc_prev_chunk` holds the previous chunk's *normalized* actions; for a
+   delta-action policy (OpenArm v4 `delta_action_mask`) those are deltas
+   anchored to the state at the inference that produced them, not the state
+   the next inference sees. We re-express the prefix relative to the current
+   state in closed form — `norm_new = norm_old + (ref − cur)·2/(q99 − q01)`
+   on delta channels only — so the guidance continuity target lives in the
+   frame the new chunk is predicted in. Mirrors lerobot's
+   `_reanchor_relative_rtc_prefix` as a single broadcast-add (no un-norm /
+   re-norm round trip). No-op for absolute-action models / missing ref state.
+
+2. **Guidance-weight ceiling 10.0 → 5.0** — `Pi05Pipeline._rtc_max_gw`
+   (`models/pi05/pipeline_rtx.py`) now defaults to 5.0 (env
+   `FLASHRT_RTC_MAX_GW`), matching the trusted lerobot OpenArm run rather
+   than lerobot's library default of 10.0. A too-high ceiling over-pulls the
+   new chunk toward the continuity prefix in the late denoising steps,
+   injecting overshoot / back-and-forth oscillation on approach. Baked into
+   the captured graph, so it must be set before capture (server restart).
+
+3. **Eager CUDA-graph capture during prewarm** —
+   `Pi05TorchFrontendRtx.prewarm_prompt_buckets(warmup_sample=...)` +
+   `_capture_graphs_for_buckets` (`frontends/torch/pi05_rtx.py`), wired from
+   `scripts/serve_policy_flashrt.py`. Previously prewarm only *built* each
+   prompt-length pipeline; the CUDA graph was captured lazily on that
+   length's first real frame — a ~1 s "Preparing Pi0.5 runtime..." stall
+   that, under block-miss control, froze the loop and overflowed the CAN TX
+   queue (the safety-stop trigger we chased earlier). We now record every
+   bucket's graph at startup from a warmup obs (real calib frame if given,
+   else a shape-correct synthetic zero obs), so first operational use of
+   every length is pure replay. Combines with the `max_splice_d_steps` cap
+   (committed `afd21fc`) that bounds the splice index during any residual
+   latency miss.
+
+### Decisive A/B test → the jerk is in the training data, not FlashRT
+
+With all three fixes in, motion was still jerky. We flipped the bridge to
+`MODE=sync` (full 50-step chunks, **no** RTC guidance and **no** continuous
+replan — a clean readout of the model's raw output) and it was *equally*
+jerky. That isolates the jerk to the model's action chunks / obs→action
+conversion, not the RTC or serving layer.
+
+Measuring the **training data** smoothness directly from parquet confirmed
+it. The deployed checkpoint `pi05_openarm_ngc_lora_v4` was trained on
+`local/openarm-teleop-16dof-v4` (LeRobot v2.1, 282 eps / 396 k frames /
+50 fps):
+
+| Dataset | velocity sign-flip (oscillation) | p99 accel, joints | p99 accel, grippers |
+|---|---|---|---|
+| `openarm-teleop-16dof-v4` (deployed model trained on this) | **18.3%** | 2.5–4.7 k deg/s² | 13–15 k deg/s² |
+| `openarm-chocolate-v4-smoothed` (not yet trained) | **3.5%** | 0.6–1.0 k deg/s² | 4.3–5.0 k deg/s² |
+
+The teleop demos themselves oscillate (grippers reverse direction ~27–29%
+of moving steps); the policy faithfully learned that jerk. No inference-time
+trick — RTC re-anchoring, guidance weight, latency, safety gates — can
+remove jerk the model was trained to emit. We were tuning the wrong layer.
+
+### Resolution (pending the retrain)
+
+Retrain on the smoothed data. openpi's pinned lerobot
+(`lerobot.common.datasets`) reads v2.1 only, but the smoothed set was v3.0,
+so it was downgraded to v2.1 in place: `local/openarm-teleop-16dof-v4-smoothed`
+= the proven v2.1 training dir (same meta + videos + per-episode parquet)
+with only the `observation.state` / `action` columns replaced by the
+smoothed trajectories (verified: identical arrow schema, 3.5% oscillation).
+norm stats recomputed; openpi config `pi05_openarm_ngc_lora_v4_smoothed`
+added (clone of v4, repointed at the smoothed set + assets). The Orbax
+result serves through the same FlashRT JAX frontend already in use.
+
+Status: the three inference-layer fixes are code-complete and are correct
+behavior regardless (they bring FlashRT's RTC to lerobot parity and remove
+the mid-run capture spikes). The **actual smoothness fix is the retrain**,
+which is the next action and is outside FlashRT.
 
 ## What's not yet verified
 

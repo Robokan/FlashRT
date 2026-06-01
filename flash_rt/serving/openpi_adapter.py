@@ -239,6 +239,12 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
                 int(self._delta_action_mask.sum()),
                 int((~self._delta_action_mask).sum()),
             )
+        # Cached action quantile scale (2 / (q99 - q01)) for relative-action
+        # prefix re-anchoring. Populated lazily on first use from the
+        # frontend's norm_stats; None if unavailable (re-anchoring then
+        # no-ops). See _reanchor_rtc_prefix.
+        self._action_qscale: Optional[np.ndarray] = None
+        self._action_qscale_loaded = False
         if hasattr(model, "_pipe") and not getattr(model._pipe, "calibrated", False):
             logger.warning(
                 "FlashRTPolicyAdapter: model is not calibrated; first infer "
@@ -250,6 +256,86 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    def _action_quantile_scale(self) -> Optional[np.ndarray]:
+        """Return ``2 / (q99 - q01)`` for the action channels, or None.
+
+        This is the derivative of the quantile normalization
+        (``norm = (x - q01) / (q99 - q01) * 2 - 1``, see
+        ``core/utils/actions.unnormalize_actions``) w.r.t. the physical
+        action ``x``. It converts a physical delta on a channel into the
+        equivalent shift in normalized ``[-1, 1]`` space, which is what
+        relative-action prefix re-anchoring needs. Cached after the first
+        successful read from the frontend's ``norm_stats``.
+        """
+        if self._action_qscale_loaded:
+            return self._action_qscale
+        self._action_qscale_loaded = True
+        ns = getattr(getattr(self._model, "_pipe", None), "norm_stats", None)
+        if not ns or "actions" not in ns:
+            logger.warning(
+                "FlashRTPolicyAdapter: norm_stats['actions'] unavailable; "
+                "RTC relative-prefix re-anchoring disabled (guidance will "
+                "use stale-frame deltas for delta-action policies).")
+            return None
+        a = ns["actions"]
+        if "q01" not in a or "q99" not in a:
+            return None
+        q01 = np.asarray(a["q01"], dtype=np.float32).reshape(-1)
+        q99 = np.asarray(a["q99"], dtype=np.float32).reshape(-1)
+        self._action_qscale = 2.0 / (q99 - q01 + 1e-6)
+        return self._action_qscale
+
+    def _reanchor_rtc_prefix(
+        self,
+        prev: np.ndarray,
+        ref_state: Any,
+        cur_state: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Re-express a delta-action prefix relative to the current state.
+
+        ``prev`` is the previous chunk's NORMALIZED model-space actions
+        (the diffusion variable). For a delta-action policy each row is a
+        per-step delta relative to ``ref_state`` (the state at the
+        inference that produced it). The new inference's deltas are
+        relative to ``cur_state``. For the guidance continuity target to
+        live in the same frame the model is about to predict in, shift the
+        prefix's delta channels by the physical state drift, mapped into
+        normalized space:
+
+            norm(delta + (ref - cur)) = norm(delta) + (ref - cur) * 2/(q99-q01)
+
+        Only delta channels (``self._delta_action_mask``) are shifted;
+        absolute channels (e.g. grippers) are left untouched. This mirrors
+        lerobot's ``_reanchor_relative_rtc_prefix`` (to_relative_actions +
+        re-normalize) done as a closed-form additive correction so it costs
+        one broadcast-add instead of an un-norm / re-norm round trip.
+
+        No-ops (returns ``prev`` unchanged) when this isn't a delta-action
+        model, when the ref/current state is missing, or when norm_stats
+        are unavailable.
+        """
+        if (self._delta_action_mask is None or ref_state is None
+                or cur_state is None):
+            return prev
+        scale = self._action_quantile_scale()
+        if scale is None:
+            return prev
+        prev = np.asarray(prev, dtype=np.float32)
+        ref = np.asarray(ref_state, dtype=np.float32).reshape(-1)
+        cur = np.asarray(cur_state, dtype=np.float32).reshape(-1)
+        mask = self._delta_action_mask
+        a_dim = prev.shape[-1]
+        dims = min(mask.shape[0], ref.shape[0], cur.shape[0],
+                   scale.shape[0], a_dim)
+        if dims <= 0:
+            return prev
+        # Physical drift between the two anchor frames, normalized, applied
+        # only on the delta channels (absolute channels get zero shift).
+        shift = (ref[:dims] - cur[:dims]) * scale[:dims]
+        corr = np.zeros(a_dim, dtype=np.float32)
+        corr[:dims] = np.where(mask[:dims], shift, 0.0)
+        return prev + corr[None, :]
 
     def infer(self, obs: dict) -> dict:
         t0 = time.monotonic()
@@ -318,8 +404,17 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
         rtc_prev = obs.get("_rtc_prev_chunk")
         rtc_d = obs.get("_rtc_inference_delay")
         if rtc_prev is not None and rtc_d is not None:
+            prev_chunk = np.asarray(rtc_prev, dtype=np.float32)
+            # Relative-action re-anchoring: re-express the (delta) prefix
+            # relative to THIS observation's state so the guidance
+            # continuity target matches the frame the new chunk is
+            # predicted in. No-op for absolute-action models or when the
+            # client did not send a ref state. See _reanchor_rtc_prefix.
+            rtc_ref_state = obs.get("_rtc_ref_state")
+            prev_chunk_reanchored = self._reanchor_rtc_prefix(
+                prev_chunk, rtc_ref_state, state_for_model)
             extra_obs = {
-                "_rtc_prev_chunk": np.asarray(rtc_prev),
+                "_rtc_prev_chunk": prev_chunk_reanchored,
                 "_rtc_inference_delay": int(rtc_d),
             }
             # Optional per-call config: pass through only when set so
@@ -336,15 +431,26 @@ class FlashRTPolicyAdapter(_base_policy.BasePolicy):
             # silence here means the client is not populating the
             # fields (server-side guidance is a no-op).
             if self._infer_count < 5 or self._infer_count % 50 == 0:
-                prev_arr = np.asarray(rtc_prev)
                 eh = extra_obs.get("_rtc_execution_horizon", "frontend-default")
                 sch = extra_obs.get("_rtc_schedule", "frontend-default")
+                reanchor = (
+                    "on"
+                    if (rtc_ref_state is not None
+                        and self._delta_action_mask is not None
+                        and self._action_qscale is not None)
+                    else "off")
+                # Max normalized shift the re-anchoring applied (0 when off
+                # or when the robot didn't move during the inference window).
+                dmax = float(np.max(np.abs(prev_chunk_reanchored - prev_chunk))) \
+                    if reanchor == "on" else 0.0
                 logger.info(
-                    "[RTC] received _rtc_prev_chunk shape=%s d=%d "
-                    "exec_horizon=%s sched=%s (prev[0,:4]=%s prev[-1,:4]=%s)",
-                    prev_arr.shape, int(rtc_d), eh, sch,
-                    np.round(prev_arr[0, :4], 3).tolist(),
-                    np.round(prev_arr[-1, :4], 3).tolist())
+                    "[RTC] _rtc_prev_chunk shape=%s d=%d exec_horizon=%s "
+                    "sched=%s reanchor=%s max|Δnorm|=%.4f "
+                    "(prev[0,:4]=%s prev[-1,:4]=%s)",
+                    prev_chunk_reanchored.shape, int(rtc_d), eh, sch,
+                    reanchor, dmax,
+                    np.round(prev_chunk_reanchored[0, :4], 3).tolist(),
+                    np.round(prev_chunk_reanchored[-1, :4], 3).tolist())
 
         result = self._model.predict(
             images=images, prompt=str(prompt), state=state_for_model,

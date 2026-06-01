@@ -271,6 +271,20 @@ class RTCConfig:
     # ``None`` (default) = no cap (legacy behavior). Set to
     # ``execution_horizon`` to bound spikes to the guided region.
     max_splice_d_steps: int | None = None
+    # Relative-action prefix re-anchoring (delta-policy continuity). The
+    # cached ``_rtc_prev_chunk`` holds the previous chunk's NORMALIZED
+    # per-step actions. For a delta-action policy those are deltas
+    # relative to the state at the inference that produced them — not the
+    # state the next inference sees. Left as-is the server guides the new
+    # chunk toward continuity with a STALE frame, so the seam reappears
+    # scaled by however far the robot moved during the inference window
+    # (this is what lerobot's ``_reanchor_relative_rtc_prefix`` corrects).
+    # When set, the runner reads ``observation[ref_state_key]`` at submit
+    # time, caches it with the chunk, and forwards it back as
+    # ``_rtc_ref_state`` so the server can re-express the prefix relative
+    # to the current state before guidance. ``None`` = absolute-action
+    # policy / no re-anchoring (legacy behavior).
+    ref_state_key: str | None = None
     max_workers: int = 1
 
     def __post_init__(self) -> None:
@@ -337,6 +351,11 @@ class ChunkResult:
     # ``_rtc_prev_chunk`` for server-side hard-freeze inpainting. None
     # when the adapter does not expose one (older backends).
     chunk_model_space: np.ndarray | None = None
+    # State (physical, model layout) this chunk's deltas are anchored to,
+    # i.e. the ``observation[cfg.ref_state_key]`` that produced it. Used
+    # to re-anchor the delta prefix to the next inference's state (see
+    # ``RTCConfig.ref_state_key``). None when re-anchoring is disabled.
+    ref_state: np.ndarray | None = None
 
 
 @dataclass
@@ -484,6 +503,12 @@ class AsyncChunkRunner:
             meta = {}
         t1 = time.perf_counter()
         chunk_ms = meta.pop("_rtc_chunk_model_space", None)
+        ref_state = None
+        key = self.config.ref_state_key
+        if key is not None and isinstance(observation, Mapping):
+            rs = observation.get(key)
+            if rs is not None:
+                ref_state = np.asarray(rs, dtype=np.float32).reshape(-1).copy()
         return ChunkResult(
             actions=np.asarray(actions),
             latency_s=t1 - t0,
@@ -492,6 +517,7 @@ class AsyncChunkRunner:
             metadata=meta,
             chunk_model_space=(
                 np.asarray(chunk_ms) if chunk_ms is not None else None),
+            ref_state=ref_state,
         )
 
     def _submit_locked(self, observation: Any) -> None:
@@ -599,6 +625,13 @@ class AsyncChunkRunner:
         augmented = dict(observation)
         augmented["_rtc_prev_chunk"] = prev_prefix
         augmented["_rtc_inference_delay"] = int(d_pred)
+        # Relative-action re-anchoring: tell the server which state the
+        # prefix's deltas are anchored to, so it can re-express them
+        # relative to the state in THIS observation before guidance
+        # (delta-policy continuity — see RTCConfig.ref_state_key). The
+        # server no-ops this when it isn't a delta-action model.
+        if current.ref_state is not None:
+            augmented["_rtc_ref_state"] = current.ref_state
         # Per-call soft-guidance config (Phase 6 / G11). Only set when
         # the config explicitly overrides — None means "let the model
         # frontend use its own default" (lerobot defaults

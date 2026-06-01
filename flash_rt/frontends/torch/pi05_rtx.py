@@ -1323,8 +1323,13 @@ class Pi05TorchFrontendRtx:
                 n_cached, sorted(self._pipeline_cache.keys()))
         return pipe, True
 
-    def prewarm_prompt_buckets(self, prompt_lens: list[int]) -> None:
-        """Pre-build cached pipelines for an explicit list of prompt lengths.
+    def prewarm_prompt_buckets(
+        self,
+        prompt_lens: list[int],
+        warmup_sample: Optional[dict] = None,
+        warmup_prompt: Optional[str] = None,
+    ) -> None:
+        """Pre-build (and optionally graph-capture) per-prompt-length pipelines.
 
         Pays the per-bucket ~600 ms build cost up-front at startup instead
         of letting it land as per-frame spikes during inference. Each
@@ -1332,26 +1337,100 @@ class Pi05TorchFrontendRtx:
         AFTER ``calibrate_with_real_data`` so the multi-frame scales
         already exist). Idempotent: lengths already cached are skipped.
 
-        Graph capture for each bucket still happens lazily on first
-        :meth:`set_prompt` + :meth:`infer` for that bucket, because graph
-        recording requires an actual observation for warmup. The
-        pre-built pipeline is fully calibrated and autotuned, so the
-        lazy graph capture is just one short single-frame warmup pass
-        (~120 ms) instead of the full 600 ms rebuild.
+        Graph capture: if ``warmup_sample`` is given, the CUDA graph for
+        every bucket is recorded NOW (see :meth:`_capture_graphs_for_buckets`)
+        so the first operational inference at each length is pure graph
+        replay. If it is omitted, graph capture stays LAZY — each length
+        still pays a ~1 s "Preparing Pi0.5 runtime..." capture on its first
+        inference, which under block-miss control stalls the loop (and was
+        the trigger for the CAN-TX-overflow crash). Always pass a sample.
+
+        ``warmup_sample`` is an observation dict (``images`` list +
+        ``state``); ``warmup_prompt`` overrides the prompt text used to
+        size the language embeds (defaults to the current/last prompt).
 
         Typical usage::
 
             api.calibrate_with_real_data(obs_list)
-            # OpenArm chocolate_bars seen prompt-lens in calibration:
-            api.frontend.prewarm_prompt_buckets([78, 80, 82])
+            api.frontend.prewarm_prompt_buckets(
+                list(range(66, 93)), warmup_sample=obs_list[0])
         """
         for plen in prompt_lens:
             if plen in self._pipeline_cache:
                 continue
             self._pipeline_cache[plen] = self._build_pipeline_for_prompt_len(plen)
         logger.info(
-            "Pi05 pipeline cache: prewarm complete (cached prompt_lens=%s)",
+            "Pi05 pipeline cache: prewarm build complete (cached prompt_lens=%s)",
             sorted(self._pipeline_cache.keys()))
+        if warmup_sample is None:
+            logger.warning(
+                "prewarm_prompt_buckets: no warmup_sample -> CUDA graphs stay "
+                "LAZY; each prompt_len still pays a ~1 s graph-capture spike on "
+                "its first inference. Pass a warmup obs to capture them now.")
+            return
+        self._capture_graphs_for_buckets(prompt_lens, warmup_sample, warmup_prompt)
+
+    def _capture_graphs_for_buckets(
+        self,
+        prompt_lens: list[int],
+        warmup_sample: dict,
+        warmup_prompt: Optional[str] = None,
+    ) -> None:
+        """Eagerly record the CUDA graph for each prewarmed bucket.
+
+        ``prewarm_prompt_buckets`` only BUILDS the per-length pipelines; the
+        CUDA graph for each is otherwise captured lazily on that length's
+        first inference (the ~1 s ``"Preparing Pi0.5 runtime..."`` stall —
+        the spike that, under ``miss_policy="block"`` control, freezes the
+        loop and can overflow a CAN TX queue on resume). This walks every
+        bucket once at startup and runs the exact runtime capture path
+        (:meth:`_calibrate_single_frame`), so first operational use of every
+        length is pure graph replay (~190 ms) with zero mid-run captures.
+
+        The captured graph encodes buffer SHAPES, not values: we upload
+        PAD-filled length-``plen`` language embeds (and ``warmup_sample``'s
+        images) only to drive one forward + record. At runtime the same
+        pipeline is reused with the frame's real (unpadded) embeds, which
+        the graph replays correctly — identical to how the lazy path
+        captures on the first real frame and replays on later ones.
+        """
+        prompt_text = warmup_prompt or self._current_prompt or "warmup"
+        state = (warmup_sample.get("state")
+                 if isinstance(warmup_sample, dict) else None)
+        captured = 0
+        for plen in prompt_lens:
+            pipe = self._pipeline_cache.get(plen)
+            if pipe is None:
+                continue
+            if getattr(pipe, "_graph", None) is not None:
+                continue  # already captured (e.g. the calibration length)
+            # Build exactly ``plen`` language embeds (PAD-padded; the values
+            # are irrelevant to the captured graph shape) and make this
+            # bucket the active pipeline.
+            if state is not None:
+                state_norm = self._normalize_state_for_prompt(state)
+                embeds, _ = _embed_prompt(
+                    prompt_text, self.embedding_weight, max_len=plen,
+                    state=state_norm, pad_to_max=True)
+            else:
+                embeds, _ = _embed_prompt(
+                    prompt_text, self.embedding_weight, max_len=plen,
+                    pad_to_max=True)
+            self.pipeline = pipe
+            self.current_prompt_len = plen
+            embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
+            pipe.set_language_embeds(embeds_np)
+            # Reuse the exact runtime capture path. Resetting the flags makes
+            # _calibrate_single_frame actually fire for this pipeline.
+            self.calibrated = False
+            self.graph_recorded = False
+            self._calibrate_single_frame(warmup_sample)
+            captured += 1
+        logger.info(
+            "Pi05 pipeline cache: eager graph capture complete (%d/%d buckets "
+            "captured, rest already had graphs). Every prewarmed prompt_len is "
+            "now pure replay during operation (no mid-run capture spikes).",
+            captured, len(prompt_lens))
 
     def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.

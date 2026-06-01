@@ -40,6 +40,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import math
+import os
 
 import numpy as np
 import ml_dtypes
@@ -196,12 +197,19 @@ class Pi05Pipeline:
         self.int8_encoder_static_calibrated = False
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
-        # RTC soft-guidance max guidance weight. LeRobot's RTCConfig
-        # default is 10.0 (configuration_rtc.py:43). Exposed as an
-        # attribute so the frontend / config layer can override BEFORE
-        # graph capture — after capture this is baked into the graph's
-        # per-step scalars and changes require a recapture.
-        self._rtc_max_gw: float = 10.0
+        # RTC soft-guidance max guidance weight (clamp ceiling on the
+        # per-Euler-step guidance schedule). LeRobot's RTCConfig *default*
+        # is 10.0 (configuration_rtc.py:43), but the trusted OpenArm
+        # chocolate run (run_chocolate_policy_rtc.sh / eval_with_real_robot.py)
+        # overrode it to 5.0. A too-high ceiling over-pulls the new chunk
+        # toward the continuity prefix in the late denoising steps (where
+        # the unclamped weight blows past 5.0), injecting overshoot and
+        # back-and-forth oscillation during the approach phase. Default to
+        # the trusted 5.0; override via FLASHRT_RTC_MAX_GW. Must be set
+        # BEFORE graph capture — it is baked into the captured per-step
+        # scalars, so changes require a recapture (server restart).
+        self._rtc_max_gw: float = float(
+            os.environ.get("FLASHRT_RTC_MAX_GW", "5.0"))
         if self.num_steps <= 0:
             raise ValueError(f"num_steps must be positive, got {self.num_steps}")
         if self.vision_pool_factor not in (1, 2, 4):

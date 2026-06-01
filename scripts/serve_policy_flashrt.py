@@ -322,12 +322,43 @@ def main() -> int:
     if args.prewarm_prompt_lens:
         prewarm_lens = _parse_prompt_len_spec(args.prewarm_prompt_lens)
         if prewarm_lens:
+            # Provide a warmup observation so prewarm captures the CUDA graph
+            # for every bucket NOW (not lazily on each length's first real
+            # frame). Lazy capture is a ~1 s "Preparing Pi0.5 runtime..."
+            # stall per new length mid-run; under block-miss control that
+            # freezes the loop and can overflow a CAN TX queue on resume.
+            # Prefer a real calibration frame (correct FP8 scales + images);
+            # else synthesize a shape-correct zero obs (graph capture needs
+            # only buffer shapes — real frames replay correctly).
+            if args.calib_data and obs_list:
+                warmup_sample = obs_list[0]
+                warmup_prompt = first_prompt
+            else:
+                _dummy = [np.zeros((224, 224, 3), dtype=np.uint8)
+                          for _ in range(args.num_views)]
+                warmup_sample = {
+                    "images": _dummy,
+                    "image": _dummy[0],
+                    "state": np.zeros(args.robot_action_dim, dtype=np.float32),
+                }
+                if len(_dummy) >= 2:
+                    warmup_sample["wrist_image"] = _dummy[1]
+                if len(_dummy) >= 3:
+                    warmup_sample["wrist_image_right"] = _dummy[2]
+                warmup_prompt = args.default_prompt or "warmup"
+                logger.warning(
+                    "No --calib-data: capturing prewarm graphs from a SYNTHETIC "
+                    "zero observation. Graph shapes are correct (real frames "
+                    "replay fine); for FP8 runs pass --calib-data so activation "
+                    "scales are representative.")
             logger.info(
                 "Pre-warming pipeline cache for %d prompt-len bucket(s): %s "
-                "(~600 ms each; one-time startup cost, eliminates per-frame "
-                "rebuild spikes during operation)",
+                "(~600 ms build + graph capture each; one-time startup cost, "
+                "eliminates ALL per-frame rebuild/capture spikes at runtime)",
                 len(prewarm_lens), prewarm_lens)
-            model._pipe.prewarm_prompt_buckets(prewarm_lens)
+            model._pipe.prewarm_prompt_buckets(
+                prewarm_lens, warmup_sample=warmup_sample,
+                warmup_prompt=warmup_prompt)
         else:
             logger.warning(
                 "--prewarm-prompt-lens=%r parsed to an empty list; skipping",
